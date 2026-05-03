@@ -1,0 +1,31 @@
+[project]
+name = "prama-server"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "migo",email = "1695587905@qq.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "prama (>=0.1.0a1,<0.2.0)",
+    "typer (>=0.25.1,<0.26.0)",
+    "fastapi (>=0.136.1,<0.137.0)",
+    "uvicorn (>=0.46.0,<0.47.0)",
+    "pydantic (>=2.13.3,<3.0.0)",
+    "tqdm (>=4.67.3,<5.0.0)",
+    "numpy (<2.3)",
+    "pandas (<3)"
+]
+
+[tool.poetry]
+packages = [{include = "prama_server", from = "src"}]
+
+[[tool.poetry.source]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+priority = "primary"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
