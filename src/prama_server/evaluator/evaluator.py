@@ -1,55 +1,39 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import datetime
-from io import BytesIO
-from pathlib import Path
-from typing import Any
+from collections.abc import Callable, Generator
+from typing import Dict
 
-import pandas as pd
-import soundfile as sf
-from datasets import Audio, load_dataset
-from prama.evaluator.evaluator import get_cer, get_wer
-from tqdm import tqdm
+import numpy as np
+from datasets import Dataset
+from typing import Tuple
 
-from prama_server.inferencers.base import Inferencer
+from prama_server.evaluator.types import EvaluationInferenceResult
+from prama_server.inferencers.asr import AsrGrpcInferencer
+from prama_server.metrics.prama_warpper import get_cer_pd, get_wer_pd
+from prama_server.session.session import EvaluationSession
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class EvaluationResult:
-    wer: float
-    cer: float
-    results_tsv: Path
-    report_path: Path
-    wer_result: Any
-    cer_result: Any
 
 
 class Evaluator:
     def __init__(
         self,
-        dataset_path: Path | str,
+        dataset: Dataset,
         *,
-        split: str = "test",
         sample_rate: int = 16000,
-        limit: int | None = None,
-        min_reference_words: int = 5,
-        output_dir: Path | str = Path("outputs") / "evaluate",
-        report_path: Path | str = Path("outputs/demo01_wer_report.txt"),
+        tag: str | None = None,
+        reference_postprocess: Callable[[str], str] | None = None,
+        hypothesis_postprocess: Callable[[str], str] | None = None,
     ) -> None:
-        self.dataset_path = Path(dataset_path)
-        self.split = split
+        self.dataset = dataset
         self.sample_rate = sample_rate
-        self.limit = limit
-        self.min_reference_words = min_reference_words
-        self.output_dir = Path(output_dir)
-        self.report_path = Path(report_path)
+        self.tag = tag
+        self.reference_postprocess = reference_postprocess
+        self.hypothesis_postprocess = hypothesis_postprocess
 
     def close(self) -> None:
-        logger.info("Evaluator closed: dataset_path=%s split=%s", self.dataset_path, self.split)
+        logger.info("Evaluator closed: dataset_size=%s", len(self.dataset))
 
     def __enter__(self) -> Evaluator:
         return self
@@ -57,36 +41,19 @@ class Evaluator:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def evaluate(self, inferencer: Inferencer) -> EvaluationResult:
-        with inferencer as active_inferencer:
-            return self._evaluate(active_inferencer)
+    def evaluate(self, inferencer: AsrGrpcInferencer) -> Dict[str, float]:
+        return self.iter_evaluate(inferencer)
 
-    def _evaluate(self, inferencer: Inferencer) -> EvaluationResult:
-        logger.info("加载数据集: path=%s split=%s", self.dataset_path, self.split)
-        dataset = load_dataset(str(self.dataset_path), split=self.split).cast_column(
-            "audio",
-            Audio(decode=False),
-        )
-        if self.limit is not None:
-            dataset = dataset.select(range(min(self.limit, len(dataset))))
-        logger.info("待评估样本数: %s", len(dataset))
+    def get_data_itr(self) -> Generator[Tuple[str, np.ndarray, str], None, None]:
+        for sample in self.dataset:
+            utterance_id = sample["id"]
+            reference = " ".join(sample["text"].strip().split())
+            if self.reference_postprocess is not None:
+                reference = self.reference_postprocess(reference)
 
-        utterance_ids: list[str] = []
-        references: list[str] = []
-        hypotheses: list[str] = []
-        details: list[dict[str, object]] = []
-        skipped_short_refs = 0
-
-        progress_bar = tqdm(dataset, desc="ASR eval")
-        for index, row in enumerate(progress_bar):
-            utterance_id = str(row.get("id") or index)
-            reference = " ".join(row["text"].strip().split())
-            if len(reference.split()) < self.min_reference_words:
-                skipped_short_refs += 1
-                progress_bar.set_postfix(done=len(hypotheses), skipped=skipped_short_refs)
-                continue
-
-            audio_array, audio_sample_rate = self._load_audio(row["audio"], utterance_id)
+            audio = sample["audio"]
+            audio_array = audio["array"]
+            audio_sample_rate = audio["sampling_rate"]
 
             if audio_array.ndim == 2:
                 audio_array = audio_array.mean(axis=1)
@@ -96,91 +63,31 @@ class Evaluator:
                     f"audio_sample_rate={audio_sample_rate} sample_rate={self.sample_rate}"
                 )
 
-            hypothesis = inferencer.infer(audio_array)
+            yield utterance_id, audio_array, reference
 
-            utterance_ids.append(utterance_id)
-            references.append(reference)
-            hypotheses.append(hypothesis)
-            details.append(
-                {
-                    "audio_id": utterance_id,
-                    "ref": reference,
-                    "hyp": hypothesis,
-                }
-            )
-            progress_bar.set_postfix(done=len(hypotheses))
-
-        logger.info("已跳过过短参考文本样本数: %s", skipped_short_refs)
-        if not references:
-            raise ValueError(
-                f"没有可评估样本: min_reference_words={self.min_reference_words} "
-                f"dataset_size={len(dataset)} skipped_short_refs={skipped_short_refs}"
-            )
-
-        logger.info("开始计算 WER/CER")
-        wer_result = get_wer(references, hypotheses, utterance_ids)
-        cer_result = get_cer(references, hypotheses, utterance_ids)
-        row_wer = self._build_utterance_error_rates(wer_result)
-        row_cer = self._build_utterance_error_rates(cer_result)
-        for detail, wer, cer in zip(details, row_wer, row_cer, strict=True):
-            detail["wer"] = wer
-            detail["cer"] = cer
-
-        results_tsv = self._build_results_tsv_path()
-        self._write_results(results_tsv, details)
-        self.report_path.parent.mkdir(parents=True, exist_ok=True)
-        self.report_path.write_text(wer_result.report, encoding="utf-8")
-
-        logger.info("逐条结果已写入: %s", results_tsv)
-        logger.info("对齐报告已写入: %s", self.report_path)
-
-        return EvaluationResult(
-            wer=wer_result.summary.wer,
-            cer=cer_result.summary.wer,
-            results_tsv=results_tsv,
-            report_path=self.report_path,
-            wer_result=wer_result,
-            cer_result=cer_result,
+    def iter_evaluate(
+        self,
+        inferencer: AsrGrpcInferencer,
+        on_infer_result: Callable[[EvaluationInferenceResult], None] | None = None,
+    ) -> Dict[str, float]:
+        data_itr = self.get_data_itr()
+        session = EvaluationSession(
+            data_itr=data_itr,
+            inferencer=inferencer,
+            metric_fns={"wer": get_wer_pd, "cer": get_cer_pd},
+            hypothesis_postprocess=self.hypothesis_postprocess,
         )
-
-    def _build_results_tsv_path(self) -> Path:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        return self.output_dir / timestamp / "results.tsv"
-
-    @staticmethod
-    def _load_audio(audio: dict[str, object], utterance_id: str) -> tuple[Any, int]:
-        if audio["bytes"] is not None:
-            return sf.read(BytesIO(audio["bytes"]), dtype="float32")
-        if audio["path"] is not None:
-            return sf.read(audio["path"], dtype="float32")
-        raise ValueError(f"音频缺少 bytes 和 path: id={utterance_id}")
-
-    @staticmethod
-    def _build_utterance_error_rates(result: Any) -> list[float]:
-        rates: list[float] = []
-        for utterance in result.utterances:
-            correct = substitutions = deletions = insertions = 0
-            for token in utterance.tokens:
-                if token.eval_label == "correct":
-                    correct += 1
-                elif token.eval_label == "substitution":
-                    substitutions += 1
-                elif token.eval_label == "deletion":
-                    deletions += 1
-                elif token.eval_label == "insertion":
-                    insertions += 1
-
-            ref_count = correct + substitutions + deletions
-            error_count = substitutions + deletions + insertions
-            rates.append(error_count / ref_count * 100 if ref_count else 0.0)
-
-        return rates
-
-    @staticmethod
-    def _write_results(path: Path, rows: list[dict[str, object]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(rows, columns=["audio_id", "ref", "hyp", "wer", "cer"]).to_csv(
-            path,
-            sep="\t",
-            index=False,
-        )
+        for infer_results in session.infer():
+            if on_infer_result is None:
+                continue
+            latest_result = infer_results.iloc[-1]
+            on_infer_result(
+                EvaluationInferenceResult(
+                    tag=self.tag,
+                    id=str(latest_result["id"]),
+                    reference=str(latest_result["reference"]),
+                    hypothesis=str(latest_result["hypothesis"]),
+                )
+            )
+        session_metrics = session.get_metrics()
+        return session_metrics

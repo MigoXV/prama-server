@@ -1,3 +1,13 @@
-from prama_server.evaluator.evaluator import EvaluationResult, Evaluator
+from prama_server.evaluator.evaluator import Evaluator
+from prama_server.evaluator.types import (
+    EvaluationInferenceResult,
+    EvaluationProgress,
+    EvaluationResult,
+)
 
-__all__ = ["EvaluationResult", "Evaluator"]
+__all__ = [
+    "EvaluationInferenceResult",
+    "EvaluationProgress",
+    "EvaluationResult",
+    "Evaluator",
+]

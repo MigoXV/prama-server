@@ -23,8 +23,12 @@ dependencies = [
     "librosa (>=0.11.0,<0.12.0)"
 ]
 
+[project.scripts]
+prama-server = "prama_server.commands.app:app"
+
 [tool.poetry]
 packages = [{include = "prama_server", from = "src"}]
+include = ["src/prama_server/servicer/static/**"]
 
 [[tool.poetry.source]]
 name = "tuna"

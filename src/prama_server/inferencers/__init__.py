@@ -1,3 +1,3 @@
-from prama_server.inferencers.base import Inferencer
+from prama_server.inferencers.asr import AsrGrpcInferencer
 
-__all__ = ["Inferencer"]
+__all__ = ["AsrGrpcInferencer"]
