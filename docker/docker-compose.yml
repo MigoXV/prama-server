@@ -1,0 +1,16 @@
+services:
+  backend:
+    image: registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-backend:0.1.0
+    container_name: prama-server-backend
+    volumes:
+      - ${PWD}/data-bin:/data-bin
+
+  frontend:
+    image: registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-frontend:0.1.0
+    container_name: prama-server-frontend
+    environment:
+      API_UPSTREAM: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
