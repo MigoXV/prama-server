@@ -774,6 +774,87 @@ button:disabled {
   margin-bottom: 10px;
 }
 
+.asr-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.asr-summary-card {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+
+  .report-summary {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    margin: 8px 0 0;
+  }
+
+  .metric {
+    min-height: 34px;
+    padding: 6px 8px;
+  }
+}
+
+.asr-summary-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  span,
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 760;
+  }
+
+  strong {
+    font-size: 20px;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.alignment-metric-tabs {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(72px, 1fr));
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+
+  button {
+    min-height: 30px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 760;
+
+    &.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: var(--accent-fg);
+    }
+  }
+}
+
 .vad-summary {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -1306,6 +1387,10 @@ tbody tr:last-child td {
   .workspace-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .asr-summary-grid {
+    grid-template-columns: 1fr;
   }
 
   .header-actions {

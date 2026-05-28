@@ -74,6 +74,7 @@ export interface EvaluationResult {
   excluded_sample_ids?: string[];
   total_sample_count?: number;
   wer_report?: WerReport;
+  cer_report?: WerReport;
   vad_report?: VadReport;
   [key: string]: unknown;
 }

@@ -5,6 +5,7 @@ import logging
 import threading
 import tempfile
 import unicodedata
+from collections.abc import Callable
 from dataclasses import asdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +21,7 @@ from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from prama.evaluator.evaluator import get_wer
+from prama.evaluator.evaluator import get_cer, get_wer
 
 from prama_server.evaluator import (
     EvaluationInferenceResult,
@@ -346,10 +347,12 @@ def _run_evaluation(job: EvaluationJob) -> None:
                 on_partial_infer_result=publish_partial_infer_result,
             )
 
-        report = _build_wer_report(inference_rows)
+        wer_report = _build_wer_report(inference_rows)
+        cer_report = _build_cer_report(inference_rows)
         result = {
             **metrics,
-            "wer_report": report,
+            "wer_report": wer_report,
+            "cer_report": cer_report,
             **_sample_count_payload(
                 included_count=len(inference_rows),
                 excluded_sample_ids=set(),
@@ -876,10 +879,12 @@ def _recalculate_asr_result(
         if str(row["id"]) not in excluded_sample_ids
     ]
     metrics = _build_asr_metrics(rows)
-    report = _build_wer_report(rows)
+    wer_report = _build_wer_report(rows)
+    cer_report = _build_cer_report(rows)
     return {
         **metrics,
-        "wer_report": report,
+        "wer_report": wer_report,
+        "cer_report": cer_report,
         **_sample_count_payload(
             included_count=len(rows),
             excluded_sample_ids=excluded_sample_ids,
@@ -1135,6 +1140,18 @@ def _region_to_payload(
 
 
 def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return _build_asr_alignment_report(rows, metric_fn=get_wer)
+
+
+def _build_cer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return _build_asr_alignment_report(rows, metric_fn=get_cer)
+
+
+def _build_asr_alignment_report(
+    rows: list[dict[str, Any]],
+    *,
+    metric_fn: Callable[[list[str], list[str], list[str]], Any],
+) -> dict[str, Any]:
     if not rows:
         return {
             "summary": {
@@ -1152,14 +1169,14 @@ def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "utterances": [],
         }
 
-    wer_result = get_wer(
+    alignment_result = metric_fn(
         [row["reference"] for row in rows],
         [row["hypothesis"] for row in rows],
         [row["id"] for row in rows],
     )
-    summary = wer_result.summary
+    summary = alignment_result.summary
     utterance_summaries = {
-        group.name.strip("()"): group.counts for group in wer_result.groups
+        group.name.strip("()"): group.counts for group in alignment_result.groups
     }
     row_by_id = {str(row["id"]): row for row in rows}
     row_by_index = {
@@ -1189,7 +1206,7 @@ def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 or row_by_index.get(index)
                 or {},
             )
-            for index, utterance in enumerate(wer_result.utterances, start=1)
+            for index, utterance in enumerate(alignment_result.utterances, start=1)
         ],
     }
 

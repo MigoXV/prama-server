@@ -13,6 +13,8 @@ from prama_server.evaluator.vad import evaluate_masks
 from prama_server.servicer.http import (
     EvaluationJob,
     EvaluationRequest,
+    _build_cer_report,
+    _build_wer_report,
     app,
     jobs,
     jobs_lock,
@@ -57,11 +59,16 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["wer"], 0.0)
+        self.assertEqual(payload["cer"], 0.0)
         self.assertEqual(payload["included_sample_count"], 1)
         self.assertEqual(payload["excluded_sample_count"], 1)
         self.assertEqual(payload["excluded_sample_ids"], ["bad"])
         self.assertEqual(
             [item["id"] for item in payload["wer_report"]["utterances"]],
+            ["ok"],
+        )
+        self.assertEqual(
+            [item["id"] for item in payload["cer_report"]["utterances"]],
             ["ok"],
         )
 
@@ -131,7 +138,26 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(payload["wer"], 0.0)
         self.assertEqual(payload["cer"], 0.0)
         self.assertEqual(payload["wer_report"]["utterances"], [])
+        self.assertEqual(payload["cer_report"]["utterances"], [])
         self.assertEqual(payload["included_sample_count"], 0)
+
+    def test_asr_alignment_reports_include_word_and_character_tokens(self) -> None:
+        rows = [
+            {
+                "id": "zh",
+                "index": 1,
+                "reference": "我们刚刚上一段会议",
+                "hypothesis": "我们刚上一段会",
+            }
+        ]
+
+        wer_report = _build_wer_report(rows)
+        cer_report = _build_cer_report(rows)
+
+        self.assertEqual(len(wer_report["utterances"][0]["tokens"]), 1)
+        self.assertGreater(len(cer_report["utterances"][0]["tokens"]), 1)
+        self.assertEqual(cer_report["utterances"][0]["tokens"][0]["ref"], "我")
+        self.assertLess(cer_report["summary"]["wer"], wer_report["summary"]["wer"])
 
     def test_sample_audio_endpoint_only_serves_registered_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -97,7 +97,14 @@ const MODULES = [
   { label: "设置", icon: Settings, active: false },
 ];
 
-type ReportSortMode = "index-asc" | "index-desc" | "wer-desc" | "wer-asc";
+type AlignmentMetric = "wer" | "cer";
+type ReportSortMode =
+  | "index-asc"
+  | "index-desc"
+  | "wer-desc"
+  | "wer-asc"
+  | "cer-desc"
+  | "cer-asc";
 
 export default function App() {
   const { themeMode, setThemeMode } = useThemeMode();
@@ -125,6 +132,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<"overview" | "results" | "report">(
     "overview",
   );
+  const [activeAlignmentMetric, setActiveAlignmentMetric] =
+    useState<AlignmentMetric>("wer");
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
   const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
   const [resultJumpIndex, setResultJumpIndex] = useState("");
@@ -161,8 +170,8 @@ export default function App() {
     return total > 0 ? Math.min((processed / total) * 100, 100) : 0;
   }, [progress]);
 
-  const report = finalResult?.wer_report;
-  const summary = report?.summary;
+  const werReport = finalResult?.wer_report;
+  const cerReport = finalResult?.cer_report;
   const canExport = finalResult !== null;
   const isVad = formState.task === "vad";
   const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
@@ -459,11 +468,11 @@ export default function App() {
           />
           <TabButton
             active={activeTab === "report"}
-            label={isVad ? "VAD 指标" : "WER 对齐报告"}
+            label={isVad ? "VAD 指标" : "对齐报告"}
             meta={
               isVad
                 ? `${formatNumber(finalResult?.sample_count)} 个样本`
-                : `${report?.utterances.length ?? 0} 个样本`
+                : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
             }
             onClick={() => setActiveTab("report")}
           />
@@ -812,8 +821,11 @@ export default function App() {
                   onRecalculate={() => void handleRecalculateMetrics()}
                 />
               ) : (
-                <WerReportPanel
-                  report={report}
+                <AsrAlignmentReportPanel
+                  werReport={werReport}
+                  cerReport={cerReport}
+                  activeMetric={activeAlignmentMetric}
+                  onActiveMetricChange={setActiveAlignmentMetric}
                   result={finalResult}
                   sortMode={reportSort}
                   onSortModeChange={setReportSort}
@@ -1190,8 +1202,11 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   );
 }
 
-function WerReportPanel({
-  report,
+function AsrAlignmentReportPanel({
+  werReport,
+  cerReport,
+  activeMetric,
+  onActiveMetricChange,
   result,
   sortMode,
   onSortModeChange,
@@ -1203,7 +1218,10 @@ function WerReportPanel({
   recalculating,
   onRecalculate,
 }: {
-  report: WerReport | undefined;
+  werReport: WerReport | undefined;
+  cerReport: WerReport | undefined;
+  activeMetric: AlignmentMetric;
+  onActiveMetricChange: (metric: AlignmentMetric) => void;
   result: EvaluationResult | null;
   sortMode: ReportSortMode;
   onSortModeChange: (sortMode: ReportSortMode) => void;
@@ -1215,17 +1233,23 @@ function WerReportPanel({
   recalculating: boolean;
   onRecalculate: () => void;
 }) {
-  const summary = report?.summary;
+  const activeReport = activeMetric === "wer" ? werReport : cerReport;
+  const activeLabel: "WER" | "CER" = activeMetric === "wer" ? "WER" : "CER";
+  const sampleCount = werReport?.utterances.length ?? cerReport?.utterances.length ?? 0;
   const utterances = useMemo(
-    () => sortWerUtterances(report?.utterances ?? [], sortMode),
-    [report?.utterances, sortMode],
+    () =>
+      sortAlignmentUtterances(activeReport?.utterances ?? [], sortMode, {
+        wer: werReport,
+        cer: cerReport,
+      }),
+    [activeReport?.utterances, cerReport, sortMode, werReport],
   );
   return (
     <div className="panel report-panel">
       <div className="panel-heading compact-heading">
         <div>
-          <h2>WER 对齐报告</h2>
-          <span>{report?.utterances.length ?? 0} 个样本</span>
+          <h2>对齐报告</h2>
+          <span>{sampleCount} 个样本</span>
         </div>
         <div className="report-controls">
           <button
@@ -1256,21 +1280,48 @@ function WerReportPanel({
               <option value="index-desc">索引降序</option>
               <option value="wer-desc">WER 降序</option>
               <option value="wer-asc">WER 升序</option>
+              <option value="cer-desc">CER 降序</option>
+              <option value="cer-asc">CER 升序</option>
             </select>
           </label>
         </div>
       </div>
 
-      {summary ? (
+      {werReport?.summary || cerReport?.summary ? (
         <>
-          <div className="report-summary">
-            <Metric label="WER" value={formatRate(summary.wer)} />
-            <Metric label="Correct" value={formatNumber(summary.correct)} />
-            <Metric label="Sub" value={formatNumber(summary.substitutions)} />
-            <Metric label="Del" value={formatNumber(summary.deletions)} />
-            <Metric label="Ins" value={formatNumber(summary.insertions)} />
+          <div className="asr-summary-grid">
+            <AsrMetricSummaryCard
+              label="WER"
+              summary={werReport?.summary}
+              fallbackRate={result?.wer}
+            />
+            <AsrMetricSummaryCard
+              label="CER"
+              summary={cerReport?.summary}
+              fallbackRate={result?.cer}
+            />
           </div>
-          <SampleCountStrip result={result} fallbackCount={report?.utterances.length ?? 0} />
+          <SampleCountStrip result={result} fallbackCount={sampleCount} />
+          <div className="alignment-metric-tabs" role="tablist" aria-label="对齐指标">
+            <button
+              type="button"
+              className={activeMetric === "wer" ? "active" : ""}
+              aria-selected={activeMetric === "wer"}
+              role="tab"
+              onClick={() => onActiveMetricChange("wer")}
+            >
+              WER
+            </button>
+            <button
+              type="button"
+              className={activeMetric === "cer" ? "active" : ""}
+              aria-selected={activeMetric === "cer"}
+              role="tab"
+              onClick={() => onActiveMetricChange("cer")}
+            >
+              CER
+            </button>
+          </div>
           <div className="utterance-list">
             {utterances.map((utterance) => (
               <details className="utterance" key={utterance.id}>
@@ -1283,7 +1334,11 @@ function WerReportPanel({
                     <strong>#{utterance.index ?? "-"}</strong>
                     <span>{utterance.id || "-"}</span>
                   </span>
-                  <TokenCounts summary={utterance.summary} tokens={utterance.tokens} />
+                  <TokenCounts
+                    metricLabel={activeLabel}
+                    summary={utterance.summary}
+                    tokens={utterance.tokens}
+                  />
                 </summary>
                 <div className="utterance-audio-row">
                   <AudioPlayer
@@ -1356,6 +1411,31 @@ function VadReportPanel({
         <div className="empty-state">评估完成后生成 VAD 指标</div>
       )}
     </div>
+  );
+}
+
+function AsrMetricSummaryCard({
+  label,
+  summary,
+  fallbackRate,
+}: {
+  label: "WER" | "CER";
+  summary?: WerSummary;
+  fallbackRate?: number;
+}) {
+  return (
+    <section className="asr-summary-card">
+      <div className="asr-summary-title">
+        <span>{label}</span>
+        <strong>{formatRate(summary?.wer ?? fallbackRate)}</strong>
+      </div>
+      <div className="report-summary">
+        <Metric label="Correct" value={formatNumber(summary?.correct)} />
+        <Metric label="Sub" value={formatNumber(summary?.substitutions)} />
+        <Metric label="Del" value={formatNumber(summary?.deletions)} />
+        <Metric label="Ins" value={formatNumber(summary?.insertions)} />
+      </div>
+    </section>
   );
 }
 
@@ -1465,9 +1545,11 @@ function LegendItem({ className, label }: { className: string; label: string }) 
 }
 
 function TokenCounts({
+  metricLabel,
   summary,
   tokens,
 }: {
+  metricLabel: "WER" | "CER";
   summary?: WerSummary;
   tokens: WerToken[];
 }) {
@@ -1481,7 +1563,7 @@ function TokenCounts({
 
   return (
     <span className="token-counts">
-      {summary ? `WER ${formatRate(summary.wer)} · ` : ""}
+      {summary ? `${metricLabel} ${formatRate(summary.wer)} · ` : ""}
       C {summary?.correct ?? counts.correct ?? 0} · S{" "}
       {summary?.substitutions ?? counts.substitution ?? 0} · D{" "}
       {summary?.deletions ?? counts.deletion ?? 0} · I{" "}
@@ -1616,36 +1698,51 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
   };
 }
 
-function sortWerUtterances(
+function sortAlignmentUtterances(
   utterances: WerUtterance[],
   sortMode: ReportSortMode,
+  reports: Record<AlignmentMetric, WerReport | undefined>,
 ): WerUtterance[] {
   return [...utterances].sort((left, right) => {
     if (sortMode === "index-desc") {
       return getUtteranceIndex(right) - getUtteranceIndex(left);
     }
-    if (sortMode === "wer-desc" || sortMode === "wer-asc") {
-      const leftWer = getUtteranceWer(left);
-      const rightWer = getUtteranceWer(right);
-      if (leftWer !== rightWer) {
-        return sortMode === "wer-desc" ? rightWer - leftWer : leftWer - rightWer;
+    if (
+      sortMode === "wer-desc" ||
+      sortMode === "wer-asc" ||
+      sortMode === "cer-desc" ||
+      sortMode === "cer-asc"
+    ) {
+      const metric: AlignmentMetric = sortMode.startsWith("cer") ? "cer" : "wer";
+      const leftRate = getUtteranceRate(left, reports[metric]);
+      const rightRate = getUtteranceRate(right, reports[metric]);
+      if (leftRate !== rightRate) {
+        return sortMode.endsWith("desc") ? rightRate - leftRate : leftRate - rightRate;
       }
     }
     return getUtteranceIndex(left) - getUtteranceIndex(right);
   });
 }
 
-function getUtteranceWer(utterance: WerUtterance): number {
-  if (typeof utterance.summary?.wer === "number") {
-    return utterance.summary.wer;
+function getUtteranceRate(
+  utterance: WerUtterance,
+  report: WerReport | undefined,
+): number {
+  const metricUtterance = report?.utterances.find(
+    (item) => item.id === utterance.id,
+  );
+  const summary = metricUtterance?.summary ?? utterance.summary;
+  if (typeof summary?.wer === "number") {
+    return summary.wer;
   }
-  const referenceWords = utterance.tokens.filter(
+  const tokens = metricUtterance?.tokens ?? utterance.tokens;
+  const referenceWords = tokens.filter(
     (token) => token.label !== "insertion",
   ).length;
   if (referenceWords === 0) {
     return 0;
   }
-  const errors = utterance.tokens.filter((token) => token.label !== "correct").length;
+  const errors = tokens.filter((token) => token.label !== "correct").length;
   return (errors / referenceWords) * 100;
 }
 
