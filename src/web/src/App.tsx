@@ -7,8 +7,11 @@ import {
   Clipboard,
   Database,
   Download,
+  EyeOff,
   FileText,
   Moon,
+  Pause,
+  Play,
   Server,
   Settings,
   Sun,
@@ -17,11 +20,15 @@ import {
   Monitor,
   Radio,
 } from "lucide-react";
-import type { FormEvent } from "react";
+import type { ChangeEvent, FormEvent, MouseEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePersistentState } from "./hooks/usePersistentState";
 import { useThemeMode } from "./hooks/useThemeMode";
-import { createEvaluation, subscribeEvaluationEvents } from "./services/evaluations";
+import {
+  createEvaluation,
+  recalculateEvaluationMetrics,
+  subscribeEvaluationEvents,
+} from "./services/evaluations";
 import type {
   EvaluationFormState,
   EvaluationProgress,
@@ -108,9 +115,13 @@ export default function App() {
   const [progress, setProgress] = useState<EvaluationProgress | null>(null);
   const [rows, setRows] = useState<InferenceRow[]>([]);
   const [finalResult, setFinalResult] = useState<EvaluationResult | null>(null);
+  const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [errorMessage, setErrorMessage] = useState("");
   const [connectionWarning, setConnectionWarning] = useState("");
   const [busy, setBusy] = useState(false);
+  const [recalculating, setRecalculating] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "results" | "report">(
     "overview",
   );
@@ -154,6 +165,7 @@ export default function App() {
   const summary = report?.summary;
   const canExport = finalResult !== null;
   const isVad = formState.task === "vad";
+  const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
 
   function resetRunState() {
     closeEventsRef.current?.();
@@ -163,9 +175,11 @@ export default function App() {
     setProgress(null);
     setRows([]);
     setFinalResult(null);
+    setExcludedSampleIds(new Set());
     setErrorMessage("");
     setConnectionWarning("");
     setBusy(false);
+    setRecalculating(false);
     setResultJumpIndex("");
     setHighlightedResultIndex(null);
     resultRowRefs.current.clear();
@@ -193,6 +207,7 @@ export default function App() {
     setRows([]);
     setProgress(null);
     setFinalResult(null);
+    setExcludedSampleIds(new Set());
     setStatus("queued");
     setJobId("");
 
@@ -220,6 +235,9 @@ export default function App() {
           setStatus(snapshot.status);
           setProgress(snapshot.progress);
           setFinalResult(snapshot.result);
+          setExcludedSampleIds(
+            new Set(snapshot.result?.excluded_sample_ids ?? []),
+          );
           setErrorMessage(snapshot.error ?? "");
           setBusy(false);
           closeEventsRef.current = null;
@@ -262,9 +280,45 @@ export default function App() {
           sampleId,
           reference: nextProgress.reference || "-",
           hypothesis: nextProgress.hypothesis || "-",
+          audioUrl: nextProgress.audio_url,
+          durationSeconds: nextProgress.duration_seconds,
         },
       ];
     });
+  }
+
+  function toggleExcludedSample(sampleId: string, excluded: boolean) {
+    setExcludedSampleIds((current) => {
+      const next = new Set(current);
+      if (excluded) {
+        next.add(sampleId);
+      } else {
+        next.delete(sampleId);
+      }
+      return next;
+    });
+  }
+
+  async function handleRecalculateMetrics() {
+    if (!jobId || !canRecalculate) {
+      return;
+    }
+    setRecalculating(true);
+    setErrorMessage("");
+    try {
+      const nextResult = await recalculateEvaluationMetrics(
+        jobId,
+        [...excludedSampleIds],
+      );
+      setFinalResult(nextResult);
+      setExcludedSampleIds(new Set(nextResult.excluded_sample_ids ?? []));
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "重新计算评估指标失败",
+      );
+    } finally {
+      setRecalculating(false);
+    }
   }
 
   function updateField(field: keyof EvaluationFormState, value: string) {
@@ -695,6 +749,7 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
+                        <th>屏蔽</th>
                         <th>序号</th>
                         <th>样本</th>
                         <th>{isVad ? "Reference Segments" : "Reference"}</th>
@@ -719,6 +774,14 @@ export default function App() {
                               }
                             }}
                           >
+                            <td>
+                              <ExcludeCheckbox
+                                checked={excludedSampleIds.has(row.sampleId)}
+                                onChange={(checked) =>
+                                  toggleExcludedSample(row.sampleId, checked)
+                                }
+                              />
+                            </td>
                             <td>{row.index}</td>
                             <td>{row.sampleId}</td>
                             <td>{row.reference}</td>
@@ -727,7 +790,7 @@ export default function App() {
                         ))
                       ) : (
                         <tr>
-                          <td colSpan={4} className="empty-cell">
+                          <td colSpan={5} className="empty-cell">
                             暂无推理结果
                           </td>
                         </tr>
@@ -740,14 +803,27 @@ export default function App() {
 
             {activeTab === "report" ? (
               isVad ? (
-                <VadReportPanel result={finalResult} />
+                <VadReportPanel
+                  result={finalResult}
+                  excludedSampleIds={excludedSampleIds}
+                  onExcludedChange={toggleExcludedSample}
+                  canRecalculate={canRecalculate}
+                  recalculating={recalculating}
+                  onRecalculate={() => void handleRecalculateMetrics()}
+                />
               ) : (
                 <WerReportPanel
                   report={report}
+                  result={finalResult}
                   sortMode={reportSort}
                   onSortModeChange={setReportSort}
                   wrapAlignment={wrapWerAlignment}
                   onWrapAlignmentChange={setWrapWerAlignment}
+                  excludedSampleIds={excludedSampleIds}
+                  onExcludedChange={toggleExcludedSample}
+                  canRecalculate={canRecalculate}
+                  recalculating={recalculating}
+                  onRecalculate={() => void handleRecalculateMetrics()}
                 />
               )
             ) : null}
@@ -914,6 +990,135 @@ function TextBlock({ label, value }: { label: string; value: string }) {
   );
 }
 
+function ExcludeCheckbox({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`exclude-toggle ${checked ? "excluded" : ""}`}
+      title={checked ? "取消屏蔽该样本" : "屏蔽该样本的推理结果"}
+      aria-label={checked ? "取消屏蔽该样本" : "屏蔽该样本的推理结果"}
+      aria-pressed={checked}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onChange(!checked);
+      }}
+    >
+      <EyeOff size={15} />
+    </button>
+  );
+}
+
+function AudioPlayer({
+  src,
+  durationSeconds,
+}: {
+  src?: string;
+  durationSeconds?: number;
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [actualDuration, setActualDuration] = useState(durationSeconds ?? 0);
+  const duration = actualDuration || durationSeconds || 0;
+  const progress = duration > 0 ? Math.min((currentTime / duration) * 100, 100) : 0;
+
+  if (!src) {
+    return <span className="audio-empty">无音频</span>;
+  }
+
+  function togglePlay(event: MouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const audio = audioRef.current;
+    if (!audio) {
+      return;
+    }
+    if (audio.paused) {
+      void audio.play();
+    } else {
+      audio.pause();
+    }
+  }
+
+  function handleSeek(event: ChangeEvent<HTMLInputElement>) {
+    event.stopPropagation();
+    const audio = audioRef.current;
+    if (!audio || duration <= 0) {
+      return;
+    }
+    const nextTime = (Number(event.target.value) / 100) * duration;
+    audio.currentTime = nextTime;
+    setCurrentTime(nextTime);
+  }
+
+  return (
+    <div className="audio-player" onClick={(event) => event.stopPropagation()}>
+      <audio
+        ref={audioRef}
+        preload="metadata"
+        src={src}
+        onLoadedMetadata={(event) => {
+          const nextDuration = event.currentTarget.duration;
+          if (Number.isFinite(nextDuration)) {
+            setActualDuration(nextDuration);
+          }
+        }}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+      />
+      <button
+        type="button"
+        className="audio-play-button"
+        title={playing ? "暂停音频" : "播放音频"}
+        aria-label={playing ? "暂停音频" : "播放音频"}
+        onClick={togglePlay}
+      >
+        {playing ? <Pause size={14} /> : <Play size={14} />}
+      </button>
+      <input
+        className="audio-progress"
+        type="range"
+        min="0"
+        max="100"
+        step="0.1"
+        value={progress}
+        aria-label="音频播放进度"
+        onClick={(event) => event.stopPropagation()}
+        onChange={handleSeek}
+      />
+      <small>
+        {formatSeconds(currentTime)} / {formatSeconds(duration)}
+      </small>
+    </div>
+  );
+}
+
+function SampleCountStrip({
+  result,
+  fallbackCount,
+}: {
+  result: EvaluationResult | null;
+  fallbackCount: number;
+}) {
+  const included = result?.included_sample_count ?? fallbackCount;
+  const excluded = result?.excluded_sample_count ?? 0;
+  return (
+    <div className="metric-strip sample-count-strip">
+      <Metric label="参与样本" value={formatNumber(included)} />
+      <Metric label="屏蔽样本" value={formatNumber(excluded)} />
+    </div>
+  );
+}
+
 function VadOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   if (!result) {
     return null;
@@ -987,16 +1192,28 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
 
 function WerReportPanel({
   report,
+  result,
   sortMode,
   onSortModeChange,
   wrapAlignment,
   onWrapAlignmentChange,
+  excludedSampleIds,
+  onExcludedChange,
+  canRecalculate,
+  recalculating,
+  onRecalculate,
 }: {
   report: WerReport | undefined;
+  result: EvaluationResult | null;
   sortMode: ReportSortMode;
   onSortModeChange: (sortMode: ReportSortMode) => void;
   wrapAlignment: boolean;
   onWrapAlignmentChange: (wrapAlignment: boolean) => void;
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+  canRecalculate: boolean;
+  recalculating: boolean;
+  onRecalculate: () => void;
 }) {
   const summary = report?.summary;
   const utterances = useMemo(
@@ -1011,6 +1228,14 @@ function WerReportPanel({
           <span>{report?.utterances.length ?? 0} 个样本</span>
         </div>
         <div className="report-controls">
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={!canRecalculate}
+            onClick={onRecalculate}
+          >
+            {recalculating ? "重算中..." : "重新计算评估指标"}
+          </button>
           <label className="wrap-control">
             <input
               type="checkbox"
@@ -1045,16 +1270,27 @@ function WerReportPanel({
             <Metric label="Del" value={formatNumber(summary.deletions)} />
             <Metric label="Ins" value={formatNumber(summary.insertions)} />
           </div>
+          <SampleCountStrip result={result} fallbackCount={report?.utterances.length ?? 0} />
           <div className="utterance-list">
             {utterances.map((utterance) => (
               <details className="utterance" key={utterance.id}>
                 <summary>
                   <span className="utterance-title">
+                    <ExcludeCheckbox
+                      checked={excludedSampleIds.has(utterance.id)}
+                      onChange={(checked) => onExcludedChange(utterance.id, checked)}
+                    />
                     <strong>#{utterance.index ?? "-"}</strong>
                     <span>{utterance.id || "-"}</span>
                   </span>
                   <TokenCounts summary={utterance.summary} tokens={utterance.tokens} />
                 </summary>
+                <div className="utterance-audio-row">
+                  <AudioPlayer
+                    src={utterance.audio_url}
+                    durationSeconds={utterance.duration_seconds}
+                  />
+                </div>
                 <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
               </details>
             ))}
@@ -1067,7 +1303,21 @@ function WerReportPanel({
   );
 }
 
-function VadReportPanel({ result }: { result: EvaluationResult | null }) {
+function VadReportPanel({
+  result,
+  excludedSampleIds,
+  onExcludedChange,
+  canRecalculate,
+  recalculating,
+  onRecalculate,
+}: {
+  result: EvaluationResult | null;
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+  canRecalculate: boolean;
+  recalculating: boolean;
+  onRecalculate: () => void;
+}) {
   const samples = result?.vad_report?.samples ?? [];
   return (
     <div className="panel report-panel">
@@ -1076,15 +1326,32 @@ function VadReportPanel({ result }: { result: EvaluationResult | null }) {
           <h2>VAD 报告</h2>
           <span>{formatNumber(result?.sample_count)} 个样本</span>
         </div>
-        <div className="vad-legend report-legend">
-          <LegendItem className="hit" label="命中" />
-          <LegendItem className="miss" label="漏检" />
-          <LegendItem className="false_alarm" label="虚警" />
-          <LegendItem className="correct_reject" label="静音正确" />
+        <div className="report-controls vad-report-controls">
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={!canRecalculate}
+            onClick={onRecalculate}
+          >
+            {recalculating ? "重算中..." : "重新计算评估指标"}
+          </button>
+          <div className="vad-legend report-legend">
+            <LegendItem className="hit" label="命中" />
+            <LegendItem className="miss" label="漏检" />
+            <LegendItem className="false_alarm" label="虚警" />
+            <LegendItem className="correct_reject" label="静音正确" />
+          </div>
         </div>
       </div>
       {result ? (
-        <VadMaskReport samples={samples} />
+        <>
+          <SampleCountStrip result={result} fallbackCount={samples.length} />
+          <VadMaskReport
+            samples={samples}
+            excludedSampleIds={excludedSampleIds}
+            onExcludedChange={onExcludedChange}
+          />
+        </>
       ) : (
         <div className="empty-state">评估完成后生成 VAD 指标</div>
       )}
@@ -1092,7 +1359,15 @@ function VadReportPanel({ result }: { result: EvaluationResult | null }) {
   );
 }
 
-function VadMaskReport({ samples }: { samples: VadReportSample[] }) {
+function VadMaskReport({
+  samples,
+  excludedSampleIds,
+  onExcludedChange,
+}: {
+  samples: VadReportSample[];
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+}) {
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成 mask 对齐报告</div>;
   }
@@ -1103,8 +1378,16 @@ function VadMaskReport({ samples }: { samples: VadReportSample[] }) {
         <details className="vad-sample" key={sample.id} open={samples.length === 1}>
           <summary>
             <span>
+              <ExcludeCheckbox
+                checked={excludedSampleIds.has(sample.id)}
+                onChange={(checked) => onExcludedChange(sample.id, checked)}
+              />
               #{sample.index ?? "-"} {sample.id}
             </span>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
             <small>{formatSeconds(sample.duration_seconds)}</small>
           </summary>
           {sample.metrics ? (

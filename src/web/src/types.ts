@@ -41,6 +41,8 @@ export interface EvaluationProgress {
   hypothesis?: string;
   is_final?: boolean;
   result?: EvaluationResult;
+  audio_url?: string;
+  duration_seconds?: number;
 }
 
 export interface EvaluationSnapshot {
@@ -67,6 +69,10 @@ export interface EvaluationResult {
   reference_segment_count?: number;
   prediction_segment_count?: number;
   sample_count?: number;
+  included_sample_count?: number;
+  excluded_sample_count?: number;
+  excluded_sample_ids?: string[];
+  total_sample_count?: number;
   wer_report?: WerReport;
   vad_report?: VadReport;
   [key: string]: unknown;
@@ -114,6 +120,8 @@ export interface VadReportSample {
   index?: number;
   duration_seconds: number;
   frame_seconds: number;
+  audio_url?: string;
+  excluded?: boolean;
   metrics?: EvaluationResult;
   reference_segments: VadReportSegment[];
   prediction_segments: VadReportSegment[];
@@ -162,6 +170,9 @@ export interface WerSummary {
 export interface WerUtterance {
   id: string;
   index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  excluded?: boolean;
   summary?: WerSummary;
   tokens: WerToken[];
 }
@@ -179,6 +190,9 @@ export interface InferenceRow {
   sampleId: string;
   reference: string;
   hypothesis: string;
+  audioUrl?: string;
+  durationSeconds?: number;
+  excluded?: boolean;
 }
 
 export interface EvaluationFormState {
