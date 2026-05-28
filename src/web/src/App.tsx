@@ -90,7 +90,7 @@ const MODULES = [
   { label: "设置", icon: Settings, active: false },
 ];
 
-type ReportSortMode = "index-asc" | "index-desc" | "errors-desc" | "errors-asc";
+type ReportSortMode = "index-asc" | "index-desc" | "wer-desc" | "wer-asc";
 
 export default function App() {
   const { themeMode, setThemeMode } = useThemeMode();
@@ -115,6 +115,7 @@ export default function App() {
     "overview",
   );
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
+  const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
   const [resultJumpIndex, setResultJumpIndex] = useState("");
   const [highlightedResultIndex, setHighlightedResultIndex] = useState<number | null>(
     null,
@@ -745,6 +746,8 @@ export default function App() {
                   report={report}
                   sortMode={reportSort}
                   onSortModeChange={setReportSort}
+                  wrapAlignment={wrapWerAlignment}
+                  onWrapAlignmentChange={setWrapWerAlignment}
                 />
               )
             ) : null}
@@ -986,10 +989,14 @@ function WerReportPanel({
   report,
   sortMode,
   onSortModeChange,
+  wrapAlignment,
+  onWrapAlignmentChange,
 }: {
   report: WerReport | undefined;
   sortMode: ReportSortMode;
   onSortModeChange: (sortMode: ReportSortMode) => void;
+  wrapAlignment: boolean;
+  onWrapAlignmentChange: (wrapAlignment: boolean) => void;
 }) {
   const summary = report?.summary;
   const utterances = useMemo(
@@ -1003,20 +1010,30 @@ function WerReportPanel({
           <h2>WER 对齐报告</h2>
           <span>{report?.utterances.length ?? 0} 个样本</span>
         </div>
-        <label className="sort-control">
-          <span>排序</span>
-          <select
-            value={sortMode}
-            onChange={(event) =>
-              onSortModeChange(event.target.value as ReportSortMode)
-            }
-          >
-            <option value="index-asc">索引升序</option>
-            <option value="index-desc">索引降序</option>
-            <option value="errors-desc">错误数降序</option>
-            <option value="errors-asc">错误数升序</option>
-          </select>
-        </label>
+        <div className="report-controls">
+          <label className="wrap-control">
+            <input
+              type="checkbox"
+              checked={wrapAlignment}
+              onChange={(event) => onWrapAlignmentChange(event.target.checked)}
+            />
+            <span>自动换行</span>
+          </label>
+          <label className="sort-control">
+            <span>排序</span>
+            <select
+              value={sortMode}
+              onChange={(event) =>
+                onSortModeChange(event.target.value as ReportSortMode)
+              }
+            >
+              <option value="index-asc">索引升序</option>
+              <option value="index-desc">索引降序</option>
+              <option value="wer-desc">WER 降序</option>
+              <option value="wer-asc">WER 升序</option>
+            </select>
+          </label>
+        </div>
       </div>
 
       {summary ? (
@@ -1038,7 +1055,7 @@ function WerReportPanel({
                   </span>
                   <TokenCounts summary={utterance.summary} tokens={utterance.tokens} />
                 </summary>
-                <WerAlignmentRows tokens={utterance.tokens} />
+                <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
               </details>
             ))}
           </div>
@@ -1190,10 +1207,52 @@ function TokenCounts({
   );
 }
 
-function WerAlignmentRows({ tokens }: { tokens: WerToken[] }) {
+function WerAlignmentRows({ tokens, wrap }: { tokens: WerToken[]; wrap: boolean }) {
   const gridStyle = {
     gridTemplateColumns: `42px repeat(${Math.max(tokens.length, 1)}, max-content)`,
   };
+
+  if (wrap) {
+    return (
+      <div className="wer-alignment wrap">
+        <div className="wer-wrap-stack">
+          {chunkWerTokens(tokens).map((chunk, chunkIndex) => (
+            <div
+              className="wer-alignment-grid"
+              style={{
+                gridTemplateColumns: `42px repeat(${Math.max(
+                  chunk.length,
+                  1,
+                )}, max-content)`,
+              }}
+              key={`chunk:${chunkIndex}`}
+            >
+              <span className="wer-row-label">REF</span>
+              {chunk.map((token, index) => (
+                <span
+                  className={`wer-word ${getWerWordClass(token.label, "ref")}`}
+                  title={`ref: ${token.ref || "*"}\nhyp: ${token.hyp || "*"}`}
+                  key={`ref:${chunkIndex}:${index}:${token.ref ?? ""}:${token.hyp ?? ""}`}
+                >
+                  {token.ref || "*"}
+                </span>
+              ))}
+              <span className="wer-row-label">HYP</span>
+              {chunk.map((token, index) => (
+                <span
+                  className={`wer-word ${getWerWordClass(token.label, "hyp")}`}
+                  title={`ref: ${token.ref || "*"}\nhyp: ${token.hyp || "*"}`}
+                  key={`hyp:${chunkIndex}:${index}:${token.ref ?? ""}:${token.hyp ?? ""}`}
+                >
+                  {token.hyp || "*"}
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="wer-alignment">
@@ -1221,6 +1280,15 @@ function WerAlignmentRows({ tokens }: { tokens: WerToken[] }) {
       </div>
     </div>
   );
+}
+
+function chunkWerTokens(tokens: WerToken[]): WerToken[][] {
+  const chunkSize = 12;
+  const chunks: WerToken[][] = [];
+  for (let index = 0; index < tokens.length; index += chunkSize) {
+    chunks.push(tokens.slice(index, index + chunkSize));
+  }
+  return chunks;
 }
 
 function getWerWordClass(label: string, row: "ref" | "hyp"): string {
@@ -1273,21 +1341,29 @@ function sortWerUtterances(
     if (sortMode === "index-desc") {
       return getUtteranceIndex(right) - getUtteranceIndex(left);
     }
-    if (sortMode === "errors-desc" || sortMode === "errors-asc") {
-      const leftErrors = countWerTokenErrors(left);
-      const rightErrors = countWerTokenErrors(right);
-      if (leftErrors !== rightErrors) {
-        return sortMode === "errors-desc"
-          ? rightErrors - leftErrors
-          : leftErrors - rightErrors;
+    if (sortMode === "wer-desc" || sortMode === "wer-asc") {
+      const leftWer = getUtteranceWer(left);
+      const rightWer = getUtteranceWer(right);
+      if (leftWer !== rightWer) {
+        return sortMode === "wer-desc" ? rightWer - leftWer : leftWer - rightWer;
       }
     }
     return getUtteranceIndex(left) - getUtteranceIndex(right);
   });
 }
 
-function countWerTokenErrors(utterance: WerUtterance): number {
-  return utterance.tokens.filter((token) => token.label !== "correct").length;
+function getUtteranceWer(utterance: WerUtterance): number {
+  if (typeof utterance.summary?.wer === "number") {
+    return utterance.summary.wer;
+  }
+  const referenceWords = utterance.tokens.filter(
+    (token) => token.label !== "insertion",
+  ).length;
+  if (referenceWords === 0) {
+    return 0;
+  }
+  const errors = utterance.tokens.filter((token) => token.label !== "correct").length;
+  return (errors / referenceWords) * 100;
 }
 
 function getUtteranceIndex(utterance: WerUtterance): number {

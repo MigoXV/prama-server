@@ -443,6 +443,34 @@ button:disabled {
   }
 }
 
+.report-controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.wrap-control {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+
+  input {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: var(--accent);
+  }
+
+  span {
+    margin: 0;
+    font-family: inherit;
+  }
+}
+
 .jump-control {
   display: flex;
   flex: 0 0 auto;
@@ -825,10 +853,13 @@ tbody tr:last-child td {
   display: grid;
   gap: 8px;
   max-height: 380px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .utterance {
+  min-width: 0;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-soft);
@@ -876,8 +907,13 @@ tbody tr:last-child td {
 
 .wer-alignment {
   overflow-x: auto;
+  max-width: 100%;
   padding: 10px;
   border-top: 1px solid var(--border);
+
+  &.wrap {
+    overflow-x: hidden;
+  }
 }
 
 .wer-alignment-grid {
@@ -885,6 +921,17 @@ tbody tr:last-child td {
   gap: 4px 0.42em;
   align-items: center;
   min-width: max-content;
+}
+
+.wer-wrap-stack {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+
+  .wer-alignment-grid {
+    min-width: 0;
+    overflow-x: auto;
+  }
 }
 
 .wer-row-label {
@@ -903,6 +950,7 @@ tbody tr:last-child td {
   line-height: 1.45;
   text-align: left;
   white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .wer-word-substitution {
