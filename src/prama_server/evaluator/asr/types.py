@@ -24,6 +24,15 @@ class EvaluationInferenceResult:
 
 
 @dataclass(frozen=True)
+class EvaluationPartialInferenceResult:
+    tag: str | None
+    id: str
+    reference: str
+    hypothesis: str
+    is_final: bool
+
+
+@dataclass(frozen=True)
 class EvaluationProgress:
     status: Literal["started", "running", "completed"]
     total: int

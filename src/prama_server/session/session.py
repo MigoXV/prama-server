@@ -25,8 +25,9 @@ class EvaluationSession:
 
     def infer(
         self,
+        on_partial_result: Callable[[str, str, str, bool], None] | None = None,
     ) -> Generator[pd.DataFrame, None, None]:
-        for data_id, reference, hypothesis in self.iter_infer():
+        for data_id, reference, hypothesis in self.iter_infer(on_partial_result):
             if self.hypothesis_postprocess is not None:
                 hypothesis = self.hypothesis_postprocess(hypothesis)
             self.infer_results = pd.concat(
@@ -46,11 +47,25 @@ class EvaluationSession:
             )
             yield self.infer_results
 
-    def iter_infer(self) -> Generator[Tuple[str, str, str], None, None]:
+    def iter_infer(
+        self,
+        on_partial_result: Callable[[str, str, str, bool], None] | None = None,
+    ) -> Generator[Tuple[str, str, str], None, None]:
         with self.inferencer as active_inferencer:
             for data_id, audio, reference in self.data_itr:
                 results = ""
                 for hypothesis, is_final in active_inferencer.infer(audio):
+                    if self.hypothesis_postprocess is not None:
+                        display_hypothesis = self.hypothesis_postprocess(hypothesis)
+                    else:
+                        display_hypothesis = hypothesis
+                    if on_partial_result is not None:
+                        on_partial_result(
+                            data_id,
+                            reference,
+                            display_hypothesis,
+                            is_final,
+                        )
                     if is_final:
                         results += hypothesis
                 if results:

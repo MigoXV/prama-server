@@ -20,7 +20,8 @@ dependencies = [
     "protobuf (>=7.34.1,<8.0.0)",
     "huggingface-hub (>=1.13.0,<2.0.0)",
     "soundfile (>=0.13.1,<0.14.0)",
-    "librosa (>=0.11.0,<0.12.0)"
+    "librosa (>=0.11.0,<0.12.0)",
+    "scipy (<2)"
 ]
 
 [project.scripts]
@@ -28,7 +29,6 @@ prama-server = "prama_server.commands.app:app"
 
 [tool.poetry]
 packages = [{include = "prama_server", from = "src"}]
-include = ["src/prama_server/servicer/static/**"]
 
 [[tool.poetry.source]]
 name = "tuna"

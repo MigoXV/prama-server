@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator, Generator
 from typing import List, Optional, Tuple
+
 import grpc
 import numpy as np
 
@@ -21,6 +22,7 @@ class AsrGrpcInferencer:
         hotword_bias: float = 0.0,
         request_timeout_seconds: float = 60.0,
         connect_timeout_seconds: float | None = 10.0,
+        interim_results: bool = True,
     ) -> None:
         self.target = target
         self.sample_rate = sample_rate
@@ -28,6 +30,7 @@ class AsrGrpcInferencer:
         self.hotwords = list(hotwords or [])
         self.hotword_bias = hotword_bias
         self.request_timeout_seconds = request_timeout_seconds
+        self.interim_results = interim_results
         self.channel = grpc.insecure_channel(target)
         if connect_timeout_seconds is not None:
             grpc.channel_ready_future(self.channel).result(
@@ -72,7 +75,7 @@ class AsrGrpcInferencer:
                     hotwords=self.hotwords,
                     hotword_bias=self.hotword_bias,
                 ),
-                interim_results=False,
+                interim_results=self.interim_results,
             )
         )
         yield ux_speech_pb2.StreamingRecognizeRequest(audio_content=audio_content)
