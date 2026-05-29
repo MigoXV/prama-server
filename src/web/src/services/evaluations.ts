@@ -1,9 +1,11 @@
 import type {
   EvaluationCreated,
+  DatasetUploadResult,
   EvaluationProgress,
   EvaluationRequest,
   EvaluationResult,
   EvaluationSnapshot,
+  ServerDirectoryListing,
 } from "../types";
 
 export interface EvaluationEventHandlers {
@@ -80,6 +82,47 @@ export async function recalculateEvaluationMetrics(
   }
 
   return response.json() as Promise<EvaluationResult>;
+}
+
+export async function listServerDirectory(
+  path?: string,
+): Promise<ServerDirectoryListing> {
+  const params = new URLSearchParams();
+  if (path) {
+    params.set("path", path);
+  }
+  const response = await fetch(
+    `/api/files/directories${params.size ? `?${params.toString()}` : ""}`,
+  );
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json() as Promise<ServerDirectoryListing>;
+}
+
+export async function uploadDatasetFiles(
+  files: File[],
+): Promise<DatasetUploadResult> {
+  const formData = new FormData();
+  for (const file of files) {
+    const relativePath =
+      (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
+      file.name;
+    formData.append("files", file, relativePath);
+  }
+
+  const response = await fetch("/api/datasets/upload", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json() as Promise<DatasetUploadResult>;
 }
 
 function parseEventData<T>(event: MessageEvent<string>): T {

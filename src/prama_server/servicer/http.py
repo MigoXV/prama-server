@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import threading
 import tempfile
 import unicodedata
@@ -18,7 +20,7 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from prama.evaluator.evaluator import get_cer, get_wer
@@ -73,6 +75,25 @@ class RecalculateMetricsRequest(BaseModel):
     )
 
 
+class DirectoryEntry(BaseModel):
+    name: str
+    path: str
+    kind: Literal["directory", "file"]
+
+
+class DirectoryListing(BaseModel):
+    currentPath: str
+    parentPath: str | None
+    entries: list[DirectoryEntry]
+
+
+class DatasetUploadResult(BaseModel):
+    dataset_path: str
+    imported_count: int
+    skipped_count: int = 0
+    message: str | None = None
+
+
 @dataclass
 class EvaluationJob:
     job_id: str
@@ -106,10 +127,111 @@ jobs: dict[str, EvaluationJob] = {}
 jobs_lock = threading.Lock()
 message_manager = MessageManager()
 
+ALLOWED_UPLOAD_SUFFIXES = {
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".json",
+    ".jsonl",
+    ".csv",
+    ".parquet",
+    ".txt",
+}
+
 
 @app.get("/")
 def index() -> dict[str, str]:
     return {"name": "Prama ASR Evaluation Service", "status": "ok"}
+
+
+@app.get("/api/files/directories", response_model=DirectoryListing)
+def list_directory(
+    path: str | None = Query(None, description="要浏览的工作目录内路径"),
+) -> DirectoryListing:
+    root = _workspace_root()
+    current_path = _resolve_under_root(path, root=root)
+    if not current_path.exists() or not current_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"目录不存在: {path or root}")
+
+    entries = [
+        DirectoryEntry(
+            name=item.name,
+            path=_display_path(item),
+            kind="directory" if item.is_dir() else "file",
+        )
+        for item in sorted(
+            current_path.iterdir(),
+            key=lambda candidate: (not candidate.is_dir(), candidate.name.lower()),
+        )
+        if not item.name.startswith(".")
+    ]
+    parent_path = None
+    if current_path != root:
+        parent_path = _display_path(current_path.parent)
+    return DirectoryListing(
+        currentPath=_display_path(current_path),
+        parentPath=parent_path,
+        entries=entries,
+    )
+
+
+@app.post("/api/datasets/upload", response_model=DatasetUploadResult)
+async def upload_dataset(
+    files: list[UploadFile] = File(..., description="要上传的数据集文件"),
+) -> DatasetUploadResult:
+    if not files:
+        raise HTTPException(status_code=400, detail="没有收到上传文件")
+
+    upload_root = _upload_root()
+    upload_root.mkdir(parents=True, exist_ok=True)
+    prepared_files: list[tuple[UploadFile, Path]] = []
+    skipped_count = 0
+
+    for upload_file in files:
+        raw_name = upload_file.filename or ""
+        relative_path = _safe_relative_upload_path(raw_name)
+        if relative_path is None:
+            skipped_count += 1
+            continue
+        prepared_files.append((upload_file, relative_path))
+
+    if not prepared_files:
+        for upload_file in files:
+            await upload_file.close()
+        raise HTTPException(status_code=400, detail="没有可导入的支持文件")
+
+    upload_plan = _build_upload_plan([path for _, path in prepared_files])
+    upload_dir = _allocate_upload_directory(
+        upload_root,
+        preferred_name=upload_plan.root_directory_name,
+    )
+    imported_count = 0
+
+    try:
+        for upload_file, relative_path in prepared_files:
+            target_relative_path = upload_plan.to_target_relative_path(relative_path)
+            target_path = upload_dir / target_relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with target_path.open("wb") as output:
+                shutil.copyfileobj(upload_file.file, output)
+            imported_count += 1
+    finally:
+        for upload_file in files:
+            await upload_file.close()
+
+    logger.info(
+        "数据集文件已上传: path=%s imported=%s skipped=%s",
+        upload_dir,
+        imported_count,
+        skipped_count,
+    )
+    return DatasetUploadResult(
+        dataset_path=_display_path(upload_dir),
+        imported_count=imported_count,
+        skipped_count=skipped_count,
+        message=f"已上传 {imported_count} 个文件",
+    )
 
 
 @app.post("/api/evaluations", response_model=EvaluationCreated)
@@ -221,6 +343,110 @@ def _get_job(job_id: str) -> EvaluationJob:
     if job is None:
         raise HTTPException(status_code=404, detail=f"评估任务不存在: {job_id}")
     return job
+
+
+def _file_root() -> Path:
+    return _workspace_root()
+
+
+def _upload_root() -> Path:
+    configured_upload_root = os.environ.get("PRAMA_UPLOAD_ROOT")
+    if configured_upload_root:
+        return Path(configured_upload_root).resolve()
+    return _workspace_root()
+
+
+def _workspace_root() -> Path:
+    return Path(
+        os.environ.get("PRAMA_WORKDIR")
+        or os.environ.get("PRAMA_FILE_ROOT")
+        or "data-bin"
+    ).resolve()
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _resolve_under_root(path: str | None, *, root: Path) -> Path:
+    root = root.resolve()
+    target = root if not path else Path(path).expanduser().resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise HTTPException(status_code=403, detail="路径不在允许访问的目录内") from error
+    return target
+
+
+def _safe_relative_upload_path(raw_name: str) -> Path | None:
+    cleaned = raw_name.replace("\\", "/").lstrip("/")
+    if not cleaned:
+        return None
+    relative_path = Path(cleaned)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return None
+    if relative_path.suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
+        return None
+    safe_parts = [
+        "".join(
+            char if char.isalnum() or char in ("-", "_", ".", " ") else "_"
+            for char in part
+        ).strip()
+        for part in relative_path.parts
+    ]
+    safe_parts = [part for part in safe_parts if part]
+    if not safe_parts:
+        return None
+    return Path(*safe_parts)
+
+
+@dataclass(frozen=True)
+class UploadPlan:
+    root_directory_name: str
+    strip_top_level_directory: bool = False
+
+    def to_target_relative_path(self, relative_path: Path) -> Path:
+        if self.strip_top_level_directory:
+            return Path(*relative_path.parts[1:])
+        return relative_path
+
+
+def _build_upload_plan(relative_paths: list[Path]) -> UploadPlan:
+    top_level_parts = {path.parts[0] for path in relative_paths if path.parts}
+    should_preserve_directory = (
+        len(top_level_parts) == 1
+        and any(len(path.parts) > 1 for path in relative_paths)
+    )
+    if should_preserve_directory:
+        return UploadPlan(
+            root_directory_name=next(iter(top_level_parts)),
+            strip_top_level_directory=True,
+        )
+    return UploadPlan(root_directory_name="upload")
+
+
+def _allocate_upload_directory(upload_root: Path, *, preferred_name: str) -> Path:
+    safe_name = _safe_directory_name(preferred_name) or "upload"
+    candidate = upload_root / safe_name
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+
+    suffix = uuid4().hex[:8]
+    candidate = upload_root / f"{safe_name}-{suffix}"
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def _safe_directory_name(value: str) -> str:
+    sanitized = "".join(
+        char if char.isalnum() or char in ("-", "_", ".", " ") else "_"
+        for char in value
+    ).strip()
+    return sanitized
 
 
 def _run_evaluation(job: EvaluationJob) -> None:

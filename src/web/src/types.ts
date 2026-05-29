@@ -216,3 +216,22 @@ export interface EvaluationFormState {
   hit_threshold: string;
   streaming: boolean;
 }
+
+export interface ServerDirectoryEntry {
+  name: string;
+  path: string;
+  kind: "directory" | "file";
+}
+
+export interface ServerDirectoryListing {
+  currentPath: string;
+  parentPath: string | null;
+  entries: ServerDirectoryEntry[];
+}
+
+export interface DatasetUploadResult {
+  dataset_path: string;
+  imported_count: number;
+  skipped_count?: number;
+  message?: string;
+}

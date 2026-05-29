@@ -1,7 +1,7 @@
 {
   "name": "prama-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0a4",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "scripts": {
@@ -11,12 +11,13 @@
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "svara-ui": "0.1.0"
   },
   "devDependencies": {
-    "@types/react": "^18.3.28",
-    "@types/react-dom": "^18.3.7",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
     "@vitejs/plugin-react": "^4.3.4",
     "sass": "^1.99.0",
     "typescript": "^5.6.3",

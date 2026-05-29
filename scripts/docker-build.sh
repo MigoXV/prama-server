@@ -1,11 +1,18 @@
-# 前端
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERSION="${VERSION:-0.2.0a4}"
+REGISTRY="${REGISTRY:-registry.cn-hangzhou.aliyuncs.com/migo-dl}"
+FRONTEND_IMAGE="${FRONTEND_IMAGE:-${REGISTRY}/prama-server-frontend:${VERSION}}"
+BACKEND_IMAGE="${BACKEND_IMAGE:-${REGISTRY}/prama-server-backend:${VERSION}}"
+
 docker build \
   -f docker/frontend.dockerfile \
-  -t registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-frontend:0.1.0 \
+  -t "${FRONTEND_IMAGE}" \
   .
 
-# 后端
 docker build \
   -f docker/backend.dockerfile \
-  -t registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-backend:0.1.0 \
+  -t "${BACKEND_IMAGE}" \
   .

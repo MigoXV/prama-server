@@ -68,6 +68,14 @@ body {
   color: var(--text);
 }
 
+.app-theme-root {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 100%;
+  background: var(--bg);
+}
+
 button,
 input {
   font: inherit;
@@ -384,6 +392,12 @@ button:disabled {
   padding: 14px;
 }
 
+.evaluation-form {
+  max-height: calc(100vh - 176px);
+  overflow: auto;
+  padding-bottom: 0;
+}
+
 .panel-heading {
   display: flex;
   align-items: center;
@@ -676,6 +690,39 @@ button:disabled {
   }
 }
 
+.dataset-path-field {
+  display: grid;
+  gap: 5px;
+}
+
+.dataset-path-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.dataset-action-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 38px;
+  padding-inline: 14px;
+  color: var(--text);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.dataset-upload-button {
+  padding-inline: 12px;
+}
+
+.dataset-browser-button {
+  min-width: 68px;
+}
+
 .check-field {
   display: flex;
   min-height: 38px;
@@ -719,10 +766,25 @@ button:disabled {
   grid-template-columns: 1fr 1fr;
 }
 
+.form-action-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  margin-top: 12px;
+  margin-inline: -14px;
+  padding: 12px 14px 14px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface) 0%, transparent) 0%,
+    color-mix(in srgb, var(--surface) 94%, transparent) 22%,
+    var(--surface) 100%
+  );
+  backdrop-filter: blur(12px);
+}
+
 .primary-action {
   width: 100%;
   min-height: 40px;
-  margin-top: 12px;
   border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
   background: var(--accent);
@@ -1448,6 +1510,10 @@ tbody tr:last-child td {
   .vad-summary,
   .sample-grid {
     grid-template-columns: 1fr;
+  }
+
+  .dataset-path-controls {
+    grid-template-columns: 1fr auto auto;
   }
 
   .mask-row {

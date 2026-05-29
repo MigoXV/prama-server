@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
@@ -185,6 +186,101 @@ class HttpRecalculateTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.headers["content-type"].startswith("audio/"))
             self.assertEqual(missing_response.status_code, 404)
+
+    def test_directory_browser_lists_root_and_rejects_path_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "data-bin"
+            dataset_dir = root / "dataset"
+            dataset_dir.mkdir(parents=True)
+            (dataset_dir / "metadata.jsonl").write_text("{}", encoding="utf-8")
+            (root / "sample.wav").write_bytes(b"audio")
+
+            with patch.dict("os.environ", {"PRAMA_WORKDIR": str(root)}):
+                response = client.get("/api/files/directories")
+                child_response = client.get(
+                    "/api/files/directories",
+                    params={"path": str(dataset_dir)},
+                )
+                escape_response = client.get(
+                    "/api/files/directories",
+                    params={"path": str(root.parent)},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["currentPath"], str(root))
+            self.assertIn(
+                {"name": "dataset", "path": str(dataset_dir), "kind": "directory"},
+                payload["entries"],
+            )
+            self.assertIn(
+                {"name": "sample.wav", "path": str(root / "sample.wav"), "kind": "file"},
+                payload["entries"],
+            )
+            self.assertEqual(child_response.status_code, 200)
+            self.assertEqual(child_response.json()["parentPath"], str(root))
+            self.assertEqual(escape_response.status_code, 403)
+
+    def test_upload_dataset_saves_supported_files_and_skips_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workdir = Path(temp_dir) / "workdir"
+            with patch.dict("os.environ", {"PRAMA_WORKDIR": str(workdir)}):
+                response = client.post(
+                    "/api/datasets/upload",
+                    files=[
+                        ("files", ("audio.wav", b"audio", "audio/wav")),
+                        ("files", ("metadata.jsonl", b"{}", "application/json")),
+                        ("files", ("notes.exe", b"skip", "application/octet-stream")),
+                    ],
+                )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            dataset_path = Path(payload["dataset_path"])
+            self.assertEqual(payload["imported_count"], 2)
+            self.assertEqual(payload["skipped_count"], 1)
+            self.assertEqual(dataset_path.parent, workdir)
+            self.assertTrue((dataset_path / "audio.wav").exists())
+            self.assertTrue((dataset_path / "metadata.jsonl").exists())
+            self.assertFalse((dataset_path / "notes.exe").exists())
+
+    def test_upload_dataset_preserves_uploaded_directory_under_workdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workdir = Path(temp_dir) / "workdir"
+            with patch.dict("os.environ", {"PRAMA_WORKDIR": str(workdir)}):
+                response = client.post(
+                    "/api/datasets/upload",
+                    files=[
+                        (
+                            "files",
+                            ("demo-dataset/audio.wav", b"audio", "audio/wav"),
+                        ),
+                        (
+                            "files",
+                            ("demo-dataset/metadata.jsonl", b"{}", "application/json"),
+                        ),
+                    ],
+                )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            dataset_path = Path(payload["dataset_path"])
+            self.assertEqual(dataset_path, workdir / "demo-dataset")
+            self.assertTrue((dataset_path / "audio.wav").exists())
+            self.assertTrue((dataset_path / "metadata.jsonl").exists())
+
+    def test_upload_dataset_rejects_all_unsupported_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                "os.environ",
+                {"PRAMA_WORKDIR": str(Path(temp_dir) / "workdir")},
+            ):
+                response = client.post(
+                    "/api/datasets/upload",
+                    files=[("files", ("bad.exe", b"skip", "application/octet-stream"))],
+                )
+
+            self.assertEqual(response.status_code, 400)
 
 
 def _put_job(job: EvaluationJob) -> None:

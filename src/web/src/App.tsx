@@ -9,6 +9,7 @@ import {
   Download,
   EyeOff,
   FileText,
+  Upload,
   Moon,
   Pause,
   Play,
@@ -22,12 +23,27 @@ import {
 } from "lucide-react";
 import type { ChangeEvent, FormEvent, MouseEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Button,
+  Field,
+  GhostButton,
+  MetricTile,
+  SegmentedControl,
+  ServerDirectoryBrowserDialog,
+  SidebarPane,
+  StatusChip,
+  SvaraThemeProvider,
+  WorkbenchShell,
+  WorkspacePane,
+} from "svara-ui";
 import { usePersistentState } from "./hooks/usePersistentState";
 import { useThemeMode } from "./hooks/useThemeMode";
 import {
   createEvaluation,
+  listServerDirectory,
   recalculateEvaluationMetrics,
   subscribeEvaluationEvents,
+  uploadDatasetFiles,
 } from "./services/evaluations";
 import type {
   EvaluationFormState,
@@ -107,7 +123,7 @@ type ReportSortMode =
   | "cer-asc";
 
 export default function App() {
-  const { themeMode, setThemeMode } = useThemeMode();
+  const { themeMode, effectiveTheme, setThemeMode } = useThemeMode();
   const [storedFormState, setFormState] = usePersistentState<EvaluationFormState>(
     "prama.evaluationForm",
     DEFAULT_FORM_STATE,
@@ -128,6 +144,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [connectionWarning, setConnectionWarning] = useState("");
   const [busy, setBusy] = useState(false);
+  const [datasetUploading, setDatasetUploading] = useState(false);
   const [recalculating, setRecalculating] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "results" | "report">(
     "overview",
@@ -137,15 +154,21 @@ export default function App() {
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
   const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
   const [resultJumpIndex, setResultJumpIndex] = useState("");
+  const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
   const [highlightedResultIndex, setHighlightedResultIndex] = useState<number | null>(
     null,
   );
   const resultRowRefs = useRef(new Map<number, HTMLTableRowElement>());
   const closeEventsRef = useRef<(() => void) | null>(null);
+  const datasetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
 
   useEffect(() => {
     return () => closeEventsRef.current?.();
+  }, []);
+
+  useEffect(() => {
+    datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
   }, []);
 
   useEffect(() => {
@@ -334,6 +357,33 @@ export default function App() {
     setFormState((current) => ({ ...current, [field]: value }));
   }
 
+  async function handleImportDataset(files: File[]) {
+    const result = await uploadDatasetFiles(files);
+    updateField("dataset_path", result.dataset_path);
+    return {
+      importedCount: result.imported_count,
+      skippedCount: result.skipped_count,
+      message: result.message,
+    };
+  }
+
+  async function handleDatasetUploadChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) {
+      return;
+    }
+    setDatasetUploading(true);
+    setErrorMessage("");
+    try {
+      await handleImportDataset(files);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "数据集上传失败");
+    } finally {
+      setDatasetUploading(false);
+      event.target.value = "";
+    }
+  }
+
   function resetForm() {
     setFormState(DEFAULT_FORM_STATE);
   }
@@ -374,8 +424,13 @@ export default function App() {
   }
 
   return (
-    <div className="console-frame">
-      <aside className="sidebar">
+    <SvaraThemeProvider
+      mode={effectiveTheme}
+      applyBackground={false}
+      className="app-theme-root"
+    >
+      <WorkbenchShell className="console-frame" sidebarWidth={232} variant="bare">
+        <SidebarPane className="sidebar" variant="bare">
         <div className="sidebar-brand">
           <div className="brand-symbol">
             <Server size={19} />
@@ -426,9 +481,9 @@ export default function App() {
             />
           </div>
         </div>
-      </aside>
+        </SidebarPane>
 
-      <main className="workspace">
+        <WorkspacePane className="workspace" variant="bare">
         <header className="workspace-header">
           <div>
             <p className="eyebrow">{isVad ? "VAD Evaluation" : "ASR Evaluation"}</p>
@@ -485,7 +540,7 @@ export default function App() {
         </div>
 
         <section className="work-grid">
-          <form ref={formRef} className="panel evaluation-form" onSubmit={handleSubmit}>
+          <form ref={formRef} className="panel evaluation-form svara-surface svara-surface-padded" onSubmit={handleSubmit}>
             <div className="panel-heading">
               <div>
                 <h2>评估参数</h2>
@@ -507,12 +562,40 @@ export default function App() {
                 onChange={(value) => updateField("target", value)}
                 required
               />
-              <TextField
-                label="数据集路径"
-                value={formState.dataset_path}
-                onChange={(value) => updateField("dataset_path", value)}
-                required
-              />
+              <label className="field dataset-path-field">
+                <span>数据集路径</span>
+                <div className="dataset-path-controls">
+                  <input
+                    value={formState.dataset_path}
+                    required
+                    disabled={busy || datasetUploading}
+                    onChange={(event) => updateField("dataset_path", event.target.value)}
+                  />
+                  <input
+                    ref={datasetUploadInputRef}
+                    type="file"
+                    hidden
+                    multiple
+                    accept=".wav,.mp3,.flac,.ogg,.json,.jsonl,.csv,.parquet,.txt"
+                    onChange={handleDatasetUploadChange}
+                  />
+                  <GhostButton
+                    className="dataset-action-button dataset-upload-button"
+                    disabled={busy || datasetUploading}
+                    onClick={() => datasetUploadInputRef.current?.click()}
+                  >
+                    <Upload size={14} />
+                    <span>{datasetUploading ? "上传中" : "上传"}</span>
+                  </GhostButton>
+                  <GhostButton
+                    className="dataset-action-button dataset-browser-button"
+                    disabled={busy || datasetUploading}
+                    onClick={() => setDirectoryBrowserOpen(true)}
+                  >
+                    浏览
+                  </GhostButton>
+                </div>
+              </label>
               <TextField
                 label="Split"
                 value={formState.split}
@@ -671,9 +754,11 @@ export default function App() {
               </div>
             ) : null}
 
-            <button type="submit" className="primary-action" disabled={busy}>
-              {busy ? "评估中..." : "启动评估"}
-            </button>
+            <div className="form-action-bar">
+              <Button type="submit" className="primary-action" disabled={busy || datasetUploading} stretch>
+                {busy ? "评估中..." : "启动评估"}
+              </Button>
+            </div>
           </form>
 
           <section className="run-column">
@@ -841,8 +926,19 @@ export default function App() {
             ) : null}
           </section>
         </section>
-      </main>
-    </div>
+        <ServerDirectoryBrowserDialog
+          isOpen={directoryBrowserOpen}
+          initialPath={undefined}
+          listDirectory={listServerDirectory}
+          onClose={() => setDirectoryBrowserOpen(false)}
+          onSelect={(path) => {
+            updateField("dataset_path", path);
+            setDirectoryBrowserOpen(false);
+          }}
+        />
+        </WorkspacePane>
+      </WorkbenchShell>
+    </SvaraThemeProvider>
   );
 }
 
@@ -907,10 +1003,10 @@ function StatusPill({ status }: { status: JobStatus | "idle" | "started" }) {
           ? CircleDashed
           : BarChart3;
   return (
-    <div className={`status-pill status-${status}`}>
+    <StatusChip className={`status-pill status-${status}`}>
       <Icon size={15} />
       {STATUS_LABELS[status]}
-    </div>
+    </StatusChip>
   );
 }
 
@@ -938,8 +1034,7 @@ function TextField({
   disabled?: boolean;
 }) {
   return (
-    <label className="field">
-      <span>{label}</span>
+    <Field label={label} className="field">
       <input
         value={value}
         type={type}
@@ -951,7 +1046,7 @@ function TextField({
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
       />
-    </label>
+    </Field>
   );
 }
 
@@ -963,34 +1058,21 @@ function TaskSelector({
   onChange: (task: EvaluationTask) => void;
 }) {
   return (
-    <div className="task-selector" role="radiogroup" aria-label="评估类型">
-      <button
-        type="button"
-        className={value === "asr" ? "active" : ""}
-        onClick={() => onChange("asr")}
-      >
-        <Activity size={16} />
-        <span>ASR</span>
-      </button>
-      <button
-        type="button"
-        className={value === "vad" ? "active" : ""}
-        onClick={() => onChange("vad")}
-      >
-        <Radio size={16} />
-        <span>VAD</span>
-      </button>
-    </div>
+    <SegmentedControl
+      ariaLabel="评估类型"
+      className="task-selector"
+      value={value}
+      onChange={onChange}
+      options={[
+        { value: "asr", label: <><Activity size={16} /><span>ASR</span></> },
+        { value: "vad", label: <><Radio size={16} /><span>VAD</span></> },
+      ]}
+    />
   );
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+  return <MetricTile className="metric" label={label} value={value} />;
 }
 
 function TextBlock({ label, value }: { label: string; value: string }) {
