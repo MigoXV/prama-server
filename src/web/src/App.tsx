@@ -2,13 +2,10 @@ import {
   Activity,
   BarChart3,
   CheckCircle2,
-  ChevronDown,
   CircleDashed,
   Clipboard,
-  Database,
   Download,
   EyeOff,
-  FileText,
   Upload,
   Moon,
   Pause,
@@ -16,10 +13,8 @@ import {
   Server,
   Settings,
   Sun,
-  TerminalSquare,
   TriangleAlert,
   Monitor,
-  Radio,
 } from "lucide-react";
 import type { ChangeEvent, FormEvent, MouseEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -28,7 +23,6 @@ import {
   Field,
   GhostButton,
   MetricTile,
-  SegmentedControl,
   ServerDirectoryBrowserDialog,
   SidebarPane,
   StatusChip,
@@ -51,9 +45,9 @@ import type {
   EvaluationRequest,
   EvaluationResult,
   EvaluationTask,
-  InferenceRow,
   JobStatus,
   ThemeMode,
+  VadReportRegion,
   VadReportSample,
   VadReportSegment,
   WerReport,
@@ -79,9 +73,14 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   remove_punctuation: false,
   mask_frame_seconds: "0.01",
   chunk_duration_seconds: "0.1",
+  speech_padding_seconds: "0",
   hit_threshold: "0.9",
   streaming: false,
 };
+
+const VAD_TIMELINE_LABEL_WIDTH = 88;
+const VAD_TIMELINE_PIXELS_PER_SECOND = 24;
+const VAD_TIMELINE_MIN_WIDTH = 760;
 
 const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
   asr: {
@@ -96,6 +95,19 @@ const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
   },
 };
 
+type TaskRememberedFields = Pick<EvaluationFormState, "target" | "dataset_path">;
+
+const TASK_REMEMBERED_DEFAULTS: Record<EvaluationTask, TaskRememberedFields> = {
+  asr: {
+    target: "192.168.0.222:50011",
+    dataset_path: "data-bin/audiofolder/asr-demo",
+  },
+  vad: {
+    target: "192.168.0.222:50021",
+    dataset_path: "data-bin/audiofolder/vad-demo",
+  },
+};
+
 const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
   idle: "未启动",
   queued: "排队中",
@@ -105,12 +117,15 @@ const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
   failed: "失败",
 };
 
-const MODULES = [
-  { label: "在线评估", icon: Activity, active: true },
-  { label: "任务队列", icon: TerminalSquare, active: false },
-  { label: "数据集", icon: Database, active: false },
-  { label: "报告", icon: FileText, active: false },
-  { label: "设置", icon: Settings, active: false },
+type ConsoleModule = "evaluation" | "settings";
+
+const MODULES: Array<{
+  id: ConsoleModule;
+  label: string;
+  icon: typeof Activity;
+}> = [
+  { id: "evaluation", label: "在线评估", icon: Activity },
+  { id: "settings", label: "设置", icon: Settings },
 ];
 
 type AlignmentMetric = "wer" | "cer";
@@ -129,14 +144,12 @@ export default function App() {
     DEFAULT_FORM_STATE,
   );
   const formState = { ...DEFAULT_FORM_STATE, ...storedFormState };
-  const [advancedOpen, setAdvancedOpen] = usePersistentState(
-    "prama.advancedOpen",
-    false,
-  );
+  const [taskRememberedFields, setTaskRememberedFields] = usePersistentState<
+    Record<EvaluationTask, TaskRememberedFields>
+  >("prama.taskRememberedFields", TASK_REMEMBERED_DEFAULTS);
   const [status, setStatus] = useState<JobStatus | "idle" | "started">("idle");
   const [jobId, setJobId] = useState("");
   const [progress, setProgress] = useState<EvaluationProgress | null>(null);
-  const [rows, setRows] = useState<InferenceRow[]>([]);
   const [finalResult, setFinalResult] = useState<EvaluationResult | null>(null);
   const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(
     () => new Set(),
@@ -146,19 +159,16 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [datasetUploading, setDatasetUploading] = useState(false);
   const [recalculating, setRecalculating] = useState(false);
-  const [activeTab, setActiveTab] = useState<"overview" | "results" | "report">(
-    "overview",
-  );
+  const [activeModule, setActiveModule] = useState<ConsoleModule>("evaluation");
+  const [activeTab, setActiveTab] = useState<"overview" | "report">("overview");
   const [activeAlignmentMetric, setActiveAlignmentMetric] =
     useState<AlignmentMetric>("wer");
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
   const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
-  const [resultJumpIndex, setResultJumpIndex] = useState("");
   const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
-  const [highlightedResultIndex, setHighlightedResultIndex] = useState<number | null>(
-    null,
+  const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
+    formState.dataset_path,
   );
-  const resultRowRefs = useRef(new Map<number, HTMLTableRowElement>());
   const closeEventsRef = useRef<(() => void) | null>(null);
   const datasetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
@@ -169,7 +179,7 @@ export default function App() {
 
   useEffect(() => {
     datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
-  }, []);
+  }, [activeModule]);
 
   useEffect(() => {
     function handleGlobalKeyDown(event: KeyboardEvent) {
@@ -205,16 +215,12 @@ export default function App() {
     setStatus("idle");
     setJobId("");
     setProgress(null);
-    setRows([]);
     setFinalResult(null);
     setExcludedSampleIds(new Set());
     setErrorMessage("");
     setConnectionWarning("");
     setBusy(false);
     setRecalculating(false);
-    setResultJumpIndex("");
-    setHighlightedResultIndex(null);
-    resultRowRefs.current.clear();
   }
 
   function handleTaskChange(task: EvaluationTask) {
@@ -222,11 +228,19 @@ export default function App() {
       return;
     }
     resetRunState();
+    const nextTaskRemembered =
+      taskRememberedFields[task] ?? TASK_REMEMBERED_DEFAULTS[task];
+    setTaskRememberedFields((current) => ({
+      ...current,
+      [formState.task]: pickTaskRememberedFields(formState),
+    }));
     setFormState((current) => ({
       ...current,
       ...TASK_DEFAULTS[task],
+      ...nextTaskRemembered,
       task,
     }));
+    setDirectoryBrowserPath(nextTaskRemembered.dataset_path);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -236,7 +250,6 @@ export default function App() {
     setBusy(true);
     setErrorMessage("");
     setConnectionWarning("");
-    setRows([]);
     setProgress(null);
     setFinalResult(null);
     setExcludedSampleIds(new Set());
@@ -253,7 +266,6 @@ export default function App() {
           setConnectionWarning("");
           setProgress(nextProgress);
           setStatus(nextProgress.status ?? "running");
-          appendProgressRow(nextProgress);
           if (nextProgress.result) {
             setFinalResult(nextProgress.result);
           }
@@ -273,9 +285,6 @@ export default function App() {
           setErrorMessage(snapshot.error ?? "");
           setBusy(false);
           closeEventsRef.current = null;
-          if (snapshot.progress) {
-            appendProgressRow(snapshot.progress);
-          }
         },
         onError: (message) => {
           setStatus("failed");
@@ -291,32 +300,6 @@ export default function App() {
       setErrorMessage(error instanceof Error ? error.message : "评估任务创建失败");
       setBusy(false);
     }
-  }
-
-  function appendProgressRow(nextProgress: EvaluationProgress) {
-    const sampleId = nextProgress.id || nextProgress.current_id;
-    if (!sampleId) {
-      return;
-    }
-
-    setRows((currentRows) => {
-      const index = nextProgress.evaluated ?? currentRows.length + 1;
-      if (currentRows.some((row) => row.index === index && row.sampleId === sampleId)) {
-        return currentRows;
-      }
-
-      return [
-        ...currentRows,
-        {
-          index,
-          sampleId,
-          reference: nextProgress.reference || "-",
-          hypothesis: nextProgress.hypothesis || "-",
-          audioUrl: nextProgress.audio_url,
-          durationSeconds: nextProgress.duration_seconds,
-        },
-      ];
-    });
   }
 
   function toggleExcludedSample(sampleId: string, excluded: boolean) {
@@ -355,11 +338,21 @@ export default function App() {
 
   function updateField(field: keyof EvaluationFormState, value: string) {
     setFormState((current) => ({ ...current, [field]: value }));
+    if (field === "target" || field === "dataset_path") {
+      setTaskRememberedFields((current) => ({
+        ...current,
+        [formState.task]: {
+          ...(current[formState.task] ?? TASK_REMEMBERED_DEFAULTS[formState.task]),
+          [field]: value,
+        },
+      }));
+    }
   }
 
   async function handleImportDataset(files: File[]) {
     const result = await uploadDatasetFiles(files);
     updateField("dataset_path", result.dataset_path);
+    setDirectoryBrowserPath(result.dataset_path);
     return {
       importedCount: result.imported_count,
       skippedCount: result.skipped_count,
@@ -386,6 +379,8 @@ export default function App() {
 
   function resetForm() {
     setFormState(DEFAULT_FORM_STATE);
+    setTaskRememberedFields(TASK_REMEMBERED_DEFAULTS);
+    setDirectoryBrowserPath(DEFAULT_FORM_STATE.dataset_path);
   }
 
   async function copyText(value: string) {
@@ -410,19 +405,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
-  function jumpToResultIndex() {
-    const index = Number(resultJumpIndex);
-    if (!Number.isInteger(index) || index < 1) {
-      return;
-    }
-    const row = resultRowRefs.current.get(index);
-    if (!row) {
-      return;
-    }
-    row.scrollIntoView({ block: "center", behavior: "smooth" });
-    setHighlightedResultIndex(index);
-  }
-
   return (
     <SvaraThemeProvider
       mode={effectiveTheme}
@@ -445,186 +427,269 @@ export default function App() {
           {MODULES.map((item) => {
             const Icon = item.icon;
             return (
-              <button
-                key={item.label}
-                type="button"
-                className={`module-item ${item.active ? "active" : ""}`}
-                disabled={!item.active}
-              >
-                <Icon size={17} />
-                <span>{item.label}</span>
-              </button>
+              <div className="module-group" key={item.id}>
+                <button
+                  type="button"
+                  className={`module-item ${activeModule === item.id ? "active" : ""}`}
+                  onClick={() => setActiveModule(item.id)}
+                >
+                  <Icon size={17} />
+                  <span>{item.label}</span>
+                </button>
+                {item.id === "evaluation" ? (
+                  <div className="task-nav" aria-label="评估类型">
+                    <button
+                      type="button"
+                      className={formState.task === "asr" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("asr");
+                      }}
+                    >
+                      ASR
+                    </button>
+                    <button
+                      type="button"
+                      className={formState.task === "vad" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("vad");
+                      }}
+                    >
+                      VAD
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             );
           })}
         </nav>
 
-        <div className="sidebar-footer">
-          <span className="sidebar-label">主题</span>
-          <div className="theme-switcher" aria-label="主题切换">
-            <ThemeButton
-              label="系统"
-              active={themeMode === "system"}
-              mode="system"
-              onClick={setThemeMode}
-            />
-            <ThemeButton
-              label="白色"
-              active={themeMode === "light"}
-              mode="light"
-              onClick={setThemeMode}
-            />
-            <ThemeButton
-              label="黑色"
-              active={themeMode === "dark"}
-              mode="dark"
-              onClick={setThemeMode}
-            />
-          </div>
-        </div>
         </SidebarPane>
 
-        <WorkspacePane className="workspace" variant="bare">
-        <header className="workspace-header">
-          <div>
-            <p className="eyebrow">{isVad ? "VAD Evaluation" : "ASR Evaluation"}</p>
-            <h1>{isVad ? "语音活动检测评估" : "语音识别评估"}</h1>
-          </div>
-          <div className="header-actions">
-            <StatusPill status={status} />
-            <button
-              type="button"
-              className="icon-action"
-              title="复制任务 ID"
-              aria-label="复制任务 ID"
-              disabled={!jobId}
-              onClick={() => void copyText(jobId)}
-            >
-              <Clipboard size={16} />
-            </button>
-            <button
-              type="button"
-              className="icon-action"
-              title="下载结果 JSON"
-              aria-label="下载结果 JSON"
-              disabled={!canExport}
-              onClick={downloadResult}
-            >
-              <Download size={16} />
-            </button>
-          </div>
-        </header>
-
-        <div className="page-tabs" role="tablist" aria-label="评估视图">
-          <TabButton
-            active={activeTab === "overview"}
-            label="运行概览"
-            meta={STATUS_LABELS[status]}
-            onClick={() => setActiveTab("overview")}
-          />
-          <TabButton
-            active={activeTab === "report"}
-            label={isVad ? "VAD 指标" : "对齐报告"}
-            meta={
-              isVad
-                ? `${formatNumber(finalResult?.sample_count)} 个样本`
-                : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
-            }
-            onClick={() => setActiveTab("report")}
-          />
-          <TabButton
-            active={activeTab === "results"}
-            label="推理结果"
-            meta={`${rows.length} 条`}
-            onClick={() => setActiveTab("results")}
-          />
-        </div>
-
-        <section className="work-grid">
-          <form ref={formRef} className="panel evaluation-form svara-surface svara-surface-padded" onSubmit={handleSubmit}>
-            <div className="panel-heading">
-              <div>
-                <h2>评估参数</h2>
-                <span>Job {jobId || "-"}</span>
-              </div>
-              <button type="button" className="ghost-button" onClick={resetForm}>
-                重置
+        <WorkspacePane
+          className={`workspace ${
+            activeModule === "evaluation" ? "" : "workspace-compact"
+          }`}
+          variant="bare"
+        >
+        {activeModule === "evaluation" ? (
+          <header className="workspace-header">
+            <div>
+              <p className="eyebrow">{isVad ? "VAD Evaluation" : "ASR Evaluation"}</p>
+              <h1>{isVad ? "语音活动检测评估" : "语音识别评估"}</h1>
+            </div>
+            <div className="header-actions">
+              <StatusPill status={status} />
+              <button
+                type="button"
+                className="icon-action"
+                title="复制任务 ID"
+                aria-label="复制任务 ID"
+                disabled={!jobId}
+                onClick={() => void copyText(jobId)}
+              >
+                <Clipboard size={16} />
+              </button>
+              <button
+                type="button"
+                className="icon-action"
+                title="下载结果 JSON"
+                aria-label="下载结果 JSON"
+                disabled={!canExport}
+                onClick={downloadResult}
+              >
+                <Download size={16} />
               </button>
             </div>
+          </header>
+        ) : null}
 
-            <div className="field-grid">
-              <TaskSelector
-                value={formState.task}
-                onChange={handleTaskChange}
-              />
-              <TextField
-                label={`${isVad ? "VAD" : "ASR"} gRPC 地址`}
-                value={formState.target}
-                onChange={(value) => updateField("target", value)}
-                required
-              />
-              <label className="field dataset-path-field">
-                <span>数据集路径</span>
-                <div className="dataset-path-controls">
-                  <input
-                    value={formState.dataset_path}
-                    required
-                    disabled={busy || datasetUploading}
-                    onChange={(event) => updateField("dataset_path", event.target.value)}
-                  />
-                  <input
-                    ref={datasetUploadInputRef}
-                    type="file"
-                    hidden
-                    multiple
-                    accept=".wav,.mp3,.flac,.ogg,.json,.jsonl,.csv,.parquet,.txt"
-                    onChange={handleDatasetUploadChange}
-                  />
-                  <GhostButton
-                    className="dataset-action-button dataset-upload-button"
-                    disabled={busy || datasetUploading}
-                    onClick={() => datasetUploadInputRef.current?.click()}
-                  >
-                    <Upload size={14} />
-                    <span>{datasetUploading ? "上传中" : "上传"}</span>
-                  </GhostButton>
-                  <GhostButton
-                    className="dataset-action-button dataset-browser-button"
-                    disabled={busy || datasetUploading}
-                    onClick={() => setDirectoryBrowserOpen(true)}
-                  >
-                    浏览
-                  </GhostButton>
-                </div>
-              </label>
-              <TextField
-                label="Split"
-                value={formState.split}
-                onChange={(value) => updateField("split", value)}
-                required
-              />
-              <TextField
-                label="Limit"
-                value={formState.limit}
-                type="number"
-                min="1"
-                placeholder="不限制"
-                onChange={(value) => updateField("limit", value)}
-              />
-            </div>
+        {activeModule === "evaluation" ? (
+          <div className="page-tabs" role="tablist" aria-label="评估视图">
+            <TabButton
+              active={activeTab === "overview"}
+              label="运行概览"
+              meta={STATUS_LABELS[status]}
+              onClick={() => setActiveTab("overview")}
+            />
+            <TabButton
+              active={activeTab === "report"}
+              label={isVad ? "VAD 指标" : "对齐报告"}
+              meta={
+                isVad
+                  ? `${formatNumber(finalResult?.sample_count)} 个样本`
+                  : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
+              }
+              onClick={() => setActiveTab("report")}
+            />
+          </div>
+        ) : null}
 
-            <button
-              type="button"
-              className={`advanced-toggle ${advancedOpen ? "open" : ""}`}
-              onClick={() => setAdvancedOpen((value) => !value)}
+        <section
+          className={`work-grid ${
+            activeModule === "evaluation" ? "" : "single-column"
+          }`}
+        >
+          {activeModule === "evaluation" ? (
+            <form
+              ref={formRef}
+              className="panel evaluation-form svara-surface svara-surface-padded"
+              onSubmit={handleSubmit}
             >
-              <span>高级参数</span>
-              <ChevronDown size={16} />
-            </button>
+              <div className="panel-heading">
+                <div>
+                  <h2>{isVad ? "VAD 在线评估" : "ASR 在线评估"}</h2>
+                  <span>Job {jobId || "-"}</span>
+                </div>
+              </div>
 
-            {advancedOpen ? (
-              <div className="field-grid advanced-grid">
-                {!isVad ? (
-                  <>
+              <div className="field-grid">
+                <TextField
+                  label={`${isVad ? "VAD" : "ASR"} 引擎地址`}
+                  value={formState.target}
+                  onChange={(value) => updateField("target", value)}
+                  required
+                />
+                <label className="field dataset-path-field">
+                  <span>数据集路径</span>
+                  <div className="dataset-path-controls">
+                    <input
+                      value={formState.dataset_path}
+                      required
+                      disabled={busy || datasetUploading}
+                      onChange={(event) => updateField("dataset_path", event.target.value)}
+                    />
+                    <input
+                      ref={datasetUploadInputRef}
+                      type="file"
+                      hidden
+                      multiple
+                      accept=".wav,.mp3,.flac,.ogg,.json,.jsonl,.csv,.parquet,.txt"
+                      onChange={handleDatasetUploadChange}
+                    />
+                    <GhostButton
+                      className="dataset-action-button dataset-upload-button"
+                      disabled={busy || datasetUploading}
+                      onClick={() => datasetUploadInputRef.current?.click()}
+                    >
+                      <Upload size={14} />
+                      <span>{datasetUploading ? "上传中" : "上传"}</span>
+                    </GhostButton>
+                    <GhostButton
+                      className="dataset-action-button dataset-browser-button"
+                      disabled={busy || datasetUploading}
+                      onClick={() => {
+                        setDirectoryBrowserPath(formState.dataset_path);
+                        setDirectoryBrowserOpen(true);
+                      }}
+                    >
+                      浏览
+                    </GhostButton>
+                  </div>
+                </label>
+                <div className="dataset-options-grid">
+                  <TextField
+                    label="Split"
+                    value={formState.split}
+                    onChange={(value) => updateField("split", value)}
+                    required
+                  />
+                  <TextField
+                    label="Limit"
+                    value={formState.limit}
+                    type="number"
+                    min="1"
+                    placeholder="不限制"
+                    onChange={(value) => updateField("limit", value)}
+                  />
+                </div>
+              </div>
+
+              <div className="form-action-bar">
+                <Button type="submit" className="primary-action" disabled={busy || datasetUploading} stretch>
+                  {busy ? "评估中..." : "启动评估"}
+                </Button>
+              </div>
+            </form>
+          ) : null}
+
+          {activeModule === "settings" ? (
+            <section className="panel configuration-panel settings-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>设置</h2>
+                  <span>ASR 与 VAD 的高级评估参数</span>
+                </div>
+                <button type="button" className="ghost-button" onClick={resetForm}>
+                  重置
+                </button>
+              </div>
+              <div className="settings-stack">
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>界面设置</h3>
+                  </div>
+                  <div className="theme-switcher settings-theme-switcher" aria-label="主题切换">
+                    <ThemeButton
+                      label="系统"
+                      active={themeMode === "system"}
+                      mode="system"
+                      onClick={setThemeMode}
+                    />
+                    <ThemeButton
+                      label="白色"
+                      active={themeMode === "light"}
+                      mode="light"
+                      onClick={setThemeMode}
+                    />
+                    <ThemeButton
+                      label="黑色"
+                      active={themeMode === "dark"}
+                      mode="dark"
+                      onClick={setThemeMode}
+                    />
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>通用设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="采样率"
+                      value={formState.sample_rate}
+                      type="number"
+                      min="1"
+                      onChange={(value) => updateField("sample_rate", value)}
+                      required
+                    />
+                    <TextField
+                      label="连接超时秒"
+                      value={formState.connect_timeout_seconds}
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      onChange={(value) => updateField("connect_timeout_seconds", value)}
+                    />
+                    <TextField
+                      label="请求超时秒"
+                      value={formState.request_timeout_seconds}
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      onChange={(value) => updateField("request_timeout_seconds", value)}
+                      required
+                    />
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>ASR 高级设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
                     <TextField
                       label="语言"
                       value={formState.language_code}
@@ -651,64 +716,6 @@ export default function App() {
                       step="0.1"
                       onChange={(value) => updateField("hotword_bias", value)}
                     />
-                  </>
-                ) : null}
-                <TextField
-                  label="采样率"
-                  value={formState.sample_rate}
-                  type="number"
-                  min="1"
-                  onChange={(value) => updateField("sample_rate", value)}
-                  required
-                />
-                {isVad ? (
-                  <>
-                    <TextField
-                      label="VAD 帧长秒"
-                      value={formState.mask_frame_seconds}
-                      type="number"
-                      min="0.001"
-                      step="0.001"
-                      onChange={(value) => updateField("mask_frame_seconds", value)}
-                    />
-                    <TextField
-                      label="VAD 分块秒"
-                      value={formState.chunk_duration_seconds}
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      onChange={(value) => updateField("chunk_duration_seconds", value)}
-                    />
-                    <TextField
-                      label="段命中阈值"
-                      value={formState.hit_threshold}
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      onChange={(value) => updateField("hit_threshold", value)}
-                    />
-                  </>
-                ) : null}
-                <TextField
-                  label="连接超时秒"
-                  value={formState.connect_timeout_seconds}
-                  type="number"
-                  min="0.1"
-                  step="0.1"
-                  onChange={(value) => updateField("connect_timeout_seconds", value)}
-                />
-                <TextField
-                  label="请求超时秒"
-                  value={formState.request_timeout_seconds}
-                  type="number"
-                  min="0.1"
-                  step="0.1"
-                  onChange={(value) => updateField("request_timeout_seconds", value)}
-                  required
-                />
-                {!isVad ? (
-                  <>
                     <label className="check-field">
                       <input
                         type="checkbox"
@@ -735,33 +742,72 @@ export default function App() {
                       />
                       <span>评估时去掉标点</span>
                     </label>
-                  </>
-                ) : (
-                  <label className="check-field">
-                    <input
-                      type="checkbox"
-                      checked={formState.streaming}
-                      onChange={(event) =>
-                        setFormState((current) => ({
-                          ...current,
-                          streaming: event.target.checked,
-                        }))
-                      }
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>VAD 高级设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="VAD 帧长秒"
+                      value={formState.mask_frame_seconds}
+                      type="number"
+                      min="0.001"
+                      step="0.001"
+                      onChange={(value) => updateField("mask_frame_seconds", value)}
                     />
-                    <span>使用 VAD 流式接口</span>
-                  </label>
-                )}
+                    <TextField
+                      label="VAD 分块秒"
+                      value={formState.chunk_duration_seconds}
+                      type="number"
+                      min="0.01"
+                      step="0.01"
+                      onChange={(value) => updateField("chunk_duration_seconds", value)}
+                    />
+                    <TextField
+                      label="语音扩展秒"
+                      value={formState.speech_padding_seconds ?? "0"}
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      onChange={(value) => updateField("speech_padding_seconds", value)}
+                    />
+                    <TextField
+                      label="段命中阈值"
+                      value={formState.hit_threshold}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      onChange={(value) => updateField("hit_threshold", value)}
+                    />
+                    <label className="check-field">
+                      <input
+                        type="checkbox"
+                        checked={formState.streaming}
+                        onChange={(event) =>
+                          setFormState((current) => ({
+                            ...current,
+                            streaming: event.target.checked,
+                          }))
+                        }
+                      />
+                      <span>使用 VAD 流式接口</span>
+                    </label>
+                  </div>
+                </section>
               </div>
-            ) : null}
+            </section>
+          ) : null}
 
-            <div className="form-action-bar">
-              <Button type="submit" className="primary-action" disabled={busy || datasetUploading} stretch>
-                {busy ? "评估中..." : "启动评估"}
-              </Button>
-            </div>
-          </form>
-
-          <section className="run-column">
+          {activeModule === "evaluation" ? (
+          <section
+            className={`run-column ${
+              activeTab === "report" ? "report-column" : "overview-column"
+            }`}
+          >
             {activeTab === "overview" ? (
               <>
                 <div className="panel progress-panel">
@@ -777,7 +823,7 @@ export default function App() {
                   </div>
                   <div className="metric-strip progress-metrics">
                     <Metric label="已处理" value={`${progress?.processed ?? 0} / ${progress?.total ?? 0}`} />
-                    <Metric label="已评估" value={String(progress?.evaluated ?? rows.length)} />
+                    <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
                   </div>
                   {connectionWarning ? (
                     <div className="inline-warning">
@@ -811,90 +857,6 @@ export default function App() {
               </>
             ) : null}
 
-            {activeTab === "results" ? (
-              <div className="panel result-panel">
-                <div className="panel-heading compact-heading">
-                  <div>
-                    <h2>推理结果</h2>
-                    <span>{rows.length} 条</span>
-                  </div>
-                  <div className="jump-control">
-                    <label>
-                      <span>跳转序号</span>
-                      <input
-                        type="number"
-                        min="1"
-                        value={resultJumpIndex}
-                        placeholder="例如 12"
-                        onChange={(event) => setResultJumpIndex(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            jumpToResultIndex();
-                          }
-                        }}
-                      />
-                    </label>
-                    <button type="button" onClick={jumpToResultIndex}>
-                      跳转
-                    </button>
-                  </div>
-                </div>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>屏蔽</th>
-                        <th>序号</th>
-                        <th>样本</th>
-                        <th>{isVad ? "Reference Segments" : "Reference"}</th>
-                        <th>{isVad ? "Prediction Segments" : "Hypothesis"}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.length ? (
-                        rows.map((row) => (
-                          <tr
-                            key={`${row.index}:${row.sampleId}`}
-                            className={
-                              highlightedResultIndex === row.index
-                                ? "highlighted-row"
-                                : ""
-                            }
-                            ref={(element) => {
-                              if (element) {
-                                resultRowRefs.current.set(row.index, element);
-                              } else {
-                                resultRowRefs.current.delete(row.index);
-                              }
-                            }}
-                          >
-                            <td>
-                              <ExcludeCheckbox
-                                checked={excludedSampleIds.has(row.sampleId)}
-                                onChange={(checked) =>
-                                  toggleExcludedSample(row.sampleId, checked)
-                                }
-                              />
-                            </td>
-                            <td>{row.index}</td>
-                            <td>{row.sampleId}</td>
-                            <td>{row.reference}</td>
-                            <td>{row.hypothesis}</td>
-                          </tr>
-                        ))
-                      ) : (
-                        <tr>
-                          <td colSpan={5} className="empty-cell">
-                            暂无推理结果
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            ) : null}
-
             {activeTab === "report" ? (
               isVad ? (
                 <VadReportPanel
@@ -925,14 +887,16 @@ export default function App() {
               )
             ) : null}
           </section>
+          ) : null}
         </section>
         <ServerDirectoryBrowserDialog
           isOpen={directoryBrowserOpen}
-          initialPath={undefined}
+          initialPath={directoryBrowserPath}
           listDirectory={listServerDirectory}
           onClose={() => setDirectoryBrowserOpen(false)}
           onSelect={(path) => {
             updateField("dataset_path", path);
+            setDirectoryBrowserPath(path);
             setDirectoryBrowserOpen(false);
           }}
         />
@@ -1047,27 +1011,6 @@ function TextField({
         onChange={(event) => onChange(event.target.value)}
       />
     </Field>
-  );
-}
-
-function TaskSelector({
-  value,
-  onChange,
-}: {
-  value: EvaluationTask;
-  onChange: (task: EvaluationTask) => void;
-}) {
-  return (
-    <SegmentedControl
-      ariaLabel="评估类型"
-      className="task-selector"
-      value={value}
-      onChange={onChange}
-      options={[
-        { value: "asr", label: <><Activity size={16} /><span>ASR</span></> },
-        { value: "vad", label: <><Radio size={16} /><span>VAD</span></> },
-      ]}
-    />
   );
 }
 
@@ -1405,8 +1348,12 @@ function AsrAlignmentReportPanel({
             </button>
           </div>
           <div className="utterance-list">
-            {utterances.map((utterance) => (
-              <details className="utterance" key={utterance.id}>
+            {utterances.map((utterance, index) => (
+              <details
+                className="utterance"
+                key={utterance.id}
+                open={index < 3}
+              >
                 <summary>
                   <span className="utterance-title">
                     <ExcludeCheckbox
@@ -1422,13 +1369,15 @@ function AsrAlignmentReportPanel({
                     tokens={utterance.tokens}
                   />
                 </summary>
-                <div className="utterance-audio-row">
-                  <AudioPlayer
-                    src={utterance.audio_url}
-                    durationSeconds={utterance.duration_seconds}
-                  />
+                <div className="utterance-body">
+                  <div className="utterance-audio-row">
+                    <AudioPlayer
+                      src={utterance.audio_url}
+                      durationSeconds={utterance.duration_seconds}
+                    />
+                  </div>
+                  <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
                 </div>
-                <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
               </details>
             ))}
           </div>
@@ -1536,54 +1485,100 @@ function VadMaskReport({
 
   return (
     <div className="vad-report-list">
-      {samples.map((sample) => (
-        <details className="vad-sample" key={sample.id} open={samples.length === 1}>
-          <summary>
-            <span>
-              <ExcludeCheckbox
-                checked={excludedSampleIds.has(sample.id)}
-                onChange={(checked) => onExcludedChange(sample.id, checked)}
+      {samples.map((sample, index) => {
+        const timelineWidth = getVadTimelineWidth(sample.duration_seconds);
+        return (
+          <details className="vad-sample" key={sample.id} open={index < 3}>
+            <summary>
+              <span>
+                <ExcludeCheckbox
+                  checked={excludedSampleIds.has(sample.id)}
+                  onChange={(checked) => onExcludedChange(sample.id, checked)}
+                />
+                #{sample.index ?? "-"} {sample.id}
+              </span>
+              <AudioPlayer
+                src={sample.audio_url}
+                durationSeconds={sample.duration_seconds}
               />
-              #{sample.index ?? "-"} {sample.id}
-            </span>
-            <AudioPlayer
-              src={sample.audio_url}
-              durationSeconds={sample.duration_seconds}
-            />
-            <small>{formatSeconds(sample.duration_seconds)}</small>
-          </summary>
-          {sample.metrics ? (
-            <div className="sample-vad-metrics">
-              <VadMetricGroups metrics={sample.metrics} />
+              <small>{formatSeconds(sample.duration_seconds)}</small>
+            </summary>
+            <div className="vad-sample-body">
+              {sample.metrics ? (
+                <div className="sample-vad-metrics">
+                  <VadMetricGroups metrics={sample.metrics} />
+                </div>
+              ) : null}
+              <div className="vad-timeline-scroll" aria-label="VAD 时间轴">
+                <div
+                  className="vad-timeline-canvas"
+                  style={{ width: timelineWidth }}
+                >
+                  <VadTimeRuler duration={sample.duration_seconds} />
+                  <div className="mask-stack">
+                    <MaskTrack
+                      label="Reference"
+                      duration={sample.duration_seconds}
+                      segments={sample.reference_segments}
+                      regions={sample.regions}
+                      track="reference"
+                    />
+                    <MaskTrack
+                      label="Prediction"
+                      duration={sample.duration_seconds}
+                      segments={sample.prediction_segments}
+                      regions={sample.regions}
+                      track="prediction"
+                    />
+                    <div className="mask-row region-row">
+                      <span>Errors</span>
+                      <div className="region-track" aria-label="VAD 对齐区域">
+                        {sample.regions.map((region) => (
+                          <span
+                            className={`region region-${normalizeVadLabel(region.label)}`}
+                            key={`${sample.id}:${region.start_frame}:${region.end_frame}:${region.label}`}
+                            style={{
+                              left: `${toPercent(
+                                region.start,
+                                sample.duration_seconds,
+                              )}%`,
+                              width: `${toPercent(
+                                region.duration,
+                                sample.duration_seconds,
+                              )}%`,
+                            }}
+                            title={`${regionLabel(region.label)} ${formatSeconds(region.start)} - ${formatSeconds(region.end)}`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
-          ) : null}
-          <div className="mask-stack">
-            <MaskTrack
-              label="Reference"
-              duration={sample.duration_seconds}
-              segments={sample.reference_segments}
-            />
-            <MaskTrack
-              label="Prediction"
-              duration={sample.duration_seconds}
-              segments={sample.prediction_segments}
-            />
-          </div>
-          <div className="region-track" aria-label="VAD 对齐区域">
-            {sample.regions.map((region) => (
-              <span
-                className={`region region-${region.label}`}
-                key={`${sample.id}:${region.start_frame}:${region.end_frame}:${region.label}`}
-                style={{
-                  left: `${toPercent(region.start, sample.duration_seconds)}%`,
-                  width: `${toPercent(region.duration, sample.duration_seconds)}%`,
-                }}
-                title={`${regionLabel(region.label)} ${formatSeconds(region.start)} - ${formatSeconds(region.end)}`}
-              />
-            ))}
-          </div>
-        </details>
-      ))}
+          </details>
+        );
+      })}
+    </div>
+  );
+}
+
+function VadTimeRuler({ duration }: { duration: number }) {
+  const ticks = buildVadRulerTicks(duration);
+  return (
+    <div className="vad-time-ruler">
+      <span>Time</span>
+      <div className="vad-ruler-track">
+        {ticks.map((tick) => (
+          <i
+            key={tick}
+            style={{ left: `${toPercent(tick, duration)}%` }}
+            title={formatSeconds(tick)}
+          >
+            {formatSeconds(tick)}
+          </i>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1592,16 +1587,23 @@ function MaskTrack({
   label,
   duration,
   segments,
+  regions,
+  track,
 }: {
   label: string;
   duration: number;
   segments: VadReportSegment[];
+  regions: VadReportRegion[];
+  track: "reference" | "prediction";
 }) {
+  const visibleSegments =
+    regions.length > 0 ? vadRegionsToTrackSegments(regions, track) : segments;
+
   return (
     <div className="mask-row">
       <span>{label}</span>
       <div className="mask-track">
-        {segments.map((segment) => (
+        {visibleSegments.map((segment) => (
           <span
             className={`mask-segment mask-${segment.status}`}
             key={`${label}:${segment.start_frame}:${segment.end_frame}:${segment.status}`}
@@ -1615,6 +1617,27 @@ function MaskTrack({
       </div>
     </div>
   );
+}
+
+function vadRegionsToTrackSegments(
+  regions: VadReportRegion[],
+  track: "reference" | "prediction",
+): VadReportSegment[] {
+  return regions
+    .filter((region) => {
+      const label = normalizeVadLabel(region.label);
+      return track === "reference"
+        ? label === "hit" || label === "miss"
+        : label === "hit" || label === "false_alarm";
+    })
+    .map((region) => ({
+      start: region.start,
+      end: region.end,
+      duration: region.duration,
+      start_frame: region.start_frame,
+      end_frame: region.end_frame,
+      status: normalizeVadLabel(region.label),
+    }));
 }
 
 function LegendItem({ className, label }: { className: string; label: string }) {
@@ -1637,7 +1660,8 @@ function TokenCounts({
 }) {
   const counts = tokens.reduce(
     (current, token) => {
-      current[token.label] = (current[token.label] ?? 0) + 1;
+      const label = normalizeWerTokenLabel(token.label);
+      current[label] = (current[label] ?? 0) + 1;
       return current;
     },
     { correct: 0, substitution: 0, deletion: 0, insertion: 0 } as Record<string, number>,
@@ -1739,19 +1763,40 @@ function chunkWerTokens(tokens: WerToken[]): WerToken[][] {
 }
 
 function getWerWordClass(label: string, row: "ref" | "hyp"): string {
-  if (label === "substitution") {
+  const normalizedLabel = normalizeWerTokenLabel(label);
+  if (normalizedLabel === "substitution") {
     return "wer-word-substitution";
   }
-  if (label === "deletion" && row === "ref") {
+  if (normalizedLabel === "deletion" && row === "ref") {
     return "wer-word-deletion";
   }
-  if (label === "insertion" && row === "hyp") {
+  if (normalizedLabel === "insertion" && row === "hyp") {
     return "wer-word-insertion";
   }
-  if ((label === "deletion" && row === "hyp") || (label === "insertion" && row === "ref")) {
+  if (
+    (normalizedLabel === "deletion" && row === "hyp") ||
+    (normalizedLabel === "insertion" && row === "ref")
+  ) {
     return "wer-word-placeholder";
   }
   return "wer-word-correct";
+}
+
+function normalizeWerTokenLabel(label: string): string {
+  const normalized = label.trim().toLowerCase();
+  if (["sub", "subst", "substitution", "s"].includes(normalized)) {
+    return "substitution";
+  }
+  if (["del", "delete", "deletion", "d"].includes(normalized)) {
+    return "deletion";
+  }
+  if (["ins", "insert", "insertion", "i"].includes(normalized)) {
+    return "insertion";
+  }
+  if (["cor", "correct", "ok", "c"].includes(normalized)) {
+    return "correct";
+  }
+  return normalized;
 }
 
 function buildRequest(state: EvaluationFormState): EvaluationRequest {
@@ -1775,6 +1820,7 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
     remove_punctuation: state.remove_punctuation ?? false,
     mask_frame_seconds: toNumber(state.mask_frame_seconds, 0.01),
     chunk_duration_seconds: toNumber(state.chunk_duration_seconds, 0.1),
+    speech_padding_seconds: toNumber(state.speech_padding_seconds ?? "0", 0),
     hit_threshold: toNumber(state.hit_threshold, 0.9),
     streaming: state.streaming ?? false,
   };
@@ -1819,17 +1865,28 @@ function getUtteranceRate(
   }
   const tokens = metricUtterance?.tokens ?? utterance.tokens;
   const referenceWords = tokens.filter(
-    (token) => token.label !== "insertion",
+    (token) => normalizeWerTokenLabel(token.label) !== "insertion",
   ).length;
   if (referenceWords === 0) {
     return 0;
   }
-  const errors = tokens.filter((token) => token.label !== "correct").length;
+  const errors = tokens.filter(
+    (token) => normalizeWerTokenLabel(token.label) !== "correct",
+  ).length;
   return (errors / referenceWords) * 100;
 }
 
 function getUtteranceIndex(utterance: WerUtterance): number {
   return utterance.index ?? Number.MAX_SAFE_INTEGER;
+}
+
+function pickTaskRememberedFields(
+  state: EvaluationFormState,
+): TaskRememberedFields {
+  return {
+    target: state.target,
+    dataset_path: state.dataset_path,
+  };
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -1872,6 +1929,40 @@ function formatSeconds(value: unknown): string {
     : "-";
 }
 
+function getVadTimelineWidth(duration: number): number {
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return VAD_TIMELINE_MIN_WIDTH;
+  }
+  return Math.max(
+    VAD_TIMELINE_MIN_WIDTH,
+    Math.ceil(
+      VAD_TIMELINE_LABEL_WIDTH + duration * VAD_TIMELINE_PIXELS_PER_SECOND,
+    ),
+  );
+}
+
+function buildVadRulerTicks(duration: number): number[] {
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return [0];
+  }
+  const targetTickCount = Math.max(4, Math.ceil(duration / 12));
+  const roughStep = duration / targetTickCount;
+  const step = pickRulerStep(roughStep);
+  const ticks: number[] = [];
+  for (let tick = 0; tick < duration; tick += step) {
+    ticks.push(Number(tick.toFixed(3)));
+  }
+  if (ticks[ticks.length - 1] !== duration) {
+    ticks.push(duration);
+  }
+  return ticks;
+}
+
+function pickRulerStep(roughStep: number): number {
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  return steps.find((step) => step >= roughStep) ?? steps[steps.length - 1];
+}
+
 function toPercent(value: number, total: number): number {
   if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) {
     return 0;
@@ -1880,30 +1971,53 @@ function toPercent(value: number, total: number): number {
 }
 
 function segmentStatusLabel(status: string): string {
-  if (status === "hit") {
+  const normalizedStatus = normalizeVadLabel(status);
+  if (normalizedStatus === "hit") {
     return "命中";
   }
-  if (status === "miss") {
+  if (normalizedStatus === "miss") {
     return "漏检";
   }
-  if (status === "false_alarm") {
+  if (normalizedStatus === "false_alarm") {
     return "虚警";
   }
   return status;
 }
 
 function regionLabel(label: string): string {
-  if (label === "hit") {
+  const normalizedLabel = normalizeVadLabel(label);
+  if (normalizedLabel === "hit") {
     return "命中";
   }
-  if (label === "miss") {
+  if (normalizedLabel === "miss") {
     return "漏检";
   }
-  if (label === "false_alarm") {
+  if (normalizedLabel === "false_alarm") {
     return "虚警";
   }
-  if (label === "correct_reject") {
+  if (normalizedLabel === "correct_reject") {
     return "静音正确";
   }
   return label;
+}
+
+function normalizeVadLabel(label: string): string {
+  const normalized = label.trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (["falsealarm", "false_alarm", "fa", "fp"].includes(normalized)) {
+    return "false_alarm";
+  }
+  if (["miss", "missed", "fn"].includes(normalized)) {
+    return "miss";
+  }
+  if (["hit", "tp", "speech_correct"].includes(normalized)) {
+    return "hit";
+  }
+  if (
+    ["correctreject", "correct_reject", "tn", "silence_correct"].includes(
+      normalized,
+    )
+  ) {
+    return "correct_reject";
+  }
+  return normalized;
 }

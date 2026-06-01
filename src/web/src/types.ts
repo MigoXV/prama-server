@@ -20,6 +20,7 @@ export interface EvaluationRequest {
   remove_punctuation: boolean;
   mask_frame_seconds: number;
   chunk_duration_seconds: number;
+  speech_padding_seconds: number;
   hit_threshold: number;
   streaming: boolean;
 }
@@ -213,6 +214,7 @@ export interface EvaluationFormState {
   remove_punctuation: boolean;
   mask_frame_seconds: string;
   chunk_duration_seconds: string;
+  speech_padding_seconds: string;
   hit_threshold: string;
   streaming: boolean;
 }

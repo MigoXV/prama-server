@@ -19,6 +19,7 @@ class VadGrpcInferencer:
         sample_rate: int = 16000,
         mask_frame_seconds: float = 0.01,
         chunk_duration_seconds: float = 0.1,
+        speech_padding_seconds: float = 0.0,
         request_timeout_seconds: float = 60.0,
         connect_timeout_seconds: float | None = 10.0,
     ) -> None:
@@ -32,11 +33,16 @@ class VadGrpcInferencer:
             raise ValueError(
                 f"chunk_duration_seconds 必须大于 0: {chunk_duration_seconds}"
             )
+        if speech_padding_seconds < 0:
+            raise ValueError(
+                f"speech_padding_seconds 必须大于等于 0: {speech_padding_seconds}"
+            )
 
         self.target = target
         self.sample_rate = sample_rate
         self.mask_frame_seconds = mask_frame_seconds
         self.chunk_duration_seconds = chunk_duration_seconds
+        self.speech_padding_seconds = speech_padding_seconds
         self.request_timeout_seconds = request_timeout_seconds
         self.channel = grpc.insecure_channel(target)
         if connect_timeout_seconds is not None:
@@ -146,7 +152,10 @@ class VadGrpcInferencer:
         if start_seconds < 0 or end_seconds <= start_seconds:
             return
 
-        start_index = max(0, int(math.floor(start_seconds / self.mask_frame_seconds)))
+        start_seconds = max(0.0, start_seconds - self.speech_padding_seconds)
+        end_seconds += self.speech_padding_seconds
+
+        start_index = int(math.floor(start_seconds / self.mask_frame_seconds))
         end_index = min(
             len(mask),
             int(math.ceil(end_seconds / self.mask_frame_seconds)),

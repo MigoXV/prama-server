@@ -59,6 +59,11 @@ class EvaluationRequest(BaseModel):
     remove_punctuation: bool = Field(False, description="ASR 评估时是否移除标点")
     mask_frame_seconds: float = Field(0.01, gt=0, description="VAD mask 帧长秒数")
     chunk_duration_seconds: float = Field(0.1, gt=0, description="VAD 流式分块秒数")
+    speech_padding_seconds: float = Field(
+        0.0,
+        ge=0,
+        description="VAD 检出语音段前后扩展秒数",
+    )
     hit_threshold: float = Field(0.9, ge=0, le=1, description="VAD 段命中阈值")
     streaming: bool = Field(False, description="是否使用 VAD 流式接口")
 
@@ -801,6 +806,7 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
         sample_rate=request.sample_rate,
         mask_frame_seconds=request.mask_frame_seconds,
         chunk_duration_seconds=request.chunk_duration_seconds,
+        speech_padding_seconds=request.speech_padding_seconds,
         request_timeout_seconds=request.request_timeout_seconds,
         connect_timeout_seconds=request.connect_timeout_seconds,
     )
