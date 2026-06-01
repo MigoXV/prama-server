@@ -42,14 +42,17 @@ class HttpRecalculateTest(unittest.TestCase):
                 "index": 1,
                 "reference": "hello world",
                 "hypothesis": "hello world",
+                "duration_seconds": 12.5,
             },
             {
                 "id": "bad",
                 "index": 2,
                 "reference": "hello world",
                 "hypothesis": "bad world",
+                "duration_seconds": 7.5,
             },
         ]
+        job.result = {"processing_elapsed_seconds": 5.0}
         _put_job(job)
 
         response = client.post(
@@ -64,6 +67,9 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(payload["included_sample_count"], 1)
         self.assertEqual(payload["excluded_sample_count"], 1)
         self.assertEqual(payload["excluded_sample_ids"], ["bad"])
+        self.assertEqual(payload["audio_duration_seconds"], 12.5)
+        self.assertEqual(payload["processing_elapsed_seconds"], 5.0)
+        self.assertEqual(payload["realtime_factor"], 2.5)
         self.assertEqual(
             [item["id"] for item in payload["wer_report"]["utterances"]],
             ["ok"],
@@ -96,7 +102,11 @@ class HttpRecalculateTest(unittest.TestCase):
             "miss": {"id": "miss", "index": 2},
         }
         job.vad_metric_rows = [{"id": "hit", **hit}, {"id": "miss", **miss}]
-        job.vad_report_samples = [{"id": "hit"}, {"id": "miss"}]
+        job.vad_report_samples = [
+            {"id": "hit", "duration_seconds": 8.0},
+            {"id": "miss", "duration_seconds": 12.0},
+        ]
+        job.result = {"processing_elapsed_seconds": 4.0}
         _put_job(job)
 
         response = client.post(
@@ -110,7 +120,13 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(payload["frame"]["frame_f1"], 1.0)
         self.assertEqual(payload["included_sample_count"], 1)
         self.assertEqual(payload["excluded_sample_count"], 1)
-        self.assertEqual(payload["vad_report"]["samples"], [{"id": "hit"}])
+        self.assertEqual(payload["audio_duration_seconds"], 8.0)
+        self.assertEqual(payload["processing_elapsed_seconds"], 4.0)
+        self.assertEqual(payload["realtime_factor"], 2.0)
+        self.assertEqual(
+            payload["vad_report"]["samples"],
+            [{"id": "hit", "duration_seconds": 8.0}],
+        )
 
     def test_recalculate_with_all_samples_excluded_returns_empty_report(self) -> None:
         job = EvaluationJob(

@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable, Generator, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
@@ -17,6 +18,7 @@ class EvaluationSession:
     inferencer: AsrGrpcInferencer
     metric_fns: Dict[str, Callable]
     hypothesis_postprocess: Callable[[str], str] | None = None
+    inference_concurrency: int = 0
     infer_results: pd.DataFrame = field(
         default_factory=lambda: pd.DataFrame(
             columns=["id", "reference", "hypothesis"]
@@ -51,25 +53,76 @@ class EvaluationSession:
         self,
         on_partial_result: Callable[[str, str, str, bool], None] | None = None,
     ) -> Generator[Tuple[str, str, str], None, None]:
+        if self.inference_concurrency > 0:
+            yield from self._iter_infer_concurrently(on_partial_result)
+            return
+
         with self.inferencer as active_inferencer:
             for data_id, audio, reference in self.data_itr:
-                results = ""
-                for hypothesis, is_final in active_inferencer.infer(audio):
-                    if self.hypothesis_postprocess is not None:
-                        display_hypothesis = self.hypothesis_postprocess(hypothesis)
-                    else:
-                        display_hypothesis = hypothesis
-                    if on_partial_result is not None:
-                        on_partial_result(
-                            data_id,
-                            reference,
-                            display_hypothesis,
-                            is_final,
-                        )
-                    if is_final:
-                        results += hypothesis
-                if results:
-                    yield data_id, reference, results
+                result = self._infer_one(
+                    active_inferencer=active_inferencer,
+                    data_id=data_id,
+                    audio=audio,
+                    reference=reference,
+                    on_partial_result=on_partial_result,
+                )
+                if result is not None:
+                    yield result
+
+    def _iter_infer_concurrently(
+        self,
+        on_partial_result: Callable[[str, str, str, bool], None] | None = None,
+    ) -> Generator[Tuple[str, str, str], None, None]:
+        samples = list(self.data_itr)
+        max_workers = min(self.inference_concurrency, len(samples))
+        if max_workers <= 0:
+            return
+
+        with self.inferencer as active_inferencer:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._infer_one,
+                        active_inferencer=active_inferencer,
+                        data_id=data_id,
+                        audio=audio,
+                        reference=reference,
+                        on_partial_result=on_partial_result,
+                    )
+                    for data_id, audio, reference in samples
+                ]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        yield result
+
+    def _infer_one(
+        self,
+        *,
+        active_inferencer: AsrGrpcInferencer,
+        data_id: str,
+        audio: np.ndarray,
+        reference: str,
+        on_partial_result: Callable[[str, str, str, bool], None] | None,
+    ) -> Tuple[str, str, str] | None:
+        results = ""
+        for hypothesis, is_final in active_inferencer.infer(audio):
+            if self.hypothesis_postprocess is not None:
+                display_hypothesis = self.hypothesis_postprocess(hypothesis)
+            else:
+                display_hypothesis = hypothesis
+            if on_partial_result is not None:
+                on_partial_result(
+                    data_id,
+                    reference,
+                    display_hypothesis,
+                    is_final,
+                )
+            if is_final:
+                results += hypothesis
+        if not results:
+            return None
+        return data_id, reference, results
 
     def get_metrics(self):
         metrics = {}

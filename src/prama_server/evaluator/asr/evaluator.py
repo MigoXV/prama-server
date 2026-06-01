@@ -27,12 +27,18 @@ class Evaluator:
         tag: str | None = None,
         reference_postprocess: Callable[[str], str] | None = None,
         hypothesis_postprocess: Callable[[str], str] | None = None,
+        inference_concurrency: int = 0,
     ) -> None:
+        if inference_concurrency < 0:
+            raise ValueError(
+                f"inference_concurrency 必须大于等于 0: {inference_concurrency}"
+            )
         self.dataset = dataset
         self.sample_rate = sample_rate
         self.tag = tag
         self.reference_postprocess = reference_postprocess
         self.hypothesis_postprocess = hypothesis_postprocess
+        self.inference_concurrency = inference_concurrency
 
     def close(self) -> None:
         logger.info("Evaluator closed: dataset_size=%s", len(self.dataset))
@@ -87,6 +93,7 @@ class Evaluator:
             inferencer=inferencer,
             metric_fns={"wer": get_wer_pd, "cer": get_cer_pd},
             hypothesis_postprocess=self.hypothesis_postprocess,
+            inference_concurrency=self.inference_concurrency,
         )
 
         def publish_partial(

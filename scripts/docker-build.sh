@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-0.3.0a1}"
+VERSION="${VERSION:-0.4.0a1}"
 REGISTRY="${REGISTRY:-registry.cn-hangzhou.aliyuncs.com/migo-dl}"
 FRONTEND_IMAGE="${FRONTEND_IMAGE:-${REGISTRY}/prama-server-frontend:${VERSION}}"
 BACKEND_IMAGE="${BACKEND_IMAGE:-${REGISTRY}/prama-server-backend:${VERSION}}"
@@ -16,3 +16,6 @@ docker build \
   -f docker/backend.dockerfile \
   -t "${BACKEND_IMAGE}" \
   .
+
+docker push "${FRONTEND_IMAGE}"
+docker push "${BACKEND_IMAGE}"

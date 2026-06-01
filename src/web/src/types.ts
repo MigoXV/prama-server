@@ -17,6 +17,7 @@ export interface EvaluationRequest {
   connect_timeout_seconds: number | null;
   request_timeout_seconds: number;
   interim_results: boolean;
+  inference_concurrency: number;
   remove_punctuation: boolean;
   mask_frame_seconds: number;
   chunk_duration_seconds: number;
@@ -74,6 +75,9 @@ export interface EvaluationResult {
   excluded_sample_count?: number;
   excluded_sample_ids?: string[];
   total_sample_count?: number;
+  audio_duration_seconds?: number;
+  processing_elapsed_seconds?: number;
+  realtime_factor?: number;
   wer_report?: WerReport;
   cer_report?: WerReport;
   vad_report?: VadReport;
@@ -211,6 +215,7 @@ export interface EvaluationFormState {
   connect_timeout_seconds: string;
   request_timeout_seconds: string;
   interim_results: boolean;
+  inference_concurrency: string;
   remove_punctuation: boolean;
   mask_frame_seconds: string;
   chunk_duration_seconds: string;

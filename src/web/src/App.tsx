@@ -70,6 +70,7 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   connect_timeout_seconds: "10",
   request_timeout_seconds: "60",
   interim_results: true,
+  inference_concurrency: "0",
   remove_punctuation: false,
   mask_frame_seconds: "0.01",
   chunk_duration_seconds: "0.1",
@@ -682,6 +683,15 @@ export default function App() {
                       onChange={(value) => updateField("request_timeout_seconds", value)}
                       required
                     />
+                    <TextField
+                      label="推理并发数"
+                      value={formState.inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) => updateField("inference_concurrency", value)}
+                      required
+                    />
                   </div>
                 </section>
 
@@ -825,6 +835,7 @@ export default function App() {
                     <Metric label="已处理" value={`${progress?.processed ?? 0} / ${progress?.total ?? 0}`} />
                     <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
                   </div>
+                  <PerformanceMetrics result={finalResult} />
                   {connectionWarning ? (
                     <div className="inline-warning">
                       <TriangleAlert size={15} />
@@ -1156,6 +1167,20 @@ function SampleCountStrip({
   );
 }
 
+function PerformanceMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="metric-strip performance-metrics">
+      <Metric label="音频时长" value={formatSeconds(result.audio_duration_seconds)} />
+      <Metric label="处理耗时" value={formatSeconds(result.processing_elapsed_seconds)} />
+      <Metric label="倍时" value={formatRealtimeFactor(result.realtime_factor)} />
+    </div>
+  );
+}
+
 function VadOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   if (!result) {
     return null;
@@ -1327,6 +1352,7 @@ function AsrAlignmentReportPanel({
             />
           </div>
           <SampleCountStrip result={result} fallbackCount={sampleCount} />
+          <PerformanceMetrics result={result} />
           <div className="alignment-metric-tabs" role="tablist" aria-label="对齐指标">
             <button
               type="button"
@@ -1432,6 +1458,7 @@ function VadReportPanel({
       {result ? (
         <>
           <SampleCountStrip result={result} fallbackCount={samples.length} />
+          <PerformanceMetrics result={result} />
           <VadMaskReport
             samples={samples}
             excludedSampleIds={excludedSampleIds}
@@ -1817,6 +1844,7 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
     connect_timeout_seconds: toOptionalNumber(state.connect_timeout_seconds),
     request_timeout_seconds: toNumber(state.request_timeout_seconds, 60),
     interim_results: state.interim_results ?? true,
+    inference_concurrency: toNumber(state.inference_concurrency, 0),
     remove_punctuation: state.remove_punctuation ?? false,
     mask_frame_seconds: toNumber(state.mask_frame_seconds, 0.01),
     chunk_duration_seconds: toNumber(state.chunk_duration_seconds, 0.1),
@@ -1926,6 +1954,12 @@ function formatNumber(value: unknown): string {
 function formatSeconds(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value)
     ? `${value.toFixed(2)}s`
+    : "-";
+}
+
+function formatRealtimeFactor(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(2)}x`
     : "-";
 }
 

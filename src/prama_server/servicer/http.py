@@ -6,8 +6,10 @@ import os
 import shutil
 import threading
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +58,11 @@ class EvaluationRequest(BaseModel):
     connect_timeout_seconds: float | None = Field(10.0, gt=0, description="连接超时")
     request_timeout_seconds: float = Field(60.0, gt=0, description="单次请求超时")
     interim_results: bool = Field(True, description="是否请求 ASR 临时结果")
+    inference_concurrency: int = Field(
+        0,
+        ge=0,
+        description="样本级推理并发数；0 表示串行",
+    )
     remove_punctuation: bool = Field(False, description="ASR 评估时是否移除标点")
     mask_frame_seconds: float = Field(0.01, gt=0, description="VAD mask 帧长秒数")
     chunk_duration_seconds: float = Field(0.1, gt=0, description="VAD 流式分块秒数")
@@ -490,19 +497,23 @@ def _run_evaluation(job: EvaluationJob) -> None:
         _register_asr_sample_records(job, dataset)
         total = len(dataset)
         evaluated = 0
+        progress_lock = threading.Lock()
         inference_rows: list[dict[str, Any]] = []
+        inference_start_time = time.perf_counter()
 
         def publish_partial_infer_result(
             result: EvaluationPartialInferenceResult,
         ) -> None:
             if result.is_final:
                 return
+            with progress_lock:
+                current_evaluated = evaluated
             payload = {
                 "status": "running",
                 "tag": result.tag,
                 "total": total,
-                "processed": evaluated,
-                "evaluated": evaluated,
+                "processed": current_evaluated,
+                "evaluated": current_evaluated,
                 "id": result.id,
                 "current_id": result.id,
                 "reference": result.reference,
@@ -521,28 +532,30 @@ def _run_evaluation(job: EvaluationJob) -> None:
 
         def publish_infer_result(result: EvaluationInferenceResult) -> None:
             nonlocal evaluated
-            evaluated += 1
+            with progress_lock:
+                evaluated += 1
+                current_evaluated = evaluated
             sample_record = _get_sample_record_for_result(
                 job,
                 sample_id=result.id,
-                index=evaluated,
+                index=current_evaluated,
             )
-            inference_rows.append(
-                {
-                    "id": result.id,
-                    "index": evaluated,
-                    "reference": result.reference,
-                    "hypothesis": result.hypothesis,
-                    "audio_url": sample_record.get("audio_url"),
-                    "duration_seconds": sample_record.get("duration_seconds"),
-                }
-            )
+            row = {
+                "id": result.id,
+                "index": current_evaluated,
+                "reference": result.reference,
+                "hypothesis": result.hypothesis,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+            }
+            with progress_lock:
+                inference_rows.append(row)
             payload = {
                 "status": "running",
                 "tag": result.tag,
                 "total": total,
-                "processed": evaluated,
-                "evaluated": evaluated,
+                "processed": current_evaluated,
+                "evaluated": current_evaluated,
                 "id": result.id,
                 "current_id": result.id,
                 "reference": result.reference,
@@ -571,12 +584,14 @@ def _run_evaluation(job: EvaluationJob) -> None:
             hypothesis_postprocess=(
                 remove_punctuation if request.remove_punctuation else None
             ),
+            inference_concurrency=request.inference_concurrency,
         ) as evaluator:
             metrics = evaluator.iter_evaluate(
                 inferencer,
                 on_infer_result=publish_infer_result,
                 on_partial_infer_result=publish_partial_infer_result,
             )
+        processing_elapsed_seconds = time.perf_counter() - inference_start_time
 
         wer_report = _build_wer_report(inference_rows)
         cer_report = _build_cer_report(inference_rows)
@@ -584,6 +599,10 @@ def _run_evaluation(job: EvaluationJob) -> None:
             **metrics,
             "wer_report": wer_report,
             "cer_report": cer_report,
+            **_performance_payload(
+                audio_duration_seconds=_sum_row_duration(inference_rows),
+                processing_elapsed_seconds=processing_elapsed_seconds,
+            ),
             **_sample_count_payload(
                 included_count=len(inference_rows),
                 excluded_sample_ids=set(),
@@ -773,13 +792,15 @@ def _write_job_audio_file(
     audio_array: np.ndarray,
     sample_rate: int,
 ) -> Path:
-    if job.temp_dir is None:
-        job.temp_dir = Path(tempfile.mkdtemp(prefix=f"prama-{job.job_id}-"))
+    with job.lock:
+        if job.temp_dir is None:
+            job.temp_dir = Path(tempfile.mkdtemp(prefix=f"prama-{job.job_id}-"))
+        temp_dir = job.temp_dir
     safe_name = "".join(
         char if char.isalnum() or char in ("-", "_", ".") else "_"
         for char in sample_id
     )
-    audio_path = job.temp_dir / f"{safe_name or 'sample'}.wav"
+    audio_path = temp_dir / f"{safe_name or 'sample'}.wav"
     sf.write(audio_path, audio_array, sample_rate)
     return audio_path
 
@@ -820,61 +841,63 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
     total = len(dataset)
     rows: list[dict[str, Any]] = []
     report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
 
-    try:
-        for index, sample in enumerate(dataset, start=1):
-            sample_id = str(sample.get("id") or sample.get("utt_id") or index)
-            audio = sample["audio"]
-            audio_array = _prepare_vad_audio(audio, sample_rate=request.sample_rate)
-            sample_record = _register_sample_record(
-                job=job,
-                sample=sample,
-                sample_id=sample_id,
-                index=index,
-                audio_array=audio_array,
-                sample_rate=request.sample_rate,
-            )
-            prediction_mask = (
-                inferencer.stream_infer(audio_array)
-                if request.streaming
-                else inferencer.infer(audio_array)
-            )
-            reference_mask = _seconds_to_mask(
-                sample["seconds"],
-                length=len(prediction_mask),
-                frame_seconds=request.mask_frame_seconds,
-            )
-            result = evaluator.evaluate(reference_mask, prediction_mask)
-            result_dict = asdict(result)
-            rows.append({"id": sample_id, **result_dict})
-            report_sample = _build_vad_sample_report(
-                sample_id=sample_id,
-                index=index,
-                reference_mask=reference_mask,
-                prediction_mask=prediction_mask,
-                frame_seconds=request.mask_frame_seconds,
-                hit_threshold=request.hit_threshold,
-                metrics=result_dict,
-            )
-            report_sample.update(
-                {
-                    "audio_url": sample_record.get("audio_url"),
-                    "duration_seconds": sample_record.get(
-                        "duration_seconds",
-                        report_sample["duration_seconds"],
-                    ),
-                }
-            )
-            report_samples.append(report_sample)
-            payload = {
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        audio = sample["audio"]
+        audio_array = _prepare_vad_audio(audio, sample_rate=request.sample_rate)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=request.sample_rate,
+        )
+        prediction_mask = (
+            inferencer.stream_infer(audio_array)
+            if request.streaming
+            else inferencer.infer(audio_array)
+        )
+        reference_mask = _seconds_to_mask(
+            sample["seconds"],
+            length=len(prediction_mask),
+            frame_seconds=request.mask_frame_seconds,
+        )
+        result = evaluator.evaluate(reference_mask, prediction_mask)
+        result_dict = asdict(result)
+        report_sample = _build_vad_sample_report(
+            sample_id=sample_id,
+            index=index,
+            reference_mask=reference_mask,
+            prediction_mask=prediction_mask,
+            frame_seconds=request.mask_frame_seconds,
+            hit_threshold=request.hit_threshold,
+            metrics=result_dict,
+        )
+        report_sample.update(
+            {
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get(
+                    "duration_seconds",
+                    report_sample["duration_seconds"],
+                ),
+            }
+        )
+        return {
+            "row": {"id": sample_id, "index": index, **result_dict},
+            "report_sample": report_sample,
+            "payload": {
                 "status": "running",
                 "tag": job.job_id,
                 "total": total,
-                "processed": index,
-                "evaluated": index,
                 "id": sample_id,
                 "current_id": sample_id,
-                "reference": _format_vad_segments(reference_mask, request.mask_frame_seconds),
+                "reference": _format_vad_segments(
+                    reference_mask,
+                    request.mask_frame_seconds,
+                ),
                 "hypothesis": _format_vad_segments(
                     prediction_mask,
                     request.mask_frame_seconds,
@@ -883,23 +906,55 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
                 "result": result_dict,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
-            }
-            with job.lock:
-                job.latest_progress = payload
-            message_manager.put(
-                ManagedMessage(
-                    job_id=job.job_id,
-                    event_name="inference_result",
-                    payload=payload,
-                )
-            )
+            },
+        }
 
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        rows.append(item["row"])
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        if request.inference_concurrency > 0 and samples:
+            max_workers = min(request.inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        rows.sort(key=lambda row: int(row.get("index") or 0))
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
         with job.lock:
             job.status = "completed"
             job.vad_metric_rows = rows
             job.vad_report_samples = report_samples
             job.result = {
                 **_build_vad_report(rows, samples=report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
                 **_sample_count_payload(
                     included_count=len(rows),
                     excluded_sample_ids=set(),
@@ -1117,6 +1172,10 @@ def _recalculate_asr_result(
         **metrics,
         "wer_report": wer_report,
         "cer_report": cer_report,
+        **_recalculated_performance_payload(
+            job=job,
+            audio_duration_seconds=_sum_row_duration(rows),
+        ),
         **_sample_count_payload(
             included_count=len(rows),
             excluded_sample_ids=excluded_sample_ids,
@@ -1179,6 +1238,10 @@ def _recalculate_vad_result(
     ]
     return {
         **_build_vad_report(rows, samples=samples),
+        **_recalculated_performance_payload(
+            job=job,
+            audio_duration_seconds=_sum_sample_duration(samples),
+        ),
         **_sample_count_payload(
             included_count=len(rows),
             excluded_sample_ids=excluded_sample_ids,
@@ -1199,6 +1262,68 @@ def _sample_count_payload(
         "excluded_sample_ids": sorted(excluded_sample_ids),
         "total_sample_count": total_count,
     }
+
+
+def _performance_payload(
+    *,
+    audio_duration_seconds: float,
+    processing_elapsed_seconds: float,
+) -> dict[str, float]:
+    realtime_factor = _safe_divide_float(
+        audio_duration_seconds,
+        processing_elapsed_seconds,
+    )
+    return {
+        "audio_duration_seconds": audio_duration_seconds,
+        "processing_elapsed_seconds": processing_elapsed_seconds,
+        "realtime_factor": realtime_factor,
+    }
+
+
+def _recalculated_performance_payload(
+    *,
+    job: EvaluationJob,
+    audio_duration_seconds: float,
+) -> dict[str, float]:
+    result = job.result or {}
+    elapsed = _as_float(result.get("processing_elapsed_seconds"))
+    if elapsed is None:
+        return _performance_payload(
+            audio_duration_seconds=audio_duration_seconds,
+            processing_elapsed_seconds=0.0,
+        )
+    return _performance_payload(
+        audio_duration_seconds=audio_duration_seconds,
+        processing_elapsed_seconds=elapsed,
+    )
+
+
+def _sum_row_duration(rows: list[dict[str, Any]]) -> float:
+    return sum(
+        _as_float(row.get("duration_seconds")) or 0.0
+        for row in rows
+    )
+
+
+def _sum_sample_duration(samples: list[dict[str, Any]]) -> float:
+    return sum(
+        _as_float(sample.get("duration_seconds")) or 0.0
+        for sample in samples
+    )
+
+
+def _safe_divide_float(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return float(value)
+    return None
 
 
 def _build_vad_sample_report(
