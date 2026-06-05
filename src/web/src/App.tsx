@@ -32,6 +32,7 @@ import {
 } from "svara-ui";
 import { usePersistentState } from "./hooks/usePersistentState";
 import { useThemeMode } from "./hooks/useThemeMode";
+import packageJson from "../package.json";
 import {
   createEvaluation,
   listServerDirectory,
@@ -46,6 +47,7 @@ import type {
   EvaluationResult,
   EvaluationTask,
   JobStatus,
+  LidReportSample,
   ThemeMode,
   VadReportRegion,
   VadReportSample,
@@ -71,6 +73,10 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   request_timeout_seconds: "60",
   interim_results: true,
   inference_concurrency: "0",
+  asr_inference_concurrency: "0",
+  vad_inference_concurrency: "0",
+  lid_inference_concurrency: "0",
+  lid_confidence_threshold: "0",
   remove_punctuation: false,
   mask_frame_seconds: "0.01",
   chunk_duration_seconds: "0.1",
@@ -78,6 +84,8 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   hit_threshold: "0.9",
   streaming: false,
 };
+
+const APP_VERSION = packageJson.version;
 
 const VAD_TIMELINE_LABEL_WIDTH = 88;
 const VAD_TIMELINE_PIXELS_PER_SECOND = 24;
@@ -94,6 +102,11 @@ const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
     dataset_path: "data-bin/audiofolder/vad-demo",
     min_reference_words: "0",
   },
+  lid: {
+    target: "192.168.0.222:50026",
+    dataset_path: "data-bin/audiofolder/lid-demo",
+    min_reference_words: "0",
+  },
 };
 
 type TaskRememberedFields = Pick<EvaluationFormState, "target" | "dataset_path">;
@@ -106,6 +119,10 @@ const TASK_REMEMBERED_DEFAULTS: Record<EvaluationTask, TaskRememberedFields> = {
   vad: {
     target: "192.168.0.222:50021",
     dataset_path: "data-bin/audiofolder/vad-demo",
+  },
+  lid: {
+    target: "192.168.0.222:50026",
+    dataset_path: "data-bin/audiofolder/lid-demo",
   },
 };
 
@@ -206,8 +223,10 @@ export default function App() {
 
   const werReport = finalResult?.wer_report;
   const cerReport = finalResult?.cer_report;
+  const lidReport = finalResult?.lid_report;
   const canExport = finalResult !== null;
   const isVad = formState.task === "vad";
+  const isLid = formState.task === "lid";
   const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
 
   function resetRunState() {
@@ -419,7 +438,10 @@ export default function App() {
             <Server size={19} />
           </div>
           <div>
-            <strong>Prama</strong>
+            <div className="brand-title-row">
+              <strong>Prama</strong>
+              <small>v{APP_VERSION}</small>
+            </div>
             <span>评估控制台</span>
           </div>
         </div>
@@ -459,6 +481,16 @@ export default function App() {
                     >
                       VAD
                     </button>
+                    <button
+                      type="button"
+                      className={formState.task === "lid" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("lid");
+                      }}
+                    >
+                      LID
+                    </button>
                   </div>
                 ) : null}
               </div>
@@ -477,8 +509,8 @@ export default function App() {
         {activeModule === "evaluation" ? (
           <header className="workspace-header">
             <div>
-              <p className="eyebrow">{isVad ? "VAD Evaluation" : "ASR Evaluation"}</p>
-              <h1>{isVad ? "语音活动检测评估" : "语音识别评估"}</h1>
+              <p className="eyebrow">{evaluationTaskEnglishLabel(formState.task)}</p>
+              <h1>{evaluationTaskTitle(formState.task)}</h1>
             </div>
             <div className="header-actions">
               <StatusPill status={status} />
@@ -516,11 +548,15 @@ export default function App() {
             />
             <TabButton
               active={activeTab === "report"}
-              label={isVad ? "VAD 指标" : "对齐报告"}
+              label={
+                isVad ? "VAD 指标" : isLid ? "LID 报告" : "对齐报告"
+              }
               meta={
                 isVad
                   ? `${formatNumber(finalResult?.sample_count)} 个样本`
-                  : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
+                  : isLid
+                    ? `${lidReport?.samples.length ?? 0} 个样本`
+                    : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
               }
               onClick={() => setActiveTab("report")}
             />
@@ -540,14 +576,14 @@ export default function App() {
             >
               <div className="panel-heading">
                 <div>
-                  <h2>{isVad ? "VAD 在线评估" : "ASR 在线评估"}</h2>
+                  <h2>{evaluationTaskShortLabel(formState.task)} 在线评估</h2>
                   <span>Job {jobId || "-"}</span>
                 </div>
               </div>
 
               <div className="field-grid">
                 <TextField
-                  label={`${isVad ? "VAD" : "ASR"} 引擎地址`}
+                  label={`${evaluationTaskShortLabel(formState.task)} 引擎地址`}
                   value={formState.target}
                   onChange={(value) => updateField("target", value)}
                   required
@@ -620,7 +656,7 @@ export default function App() {
               <div className="panel-heading">
                 <div>
                   <h2>设置</h2>
-                  <span>ASR 与 VAD 的高级评估参数</span>
+                  <span>ASR、VAD 与 LID 的高级评估参数</span>
                 </div>
                 <button type="button" className="ghost-button" onClick={resetForm}>
                   重置
@@ -683,15 +719,6 @@ export default function App() {
                       onChange={(value) => updateField("request_timeout_seconds", value)}
                       required
                     />
-                    <TextField
-                      label="推理并发数"
-                      value={formState.inference_concurrency}
-                      type="number"
-                      min="0"
-                      step="1"
-                      onChange={(value) => updateField("inference_concurrency", value)}
-                      required
-                    />
                   </div>
                 </section>
 
@@ -725,6 +752,17 @@ export default function App() {
                       type="number"
                       step="0.1"
                       onChange={(value) => updateField("hotword_bias", value)}
+                    />
+                    <TextField
+                      label="ASR 推理并发数"
+                      value={formState.asr_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) =>
+                        updateField("asr_inference_concurrency", value)
+                      }
+                      required
                     />
                     <label className="check-field">
                       <input
@@ -793,6 +831,17 @@ export default function App() {
                       step="0.01"
                       onChange={(value) => updateField("hit_threshold", value)}
                     />
+                    <TextField
+                      label="VAD 推理并发数"
+                      value={formState.vad_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) =>
+                        updateField("vad_inference_concurrency", value)
+                      }
+                      required
+                    />
                     <label className="check-field">
                       <input
                         type="checkbox"
@@ -806,6 +855,36 @@ export default function App() {
                       />
                       <span>使用 VAD 流式接口</span>
                     </label>
+                  </div>
+                </section>
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>LID 高级设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="LID 推理并发数"
+                      value={formState.lid_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) =>
+                        updateField("lid_inference_concurrency", value)
+                      }
+                      required
+                    />
+                    <TextField
+                      label="LID 置信度阈值"
+                      value={formState.lid_confidence_threshold}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      onChange={(value) =>
+                        updateField("lid_confidence_threshold", value)
+                      }
+                      required
+                    />
                   </div>
                 </section>
               </div>
@@ -850,6 +929,7 @@ export default function App() {
                   ) : null}
                 </div>
                 {isVad ? <VadOverviewMetrics result={finalResult} /> : null}
+                {isLid ? <LidOverviewMetrics result={finalResult} /> : null}
 
                 {!isVad ? (
                   <div className="panel sample-panel">
@@ -860,8 +940,14 @@ export default function App() {
                       </div>
                     </div>
                     <div className="sample-grid">
-                      <TextBlock label="Reference" value={progress?.reference || "-"} />
-                      <TextBlock label="Hypothesis" value={progress?.hypothesis || "-"} />
+                      <TextBlock
+                        label={isLid ? "Reference Language" : "Reference"}
+                        value={progress?.reference || "-"}
+                      />
+                      <TextBlock
+                        label={isLid ? "Prediction" : "Hypothesis"}
+                        value={progress?.hypothesis || "-"}
+                      />
                     </div>
                   </div>
                 ) : null}
@@ -871,6 +957,15 @@ export default function App() {
             {activeTab === "report" ? (
               isVad ? (
                 <VadReportPanel
+                  result={finalResult}
+                  excludedSampleIds={excludedSampleIds}
+                  onExcludedChange={toggleExcludedSample}
+                  canRecalculate={canRecalculate}
+                  recalculating={recalculating}
+                  onRecalculate={() => void handleRecalculateMetrics()}
+                />
+              ) : isLid ? (
+                <LidReportPanel
                   result={finalResult}
                   excludedSampleIds={excludedSampleIds}
                   onExcludedChange={toggleExcludedSample}
@@ -1189,6 +1284,21 @@ function VadOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   return <VadMetricGroups metrics={result} />;
 }
 
+function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="metric-strip lid-overview-metrics">
+      <Metric label="Accuracy" value={formatRate(result.accuracy)} />
+      <Metric label="Recall" value={formatRate(result.recall)} />
+      <Metric label="Correct" value={formatNumber(result.correct_count)} />
+      <Metric label="Samples" value={formatNumber(result.sample_count)} />
+    </div>
+  );
+}
+
 function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   const frame = metrics.frame;
   const segment = metrics.segment;
@@ -1468,6 +1578,112 @@ function VadReportPanel({
       ) : (
         <div className="empty-state">评估完成后生成 VAD 指标</div>
       )}
+    </div>
+  );
+}
+
+function LidReportPanel({
+  result,
+  excludedSampleIds,
+  onExcludedChange,
+  canRecalculate,
+  recalculating,
+  onRecalculate,
+}: {
+  result: EvaluationResult | null;
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+  canRecalculate: boolean;
+  recalculating: boolean;
+  onRecalculate: () => void;
+}) {
+  const samples = result?.lid_report?.samples ?? [];
+  return (
+    <div className="panel report-panel">
+      <div className="panel-heading compact-heading">
+        <div>
+          <h2>LID 报告</h2>
+          <span>{formatNumber(result?.sample_count)} 个样本</span>
+        </div>
+        <div className="report-controls">
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={!canRecalculate}
+            onClick={onRecalculate}
+          >
+            {recalculating ? "重算中..." : "重新计算评估指标"}
+          </button>
+        </div>
+      </div>
+      {result ? (
+        <>
+          <div className="report-summary lid-summary">
+            <Metric label="Accuracy" value={formatRate(result.accuracy)} />
+            <Metric label="Recall" value={formatRate(result.recall)} />
+            <Metric label="Correct" value={formatNumber(result.correct_count)} />
+            <Metric label="Samples" value={formatNumber(result.sample_count)} />
+          </div>
+          <SampleCountStrip result={result} fallbackCount={samples.length} />
+          <PerformanceMetrics result={result} />
+          <LidSampleList
+            samples={samples}
+            excludedSampleIds={excludedSampleIds}
+            onExcludedChange={onExcludedChange}
+          />
+        </>
+      ) : (
+        <div className="empty-state">评估完成后生成 LID 报告</div>
+      )}
+    </div>
+  );
+}
+
+function LidSampleList({
+  samples,
+  excludedSampleIds,
+  onExcludedChange,
+}: {
+  samples: LidReportSample[];
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+}) {
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成语种识别结果</div>;
+  }
+
+  return (
+    <div className="lid-sample-list">
+      {samples.map((sample) => (
+        <section
+          className={`lid-sample ${sample.correct ? "correct" : "incorrect"}`}
+          key={sample.id}
+        >
+          <div className="lid-sample-title">
+            <span>
+              <ExcludeCheckbox
+                checked={excludedSampleIds.has(sample.id)}
+                onChange={(checked) => onExcludedChange(sample.id, checked)}
+              />
+              <strong>#{sample.index ?? "-"}</strong>
+              <span>{sample.id}</span>
+            </span>
+            <b>{sample.correct ? "正确" : "错误"}</b>
+          </div>
+          <div className="lid-sample-row">
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <div className="lid-result-grid">
+              <Metric label="真实语种" value={sample.reference_language || "-"} />
+              <Metric label="预测语种" value={sample.predicted_language || "-"} />
+              <Metric label="原始结果" value={sample.raw_language || "-"} />
+              <Metric label="置信度" value={formatConfidence(sample.confidence)} />
+            </div>
+          </div>
+        </section>
+      ))}
     </div>
   );
 }
@@ -1844,7 +2060,11 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
     connect_timeout_seconds: toOptionalNumber(state.connect_timeout_seconds),
     request_timeout_seconds: toNumber(state.request_timeout_seconds, 60),
     interim_results: state.interim_results ?? true,
-    inference_concurrency: toNumber(state.inference_concurrency, 0),
+    inference_concurrency: 0,
+    asr_inference_concurrency: toNumber(state.asr_inference_concurrency, 0),
+    vad_inference_concurrency: toNumber(state.vad_inference_concurrency, 0),
+    lid_inference_concurrency: toNumber(state.lid_inference_concurrency, 0),
+    lid_confidence_threshold: toNumber(state.lid_confidence_threshold, 0),
     remove_punctuation: state.remove_punctuation ?? false,
     mask_frame_seconds: toNumber(state.mask_frame_seconds, 0.01),
     chunk_duration_seconds: toNumber(state.chunk_duration_seconds, 0.1),
@@ -1908,6 +2128,30 @@ function getUtteranceIndex(utterance: WerUtterance): number {
   return utterance.index ?? Number.MAX_SAFE_INTEGER;
 }
 
+function evaluationTaskShortLabel(task: EvaluationTask): string {
+  if (task === "vad") {
+    return "VAD";
+  }
+  if (task === "lid") {
+    return "LID";
+  }
+  return "ASR";
+}
+
+function evaluationTaskEnglishLabel(task: EvaluationTask): string {
+  return `${evaluationTaskShortLabel(task)} Evaluation`;
+}
+
+function evaluationTaskTitle(task: EvaluationTask): string {
+  if (task === "vad") {
+    return "语音活动检测评估";
+  }
+  if (task === "lid") {
+    return "语种识别评估";
+  }
+  return "语音识别评估";
+}
+
 function pickTaskRememberedFields(
   state: EvaluationFormState,
 ): TaskRememberedFields {
@@ -1960,6 +2204,12 @@ function formatSeconds(value: unknown): string {
 function formatRealtimeFactor(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value)
     ? `${value.toFixed(2)}x`
+    : "-";
+}
+
+function formatConfidence(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(4)
     : "-";
 }
 

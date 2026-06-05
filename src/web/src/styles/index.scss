@@ -125,15 +125,31 @@ button:disabled {
   padding: 4px 4px 14px;
 
   strong,
-  span {
+  span,
+  small {
     display: block;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
+  .brand-title-row {
+    display: flex;
+    min-width: 0;
+    align-items: baseline;
+    gap: 8px;
+  }
+
   strong {
+    min-width: 0;
     font-size: 15px;
+  }
+
+  small {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
   }
 
   span {
@@ -1010,6 +1026,108 @@ button:disabled {
   .metric {
     min-height: 38px;
     padding: 7px 9px;
+  }
+}
+
+.lid-sample-list {
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
+.lid-sample {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+
+  &.correct {
+    border-color: color-mix(in srgb, var(--green) 48%, var(--border));
+  }
+
+  &.incorrect {
+    border-color: color-mix(in srgb, var(--red) 48%, var(--border));
+  }
+}
+
+.lid-sample-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(420px, 1fr);
+  gap: 10px;
+  min-width: 0;
+  align-items: center;
+
+  .audio-player {
+    max-width: 100%;
+  }
+}
+
+.lid-sample-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  > span {
+    display: grid;
+    grid-template-columns: 30px 58px minmax(0, 1fr);
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+  }
+
+  span span,
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+
+  b {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-size: 12px;
+  }
+}
+
+.lid-result-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(92px, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  .metric {
+    min-height: 38px;
+    padding: 7px 9px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .lid-sample-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .lid-result-grid {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   }
 }
 

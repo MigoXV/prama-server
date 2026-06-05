@@ -34,6 +34,7 @@ from prama_server.evaluator import (
 )
 from prama_server.evaluator.vad import VadEvaluator
 from prama_server.inferencers.asr import AsrGrpcInferencer
+from prama_server.inferencers.lid import LidGrpcInferencer
 from prama_server.inferencers.vad import VadGrpcInferencer
 from prama_server.metrics.prama_warpper import get_cer_pd, get_wer_pd
 from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, MessageManager
@@ -41,7 +42,7 @@ from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, Messa
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "completed", "failed"]
-EvaluationTask = Literal["asr", "vad"]
+EvaluationTask = Literal["asr", "vad", "lid"]
 
 
 class EvaluationRequest(BaseModel):
@@ -61,7 +62,16 @@ class EvaluationRequest(BaseModel):
     inference_concurrency: int = Field(
         0,
         ge=0,
-        description="样本级推理并发数；0 表示串行",
+        description="兼容旧字段；样本级推理并发数，0 表示串行",
+    )
+    asr_inference_concurrency: int = Field(0, ge=0, description="ASR 样本级推理并发数")
+    vad_inference_concurrency: int = Field(0, ge=0, description="VAD 样本级推理并发数")
+    lid_inference_concurrency: int = Field(0, ge=0, description="LID 样本级推理并发数")
+    lid_confidence_threshold: float = Field(
+        0.0,
+        ge=0,
+        le=1,
+        description="LID 置信度阈值；低于阈值时预测为 other",
     )
     remove_punctuation: bool = Field(False, description="ASR 评估时是否移除标点")
     mask_frame_seconds: float = Field(0.01, gt=0, description="VAD mask 帧长秒数")
@@ -116,6 +126,7 @@ class EvaluationJob:
     error: str | None = None
     sample_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     asr_inference_rows: list[dict[str, Any]] = field(default_factory=list)
+    lid_report_samples: list[dict[str, Any]] = field(default_factory=list)
     vad_metric_rows: list[dict[str, Any]] = field(default_factory=list)
     vad_report_samples: list[dict[str, Any]] = field(default_factory=list)
     temp_dir: Path | None = None
@@ -303,6 +314,8 @@ def recalculate_evaluation_metrics(
 
         if job.request.task == "vad":
             result = _recalculate_vad_result(job, excluded_sample_ids)
+        elif job.request.task == "lid":
+            result = _recalculate_lid_result(job, excluded_sample_ids)
         else:
             result = _recalculate_asr_result(job, excluded_sample_ids)
         job.result = result
@@ -476,6 +489,9 @@ def _run_evaluation(job: EvaluationJob) -> None:
         if request.task == "vad":
             _run_vad_evaluation(job)
             return
+        if request.task == "lid":
+            _run_lid_evaluation(job)
+            return
 
         inferencer = AsrGrpcInferencer(
             target=request.target,
@@ -584,7 +600,7 @@ def _run_evaluation(job: EvaluationJob) -> None:
             hypothesis_postprocess=(
                 remove_punctuation if request.remove_punctuation else None
             ),
-            inference_concurrency=request.inference_concurrency,
+            inference_concurrency=_task_inference_concurrency(request, "asr"),
         ) as evaluator:
             metrics = evaluator.iter_evaluate(
                 inferencer,
@@ -929,8 +945,9 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
 
     try:
         samples = list(enumerate(dataset, start=1))
-        if request.inference_concurrency > 0 and samples:
-            max_workers = min(request.inference_concurrency, len(samples))
+        inference_concurrency = _task_inference_concurrency(request, "vad")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(evaluate_sample, index, sample)
@@ -964,6 +981,161 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
         logger.info("VAD 评估任务完成: job_id=%s", job.job_id)
     finally:
         inferencer.close()
+
+
+def _run_lid_evaluation(job: EvaluationJob) -> None:
+    request = job.request
+    inferencer = LidGrpcInferencer(
+        target=request.target,
+        sample_rate=request.sample_rate,
+        request_timeout_seconds=request.request_timeout_seconds,
+        connect_timeout_seconds=request.connect_timeout_seconds,
+    )
+    dataset = _load_lid_dataset(
+        Path(request.dataset_path),
+        split=request.split,
+        limit=request.limit,
+        sample_rate=request.sample_rate,
+    )
+    total = len(dataset)
+    report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
+
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        reference_language = _normalize_lid_language(sample["language_id"])
+        audio_array = _prepare_vad_audio(sample["audio"], sample_rate=request.sample_rate)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=request.sample_rate,
+        )
+        prediction = inferencer.infer(audio_array)
+        predicted_language = _lid_predicted_language(
+            raw_language=prediction.lang,
+            confidence=prediction.score,
+            threshold=request.lid_confidence_threshold,
+        )
+        correct = predicted_language == reference_language
+        report_sample = {
+            "id": sample_id,
+            "index": index,
+            "audio_url": sample_record.get("audio_url"),
+            "duration_seconds": sample_record.get("duration_seconds"),
+            "reference_language": reference_language,
+            "predicted_language": predicted_language,
+            "raw_language": prediction.lang,
+            "confidence": prediction.score,
+            "correct": correct,
+        }
+        return {
+            "report_sample": report_sample,
+            "payload": {
+                "status": "running",
+                "tag": job.job_id,
+                "total": total,
+                "id": sample_id,
+                "current_id": sample_id,
+                "reference": reference_language,
+                "hypothesis": f"{prediction.lang} ({prediction.score:.4f})",
+                "is_final": True,
+                "result": report_sample,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+            },
+        }
+
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        inference_concurrency = _task_inference_concurrency(request, "lid")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        with job.lock:
+            job.status = "completed"
+            job.lid_report_samples = report_samples
+            job.result = {
+                **_build_lid_report(report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
+                **_sample_count_payload(
+                    included_count=len(report_samples),
+                    excluded_sample_ids=set(),
+                    total_count=len(report_samples),
+                ),
+            }
+        logger.info("LID 评估任务完成: job_id=%s", job.job_id)
+    finally:
+        inferencer.close()
+
+
+def _load_lid_dataset(
+    dataset_path: Path,
+    *,
+    split: str,
+    limit: int | None,
+    sample_rate: int,
+) -> Dataset:
+    logger.info("加载 LID 数据集: path=%s split=%s", dataset_path, split)
+    if _is_audiofolder_dataset_dir(dataset_path):
+        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
+    elif dataset_path.exists() and dataset_path.is_dir():
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            if split not in loaded:
+                available_splits = ", ".join(loaded.keys())
+                raise ValueError(
+                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
+                )
+            dataset = loaded[split]
+        else:
+            dataset = loaded
+    else:
+        dataset = load_dataset(str(dataset_path), split=split)
+
+    missing = sorted({"audio", "language_id"} - set(dataset.column_names))
+    if missing:
+        raise ValueError(f"LID 数据集缺少必要字段: {', '.join(missing)}")
+
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+    if limit is not None:
+        dataset = dataset.select(range(min(limit, len(dataset))))
+    logger.info("LID 数据集已加载: size=%s", len(dataset))
+    return dataset
 
 
 def _load_vad_dataset(
@@ -1156,6 +1328,29 @@ def _build_vad_report(
     return report
 
 
+def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    correct_count = sum(1 for sample in samples if sample.get("correct") is True)
+    sample_count = len(samples)
+    language_totals: dict[str, int] = {}
+    language_hits: dict[str, int] = {}
+    for sample in samples:
+        reference_language = str(sample.get("reference_language") or "")
+        language_totals[reference_language] = language_totals.get(reference_language, 0) + 1
+        if sample.get("predicted_language") == reference_language:
+            language_hits[reference_language] = language_hits.get(reference_language, 0) + 1
+    recalls = [
+        _safe_divide_float(language_hits.get(language, 0), total)
+        for language, total in language_totals.items()
+    ]
+    return {
+        "accuracy": _safe_divide_float(correct_count, sample_count),
+        "recall": sum(recalls) / len(recalls) if recalls else 0.0,
+        "correct_count": correct_count,
+        "sample_count": sample_count,
+        "lid_report": {"samples": samples},
+    }
+
+
 def _recalculate_asr_result(
     job: EvaluationJob,
     excluded_sample_ids: set[str],
@@ -1250,6 +1445,29 @@ def _recalculate_vad_result(
     }
 
 
+def _recalculate_lid_result(
+    job: EvaluationJob,
+    excluded_sample_ids: set[str],
+) -> dict[str, Any]:
+    samples = [
+        sample
+        for sample in job.lid_report_samples
+        if str(sample["id"]) not in excluded_sample_ids
+    ]
+    return {
+        **_build_lid_report(samples),
+        **_recalculated_performance_payload(
+            job=job,
+            audio_duration_seconds=_sum_sample_duration(samples),
+        ),
+        **_sample_count_payload(
+            included_count=len(samples),
+            excluded_sample_ids=excluded_sample_ids,
+            total_count=len(job.lid_report_samples),
+        ),
+    }
+
+
 def _sample_count_payload(
     *,
     included_count: int,
@@ -1310,6 +1528,49 @@ def _sum_sample_duration(samples: list[dict[str, Any]]) -> float:
         _as_float(sample.get("duration_seconds")) or 0.0
         for sample in samples
     )
+
+
+def _normalize_lid_language(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    if normalized in {"en", "eng", "en-us", "en-gb", "english"}:
+        return "en"
+    if normalized in {
+        "cn",
+        "zh",
+        "zho",
+        "chi",
+        "zh-cn",
+        "zh-tw",
+        "zh-hans",
+        "zh-hant",
+        "chinese",
+    }:
+        return "zh"
+    return normalized
+
+
+def _lid_predicted_language(
+    *,
+    raw_language: Any,
+    confidence: float,
+    threshold: float,
+) -> str:
+    if confidence < threshold:
+        return "other"
+    return _normalize_lid_language(raw_language)
+
+
+def _task_inference_concurrency(
+    request: EvaluationRequest,
+    task: EvaluationTask,
+) -> int:
+    if task == "asr":
+        return request.asr_inference_concurrency or request.inference_concurrency
+    if task == "vad":
+        return request.vad_inference_concurrency or request.inference_concurrency
+    if task == "lid":
+        return request.lid_inference_concurrency or request.inference_concurrency
+    return request.inference_concurrency
 
 
 def _safe_divide_float(numerator: float, denominator: float) -> float:

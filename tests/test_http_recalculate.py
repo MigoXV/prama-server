@@ -16,6 +16,7 @@ from prama_server.servicer.http import (
     EvaluationRequest,
     _build_cer_report,
     _build_wer_report,
+    _lid_predicted_language,
     app,
     jobs,
     jobs_lock,
@@ -126,6 +127,133 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(
             payload["vad_report"]["samples"],
             [{"id": "hit", "duration_seconds": 8.0}],
+        )
+
+    def test_recalculate_lid_metrics_excludes_selected_sample(self) -> None:
+        job = EvaluationJob(
+            job_id="test-lid-recalculate",
+            request=EvaluationRequest(task="lid"),
+            status="completed",
+        )
+        job.sample_records = {
+            "ok": {"id": "ok", "index": 1},
+            "bad": {"id": "bad", "index": 2},
+        }
+        job.lid_report_samples = [
+            {
+                "id": "ok",
+                "index": 1,
+                "duration_seconds": 3.0,
+                "reference_language": "en",
+                "predicted_language": "en",
+                "raw_language": "en",
+                "confidence": 0.9,
+                "correct": True,
+            },
+            {
+                "id": "bad",
+                "index": 2,
+                "duration_seconds": 2.0,
+                "reference_language": "zh",
+                "predicted_language": "en",
+                "raw_language": "en",
+                "confidence": 0.7,
+                "correct": False,
+            },
+        ]
+        job.result = {"processing_elapsed_seconds": 2.5}
+        _put_job(job)
+
+        response = client.post(
+            f"/api/evaluations/{job.job_id}/metrics/recalculate",
+            json={"excluded_sample_ids": ["bad"]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["accuracy"], 1.0)
+        self.assertEqual(payload["recall"], 1.0)
+        self.assertEqual(payload["correct_count"], 1)
+        self.assertEqual(payload["sample_count"], 1)
+        self.assertEqual(payload["audio_duration_seconds"], 3.0)
+        self.assertEqual(payload["processing_elapsed_seconds"], 2.5)
+        self.assertEqual(payload["realtime_factor"], 1.2)
+        self.assertEqual(
+            [item["id"] for item in payload["lid_report"]["samples"]],
+            ["ok"],
+        )
+
+    def test_recalculate_lid_metrics_uses_macro_recall_by_reference_language(self) -> None:
+        job = EvaluationJob(
+            job_id="test-lid-macro-recall",
+            request=EvaluationRequest(task="lid"),
+            status="completed",
+        )
+        job.sample_records = {
+            "en-ok": {"id": "en-ok", "index": 1},
+            "en-bad": {"id": "en-bad", "index": 2},
+            "zh-ok": {"id": "zh-ok", "index": 3},
+        }
+        job.lid_report_samples = [
+            {
+                "id": "en-ok",
+                "index": 1,
+                "duration_seconds": 1.0,
+                "reference_language": "en",
+                "predicted_language": "en",
+                "raw_language": "en",
+                "confidence": 0.9,
+                "correct": True,
+            },
+            {
+                "id": "en-bad",
+                "index": 2,
+                "duration_seconds": 1.0,
+                "reference_language": "en",
+                "predicted_language": "zh",
+                "raw_language": "zh",
+                "confidence": 0.8,
+                "correct": False,
+            },
+            {
+                "id": "zh-ok",
+                "index": 3,
+                "duration_seconds": 1.0,
+                "reference_language": "zh",
+                "predicted_language": "zh",
+                "raw_language": "zh",
+                "confidence": 0.9,
+                "correct": True,
+            },
+        ]
+        _put_job(job)
+
+        response = client.post(
+            f"/api/evaluations/{job.job_id}/metrics/recalculate",
+            json={"excluded_sample_ids": []},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["accuracy"], 2 / 3)
+        self.assertEqual(payload["recall"], 0.75)
+
+    def test_lid_confidence_threshold_maps_low_score_to_other(self) -> None:
+        self.assertEqual(
+            _lid_predicted_language(
+                raw_language="en",
+                confidence=0.79,
+                threshold=0.8,
+            ),
+            "other",
+        )
+        self.assertEqual(
+            _lid_predicted_language(
+                raw_language="cn",
+                confidence=0.8,
+                threshold=0.8,
+            ),
+            "zh",
         )
 
     def test_recalculate_with_all_samples_excluded_returns_empty_report(self) -> None:

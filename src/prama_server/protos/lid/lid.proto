@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package lid;
+option go_package = "192.168.0.241/d145/proto/lid";
+
+service LidService {
+  rpc Process(MsgLidProcessReq) returns (MsgLidProcessRes);
+  rpc GetLanguages(MsgLidGetLanguagesReq) returns (MsgLidGetLanguagesRes);
+}
+
+message MsgLidGetLanguagesReq {
+}
+
+message MsgLidGetLanguagesRes {
+  map<int64, string> data = 1;
+}
+
+message MsgLidProcessReq {
+  bytes pcm = 1;        // wav pcm
+  int32 sampleRate = 2;    // 采样率
+  int32 channel = 3;       // 声道数
+  int32 bitsPerSample = 4; // 样本位数
+}
+
+message MsgLidProcessRes {
+  string lang = 2;      // Lid 结果
+  float score = 3;      // Lid 得分
+}

@@ -1,7 +1,7 @@
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 
 export type ThemeMode = "system" | "light" | "dark";
-export type EvaluationTask = "asr" | "vad";
+export type EvaluationTask = "asr" | "vad" | "lid";
 
 export interface EvaluationRequest {
   task: EvaluationTask;
@@ -18,6 +18,10 @@ export interface EvaluationRequest {
   request_timeout_seconds: number;
   interim_results: boolean;
   inference_concurrency: number;
+  asr_inference_concurrency: number;
+  vad_inference_concurrency: number;
+  lid_inference_concurrency: number;
+  lid_confidence_threshold: number;
   remove_punctuation: boolean;
   mask_frame_seconds: number;
   chunk_duration_seconds: number;
@@ -60,6 +64,7 @@ export interface EvaluationResult {
   wer?: number;
   cer?: number;
   accuracy?: number;
+  recall?: number;
   frame?: VadFrameMetrics;
   segment?: VadSegmentMetrics;
   frame_accuracy?: number;
@@ -75,13 +80,32 @@ export interface EvaluationResult {
   excluded_sample_count?: number;
   excluded_sample_ids?: string[];
   total_sample_count?: number;
+  correct_count?: number;
   audio_duration_seconds?: number;
   processing_elapsed_seconds?: number;
   realtime_factor?: number;
   wer_report?: WerReport;
   cer_report?: WerReport;
   vad_report?: VadReport;
+  lid_report?: LidReport;
   [key: string]: unknown;
+}
+
+export interface LidReport {
+  samples: LidReportSample[];
+}
+
+export interface LidReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  reference_language: string;
+  predicted_language: string;
+  raw_language: string;
+  confidence: number;
+  correct: boolean;
+  excluded?: boolean;
 }
 
 export interface VadFrameMetrics {
@@ -216,6 +240,10 @@ export interface EvaluationFormState {
   request_timeout_seconds: string;
   interim_results: boolean;
   inference_concurrency: string;
+  asr_inference_concurrency: string;
+  vad_inference_concurrency: string;
+  lid_inference_concurrency: string;
+  lid_confidence_threshold: string;
   remove_punctuation: boolean;
   mask_frame_seconds: string;
   chunk_duration_seconds: string;
