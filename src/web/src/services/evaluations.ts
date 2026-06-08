@@ -5,6 +5,7 @@ import type {
   EvaluationRequest,
   EvaluationResult,
   EvaluationSnapshot,
+  HelpDocument,
   ServerDirectoryListing,
 } from "../types";
 
@@ -30,6 +31,46 @@ export async function createEvaluation(
   }
 
   return response.json() as Promise<EvaluationCreated>;
+}
+
+export async function getEvaluation(jobId: string): Promise<EvaluationSnapshot> {
+  const response = await fetch(`/api/evaluations/${jobId}`);
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json() as Promise<EvaluationSnapshot>;
+}
+
+export async function testEngineConnectivity(
+  target: string,
+  timeoutSeconds: number | null,
+): Promise<{ ok: boolean; target: string; message: string }> {
+  const response = await fetch("/api/engines/connectivity", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      target,
+      timeout_seconds: timeoutSeconds ?? 3,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json() as Promise<{ ok: boolean; target: string; message: string }>;
+}
+
+export async function getHelpDocument(): Promise<HelpDocument> {
+  const response = await fetch("/api/help");
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json() as Promise<HelpDocument>;
 }
 
 export function subscribeEvaluationEvents(

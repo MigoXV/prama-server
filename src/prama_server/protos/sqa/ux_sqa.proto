@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "com.ux.sqa";
+option java_outer_classname = "UxSqaProto";
+
+package ux_sqa;
+
+service UxSqa {
+  rpc Assess(AssessRequest) 
+  returns (AssessResponse) {}
+}
+
+
+message AssessRequest {
+  QualityConfig config = 1;
+  bytes audio = 2;
+}
+
+
+message QualityConfig {
+  enum AudioEncoding {
+    AUDIO_ENCODING_UNSPECIFIED = 0;
+    LINEAR16 = 1;
+  }
+  AudioEncoding encoding = 1;
+  uint32 sample_rate_hertz = 2;
+
+}
+
+
+message AssessResponse {
+  float score = 1;
+}

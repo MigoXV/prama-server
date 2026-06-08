@@ -3,6 +3,26 @@ export type JobStatus = "queued" | "running" | "completed" | "failed";
 export type ThemeMode = "system" | "light" | "dark";
 export type EvaluationTask = "asr" | "vad" | "lid";
 
+export interface HelpDocument {
+  title: string;
+  markdown: string;
+}
+
+export interface SqaScore {
+  engine_name: string;
+  target: string;
+  score: number | null;
+  error?: string | null;
+}
+
+export interface SqaSummary {
+  engine_name: string;
+  target: string;
+  mean_score: number | null;
+  scored_count: number;
+  failed_count: number;
+}
+
 export interface EvaluationRequest {
   task: EvaluationTask;
   target: string;
@@ -21,6 +41,11 @@ export interface EvaluationRequest {
   asr_inference_concurrency: number;
   vad_inference_concurrency: number;
   lid_inference_concurrency: number;
+  enable_mos: boolean;
+  mos_target: string;
+  enable_snr: boolean;
+  snr_target: string;
+  sqa_inference_concurrency: number;
   lid_confidence_threshold: number;
   remove_punctuation: boolean;
   mask_frame_seconds: number;
@@ -49,6 +74,7 @@ export interface EvaluationProgress {
   result?: EvaluationResult;
   audio_url?: string;
   duration_seconds?: number;
+  sqa_scores?: SqaScore[];
 }
 
 export interface EvaluationSnapshot {
@@ -88,6 +114,7 @@ export interface EvaluationResult {
   cer_report?: WerReport;
   vad_report?: VadReport;
   lid_report?: LidReport;
+  sqa_summary?: SqaSummary[];
   [key: string]: unknown;
 }
 
@@ -106,6 +133,7 @@ export interface LidReportSample {
   confidence: number;
   correct: boolean;
   excluded?: boolean;
+  sqa_scores?: SqaScore[];
 }
 
 export interface VadFrameMetrics {
@@ -153,6 +181,7 @@ export interface VadReportSample {
   audio_url?: string;
   excluded?: boolean;
   metrics?: EvaluationResult;
+  sqa_scores?: SqaScore[];
   reference_segments: VadReportSegment[];
   prediction_segments: VadReportSegment[];
   regions: VadReportRegion[];
@@ -203,6 +232,7 @@ export interface WerUtterance {
   audio_url?: string;
   duration_seconds?: number;
   excluded?: boolean;
+  sqa_scores?: SqaScore[];
   summary?: WerSummary;
   tokens: WerToken[];
 }
@@ -243,6 +273,11 @@ export interface EvaluationFormState {
   asr_inference_concurrency: string;
   vad_inference_concurrency: string;
   lid_inference_concurrency: string;
+  enable_mos: boolean;
+  mos_target: string;
+  enable_snr: boolean;
+  snr_target: string;
+  sqa_inference_concurrency: string;
   lid_confidence_threshold: string;
   remove_punctuation: boolean;
   mask_frame_seconds: string;

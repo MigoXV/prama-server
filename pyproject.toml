@@ -30,6 +30,7 @@ prama-server = "prama_server.commands.app:app"
 
 [tool.poetry]
 packages = [{include = "prama_server", from = "src"}]
+include = [{path = "src/prama_server/help/*.md", format = ["sdist", "wheel"]}]
 
 [[tool.poetry.source]]
 name = "tuna"

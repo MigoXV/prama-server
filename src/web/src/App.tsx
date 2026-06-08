@@ -1,6 +1,7 @@
 import {
   Activity,
   BarChart3,
+  BookOpen,
   CheckCircle2,
   CircleDashed,
   Clipboard,
@@ -35,9 +36,12 @@ import { useThemeMode } from "./hooks/useThemeMode";
 import packageJson from "../package.json";
 import {
   createEvaluation,
+  getHelpDocument,
+  getEvaluation,
   listServerDirectory,
   recalculateEvaluationMetrics,
   subscribeEvaluationEvents,
+  testEngineConnectivity,
   uploadDatasetFiles,
 } from "./services/evaluations";
 import type {
@@ -45,9 +49,13 @@ import type {
   EvaluationProgress,
   EvaluationRequest,
   EvaluationResult,
+  EvaluationSnapshot,
   EvaluationTask,
+  HelpDocument,
   JobStatus,
   LidReportSample,
+  SqaScore,
+  SqaSummary,
   ThemeMode,
   VadReportRegion,
   VadReportSample,
@@ -76,6 +84,11 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   asr_inference_concurrency: "0",
   vad_inference_concurrency: "0",
   lid_inference_concurrency: "0",
+  enable_mos: false,
+  mos_target: "",
+  enable_snr: false,
+  snr_target: "",
+  sqa_inference_concurrency: "0",
   lid_confidence_threshold: "0",
   remove_punctuation: false,
   mask_frame_seconds: "0.01",
@@ -87,6 +100,7 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
 
 const APP_VERSION = packageJson.version;
 
+const LAST_EVALUATION_JOB_KEY = "prama.lastEvaluationJobId";
 const VAD_TIMELINE_LABEL_WIDTH = 88;
 const VAD_TIMELINE_PIXELS_PER_SECOND = 24;
 const VAD_TIMELINE_MIN_WIDTH = 760;
@@ -135,7 +149,7 @@ const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
   failed: "失败",
 };
 
-type ConsoleModule = "evaluation" | "settings";
+type ConsoleModule = "evaluation" | "settings" | "help";
 
 const MODULES: Array<{
   id: ConsoleModule;
@@ -144,6 +158,7 @@ const MODULES: Array<{
 }> = [
   { id: "evaluation", label: "在线评估", icon: Activity },
   { id: "settings", label: "设置", icon: Settings },
+  { id: "help", label: "帮助", icon: BookOpen },
 ];
 
 type AlignmentMetric = "wer" | "cer";
@@ -154,6 +169,16 @@ type ReportSortMode =
   | "wer-asc"
   | "cer-desc"
   | "cer-asc";
+type ConnectivityState = "idle" | "testing" | "ok" | "failed";
+type ConnectivityStatus = {
+  state: ConnectivityState;
+  message: string;
+};
+type MarkdownBlock =
+  | { type: "heading"; level: 1 | 2 | 3; text: string }
+  | { type: "paragraph"; text: string }
+  | { type: "list"; items: string[] }
+  | { type: "code"; language: string; text: string };
 
 export default function App() {
   const { themeMode, effectiveTheme, setThemeMode } = useThemeMode();
@@ -161,12 +186,17 @@ export default function App() {
     "prama.evaluationForm",
     DEFAULT_FORM_STATE,
   );
-  const formState = { ...DEFAULT_FORM_STATE, ...storedFormState };
+  const formState = normalizeFormState(storedFormState);
   const [taskRememberedFields, setTaskRememberedFields] = usePersistentState<
     Record<EvaluationTask, TaskRememberedFields>
   >("prama.taskRememberedFields", TASK_REMEMBERED_DEFAULTS);
   const [status, setStatus] = useState<JobStatus | "idle" | "started">("idle");
   const [jobId, setJobId] = useState("");
+  const [rememberedJobId, setRememberedJobId] = usePersistentState<string>(
+    LAST_EVALUATION_JOB_KEY,
+    "",
+  );
+  const [runTask, setRunTask] = useState<EvaluationTask>(formState.task);
   const [progress, setProgress] = useState<EvaluationProgress | null>(null);
   const [finalResult, setFinalResult] = useState<EvaluationResult | null>(null);
   const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(
@@ -174,6 +204,9 @@ export default function App() {
   );
   const [errorMessage, setErrorMessage] = useState("");
   const [connectionWarning, setConnectionWarning] = useState("");
+  const [connectivityStatus, setConnectivityStatus] = useState<
+    Record<string, ConnectivityStatus>
+  >({});
   const [busy, setBusy] = useState(false);
   const [datasetUploading, setDatasetUploading] = useState(false);
   const [recalculating, setRecalculating] = useState(false);
@@ -183,6 +216,9 @@ export default function App() {
     useState<AlignmentMetric>("wer");
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
   const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
+  const [helpDocument, setHelpDocument] = useState<HelpDocument | null>(null);
+  const [helpError, setHelpError] = useState("");
+  const evaluationConnectivityKey = `evaluation:${formState.task}`;
   const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
   const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
     formState.dataset_path,
@@ -196,8 +232,69 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (
+      activeModule !== "evaluation" ||
+      jobId ||
+      busy ||
+      !rememberedJobId
+    ) {
+      return;
+    }
+
+    let canceled = false;
+    getEvaluation(rememberedJobId)
+      .then((snapshot) => {
+        if (canceled) {
+          return;
+        }
+        applyEvaluationSnapshot(snapshot);
+        if (snapshot.status === "queued" || snapshot.status === "running") {
+          setBusy(true);
+          subscribeToEvaluation(snapshot.job_id);
+        }
+      })
+      .catch((error) => {
+        if (canceled) {
+          return;
+        }
+        const message =
+          error instanceof Error ? error.message : "最近评估任务恢复失败";
+        if (message.includes("评估任务不存在")) {
+          setRememberedJobId("");
+          return;
+        }
+        setConnectionWarning(message);
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [activeModule, rememberedJobId, jobId, busy]);
+
+  useEffect(() => {
     datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
   }, [activeModule]);
+
+  useEffect(() => {
+    if (activeModule !== "help" || helpDocument || helpError) {
+      return;
+    }
+    let canceled = false;
+    getHelpDocument()
+      .then((document) => {
+        if (!canceled) {
+          setHelpDocument(document);
+        }
+      })
+      .catch((error) => {
+        if (!canceled) {
+          setHelpError(error instanceof Error ? error.message : "帮助文档加载失败");
+        }
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [activeModule, helpDocument, helpError]);
 
   useEffect(() => {
     function handleGlobalKeyDown(event: KeyboardEvent) {
@@ -225,8 +322,9 @@ export default function App() {
   const cerReport = finalResult?.cer_report;
   const lidReport = finalResult?.lid_report;
   const canExport = finalResult !== null;
-  const isVad = formState.task === "vad";
-  const isLid = formState.task === "lid";
+  const displayTask = jobId || progress || finalResult ? runTask : formState.task;
+  const isVad = displayTask === "vad";
+  const isLid = displayTask === "lid";
   const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
 
   function resetRunState() {
@@ -234,6 +332,7 @@ export default function App() {
     closeEventsRef.current = null;
     setStatus("idle");
     setJobId("");
+    setRunTask(formState.task);
     setProgress(null);
     setFinalResult(null);
     setExcludedSampleIds(new Set());
@@ -248,6 +347,8 @@ export default function App() {
       return;
     }
     resetRunState();
+    setRememberedJobId("");
+    setRunTask(task);
     const nextTaskRemembered =
       taskRememberedFields[task] ?? TASK_REMEMBERED_DEFAULTS[task];
     setTaskRememberedFields((current) => ({
@@ -279,42 +380,11 @@ export default function App() {
     try {
       const request = buildRequest(formState);
       const created = await createEvaluation(request);
+      setRememberedJobId(created.job_id);
       setJobId(created.job_id);
+      setRunTask(request.task);
       setStatus(created.status);
-      closeEventsRef.current = subscribeEvaluationEvents(created.job_id, {
-        onProgress: (nextProgress) => {
-          setConnectionWarning("");
-          setProgress(nextProgress);
-          setStatus(nextProgress.status ?? "running");
-          if (nextProgress.result) {
-            setFinalResult(nextProgress.result);
-          }
-        },
-        onPartialProgress: (nextProgress) => {
-          setConnectionWarning("");
-          setProgress(nextProgress);
-          setStatus(nextProgress.status ?? "running");
-        },
-        onDone: (snapshot) => {
-          setStatus(snapshot.status);
-          setProgress(snapshot.progress);
-          setFinalResult(snapshot.result);
-          setExcludedSampleIds(
-            new Set(snapshot.result?.excluded_sample_ids ?? []),
-          );
-          setErrorMessage(snapshot.error ?? "");
-          setBusy(false);
-          closeEventsRef.current = null;
-        },
-        onError: (message) => {
-          setStatus("failed");
-          setErrorMessage(message);
-          setBusy(false);
-        },
-        onConnectionError: () => {
-          setConnectionWarning("事件流连接暂时不可用");
-        },
-      });
+      subscribeToEvaluation(created.job_id);
     } catch (error) {
       setStatus("failed");
       setErrorMessage(error instanceof Error ? error.message : "评估任务创建失败");
@@ -356,6 +426,85 @@ export default function App() {
     }
   }
 
+  async function handleTestConnectivity(key: string, target: string) {
+    const normalizedTarget = target.trim();
+    if (!normalizedTarget) {
+      setConnectivityStatus((current) => ({
+        ...current,
+        [key]: { state: "failed", message: "引擎地址不能为空" },
+      }));
+      return;
+    }
+    setConnectivityStatus((current) => ({
+      ...current,
+      [key]: { state: "testing", message: "测试中" },
+    }));
+    try {
+      const result = await testEngineConnectivity(
+        normalizedTarget,
+        toOptionalNumber(formState.connect_timeout_seconds),
+      );
+      setConnectivityStatus((current) => ({
+        ...current,
+        [key]: {
+          state: result.ok ? "ok" : "failed",
+          message: result.message,
+        },
+      }));
+    } catch (error) {
+      setConnectivityStatus((current) => ({
+        ...current,
+        [key]: {
+          state: "failed",
+          message: error instanceof Error ? error.message : "连接测试失败",
+        },
+      }));
+    }
+  }
+
+  function applyEvaluationSnapshot(snapshot: EvaluationSnapshot) {
+    setRememberedJobId(snapshot.job_id);
+    setJobId(snapshot.job_id);
+    setRunTask(snapshot.request.task);
+    setStatus(snapshot.status);
+    setProgress(snapshot.progress);
+    setFinalResult(snapshot.result);
+    setExcludedSampleIds(new Set(snapshot.result?.excluded_sample_ids ?? []));
+    setErrorMessage(snapshot.error ?? "");
+  }
+
+  function subscribeToEvaluation(nextJobId: string) {
+    closeEventsRef.current?.();
+    closeEventsRef.current = subscribeEvaluationEvents(nextJobId, {
+      onProgress: (nextProgress) => {
+        setConnectionWarning("");
+        setProgress(nextProgress);
+        setStatus(nextProgress.status ?? "running");
+        if (nextProgress.result) {
+          setFinalResult(nextProgress.result);
+        }
+      },
+      onPartialProgress: (nextProgress) => {
+        setConnectionWarning("");
+        setProgress(nextProgress);
+        setStatus(nextProgress.status ?? "running");
+      },
+      onDone: (snapshot) => {
+        applyEvaluationSnapshot(snapshot);
+        setBusy(false);
+        closeEventsRef.current = null;
+      },
+      onError: (message) => {
+        setStatus("failed");
+        setErrorMessage(message);
+        setBusy(false);
+      },
+      onConnectionError: () => {
+        setConnectionWarning("事件流连接暂时不可用");
+      },
+    });
+  }
+
   function updateField(field: keyof EvaluationFormState, value: string) {
     setFormState((current) => ({ ...current, [field]: value }));
     if (field === "target" || field === "dataset_path") {
@@ -367,6 +516,10 @@ export default function App() {
         },
       }));
     }
+  }
+
+  function setBooleanField(field: keyof EvaluationFormState, value: boolean) {
+    setFormState((current) => ({ ...current, [field]: value }));
   }
 
   async function handleImportDataset(files: File[]) {
@@ -582,12 +735,23 @@ export default function App() {
               </div>
 
               <div className="field-grid">
-                <TextField
-                  label={`${evaluationTaskShortLabel(formState.task)} 引擎地址`}
-                  value={formState.target}
-                  onChange={(value) => updateField("target", value)}
-                  required
-                />
+                <div className="engine-target-row">
+                  <TextField
+                    label={`${evaluationTaskShortLabel(formState.task)} 引擎地址`}
+                    value={formState.target}
+                    onChange={(value) => updateField("target", value)}
+                    required
+                  />
+                  <ConnectivityButton
+                    status={connectivityStatus[evaluationConnectivityKey]}
+                    onClick={() =>
+                      void handleTestConnectivity(
+                        evaluationConnectivityKey,
+                        formState.target,
+                      )
+                    }
+                  />
+                </div>
                 <label className="field dataset-path-field">
                   <span>数据集路径</span>
                   <div className="dataset-path-controls">
@@ -719,6 +883,71 @@ export default function App() {
                       onChange={(value) => updateField("request_timeout_seconds", value)}
                       required
                     />
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>SQA 语音质量评估</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="MOS/SNR 推理并发数"
+                      value={formState.sqa_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) => updateField("sqa_inference_concurrency", value)}
+                      required
+                    />
+                  </div>
+                  <div className="sqa-fixed-list">
+                    <div className="sqa-fixed-row">
+                      <label className="check-field">
+                        <input
+                          type="checkbox"
+                          checked={formState.enable_mos}
+                          onChange={(event) =>
+                            setBooleanField("enable_mos", event.target.checked)
+                          }
+                        />
+                        <span>MOS</span>
+                      </label>
+                      <TextField
+                        label="MOS 地址"
+                        value={formState.mos_target}
+                        onChange={(value) => updateField("mos_target", value)}
+                      />
+                      <ConnectivityButton
+                        status={connectivityStatus.mos}
+                        onClick={() =>
+                          void handleTestConnectivity("mos", formState.mos_target)
+                        }
+                      />
+                    </div>
+                    <div className="sqa-fixed-row">
+                      <label className="check-field">
+                        <input
+                          type="checkbox"
+                          checked={formState.enable_snr}
+                          onChange={(event) =>
+                            setBooleanField("enable_snr", event.target.checked)
+                          }
+                        />
+                        <span>SNR</span>
+                      </label>
+                      <TextField
+                        label="SNR 地址"
+                        value={formState.snr_target}
+                        onChange={(value) => updateField("snr_target", value)}
+                      />
+                      <ConnectivityButton
+                        status={connectivityStatus.snr}
+                        onClick={() =>
+                          void handleTestConnectivity("snr", formState.snr_target)
+                        }
+                      />
+                    </div>
                   </div>
                 </section>
 
@@ -873,21 +1102,30 @@ export default function App() {
                       }
                       required
                     />
-                    <TextField
-                      label="LID 置信度阈值"
-                      value={formState.lid_confidence_threshold}
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      onChange={(value) =>
-                        updateField("lid_confidence_threshold", value)
-                      }
-                      required
-                    />
                   </div>
                 </section>
               </div>
+            </section>
+          ) : null}
+
+          {activeModule === "help" ? (
+            <section className="panel help-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>{helpDocument?.title || "帮助"}</h2>
+                  <span>数据集格式、字段要求和示例</span>
+                </div>
+              </div>
+              {helpError ? (
+                <div className="inline-warning">
+                  <TriangleAlert size={15} />
+                  {helpError}
+                </div>
+              ) : helpDocument ? (
+                <MarkdownDocument markdown={helpDocument.markdown} />
+              ) : (
+                <div className="empty-state">正在加载帮助文档</div>
+              )}
             </section>
           ) : null}
 
@@ -915,6 +1153,7 @@ export default function App() {
                     <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
                   </div>
                   <PerformanceMetrics result={finalResult} />
+                  <SqaSummaryMetrics summary={finalResult?.sqa_summary} />
                   {connectionWarning ? (
                     <div className="inline-warning">
                       <TriangleAlert size={15} />
@@ -930,6 +1169,9 @@ export default function App() {
                 </div>
                 {isVad ? <VadOverviewMetrics result={finalResult} /> : null}
                 {isLid ? <LidOverviewMetrics result={finalResult} /> : null}
+                {!isVad && !isLid ? (
+                  <AsrOverviewMetrics result={finalResult} />
+                ) : null}
 
                 {!isVad ? (
                   <div className="panel sample-panel">
@@ -1077,6 +1319,35 @@ function StatusPill({ status }: { status: JobStatus | "idle" | "started" }) {
       <Icon size={15} />
       {STATUS_LABELS[status]}
     </StatusChip>
+  );
+}
+
+function ConnectivityButton({
+  status,
+  onClick,
+}: {
+  status?: ConnectivityStatus;
+  onClick: () => void;
+}) {
+  const state = status?.state ?? "idle";
+  const label =
+    state === "testing"
+      ? "测试中"
+      : state === "ok"
+        ? "已连接"
+        : state === "failed"
+          ? "失败"
+          : "测试";
+  return (
+    <button
+      type="button"
+      className={`connectivity-button ${state}`}
+      title={status?.message || "测试 gRPC 连通性"}
+      disabled={state === "testing"}
+      onClick={onClick}
+    >
+      {label}
+    </button>
   );
 }
 
@@ -1276,6 +1547,106 @@ function PerformanceMetrics({ result }: { result: EvaluationResult | null }) {
   );
 }
 
+function SqaSummaryMetrics({ summary }: { summary?: SqaSummary[] }) {
+  if (!summary?.length) {
+    return null;
+  }
+
+  return (
+    <div className="metric-strip sqa-summary-metrics">
+      {summary.map((item) => (
+        <Metric
+          key={`${item.engine_name}-${item.target}`}
+          label={item.engine_name}
+          value={formatSqaScore(item.mean_score)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function SqaScoreChips({ scores }: { scores?: SqaScore[] }) {
+  if (!scores?.length) {
+    return null;
+  }
+
+  return (
+    <span className="sqa-score-chips">
+      {scores.map((item) => {
+        const failed = item.score === null || item.score === undefined || item.error;
+        const title = failed
+          ? `${item.engine_name}: ${item.error || "无有效分数"}`
+          : `${item.engine_name}: ${item.target}`;
+        return (
+          <span
+            className={`sqa-score-chip ${failed ? "failed" : ""}`}
+            key={`${item.engine_name}-${item.target}`}
+            title={title}
+          >
+            <em>{item.engine_name}</em>
+            <strong>{formatSqaScore(item.score)}</strong>
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+function MarkdownDocument({ markdown }: { markdown: string }) {
+  const blocks = useMemo(() => parseMarkdown(markdown), [markdown]);
+  return (
+    <article className="markdown-document">
+      {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
+          return <HeadingTag key={index}>{block.text}</HeadingTag>;
+        }
+        if (block.type === "code") {
+          return (
+            <pre key={index} className="markdown-code-block">
+              {block.language ? <span>{block.language}</span> : null}
+              <code>{block.text}</code>
+            </pre>
+          );
+        }
+        if (block.type === "list") {
+          return (
+            <ul key={index}>
+              {block.items.map((item, itemIndex) => (
+                <li key={itemIndex}>{item}</li>
+              ))}
+            </ul>
+          );
+        }
+        return <p key={index}>{block.text}</p>;
+      })}
+    </article>
+  );
+}
+
+function AsrOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="panel asr-overview-panel">
+      <div className="metric-strip asr-overview-metrics">
+        <Metric label="WER" value={formatRate(result.wer)} />
+        <Metric label="CER" value={formatRate(result.cer)} />
+      </div>
+      <SampleCountStrip
+        result={result}
+        fallbackCount={
+          result.wer_report?.utterances.length ??
+          result.cer_report?.utterances.length ??
+          0
+        }
+      />
+    </div>
+  );
+}
+
 function VadOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   if (!result) {
     return null;
@@ -1463,6 +1834,7 @@ function AsrAlignmentReportPanel({
           </div>
           <SampleCountStrip result={result} fallbackCount={sampleCount} />
           <PerformanceMetrics result={result} />
+          <SqaSummaryMetrics summary={result?.sqa_summary} />
           <div className="alignment-metric-tabs" role="tablist" aria-label="对齐指标">
             <button
               type="button"
@@ -1504,6 +1876,7 @@ function AsrAlignmentReportPanel({
                     summary={utterance.summary}
                     tokens={utterance.tokens}
                   />
+                  <SqaScoreChips scores={utterance.sqa_scores} />
                 </summary>
                 <div className="utterance-body">
                   <div className="utterance-audio-row">
@@ -1569,6 +1942,7 @@ function VadReportPanel({
         <>
           <SampleCountStrip result={result} fallbackCount={samples.length} />
           <PerformanceMetrics result={result} />
+          <SqaSummaryMetrics summary={result.sqa_summary} />
           <VadMaskReport
             samples={samples}
             excludedSampleIds={excludedSampleIds}
@@ -1626,6 +2000,7 @@ function LidReportPanel({
           </div>
           <SampleCountStrip result={result} fallbackCount={samples.length} />
           <PerformanceMetrics result={result} />
+          <SqaSummaryMetrics summary={result.sqa_summary} />
           <LidSampleList
             samples={samples}
             excludedSampleIds={excludedSampleIds}
@@ -1660,26 +2035,35 @@ function LidSampleList({
           key={sample.id}
         >
           <div className="lid-sample-title">
-            <span>
+            <span className="lid-sample-name">
               <ExcludeCheckbox
                 checked={excludedSampleIds.has(sample.id)}
                 onChange={(checked) => onExcludedChange(sample.id, checked)}
               />
               <strong>#{sample.index ?? "-"}</strong>
-              <span>{sample.id}</span>
+              <span title={sample.id}>{sample.id}</span>
             </span>
-            <b>{sample.correct ? "正确" : "错误"}</b>
-          </div>
-          <div className="lid-sample-row">
-            <AudioPlayer
-              src={sample.audio_url}
-              durationSeconds={sample.duration_seconds}
-            />
-            <div className="lid-result-grid">
-              <Metric label="真实语种" value={sample.reference_language || "-"} />
-              <Metric label="预测语种" value={sample.predicted_language || "-"} />
-              <Metric label="原始结果" value={sample.raw_language || "-"} />
-              <Metric label="置信度" value={formatConfidence(sample.confidence)} />
+            <div className="lid-result-line">
+              <span>
+                <em>真实</em>
+                <strong>{sample.reference_language || "-"}</strong>
+              </span>
+              <span>
+                <em>预测</em>
+                <strong>{sample.predicted_language || "-"}</strong>
+              </span>
+              <span>
+                <em>置信度</em>
+                <strong>{formatConfidence(sample.confidence)}</strong>
+              </span>
+            </div>
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="lid-sample-actions">
+              <AudioPlayer
+                src={sample.audio_url}
+                durationSeconds={sample.duration_seconds}
+              />
+              <b>{sample.correct ? "正确" : "错误"}</b>
             </div>
           </div>
         </section>
@@ -1744,6 +2128,7 @@ function VadMaskReport({
                 src={sample.audio_url}
                 durationSeconds={sample.duration_seconds}
               />
+              <SqaScoreChips scores={sample.sqa_scores} />
               <small>{formatSeconds(sample.duration_seconds)}</small>
             </summary>
             <div className="vad-sample-body">
@@ -2042,7 +2427,8 @@ function normalizeWerTokenLabel(label: string): string {
   return normalized;
 }
 
-function buildRequest(state: EvaluationFormState): EvaluationRequest {
+function buildRequest(rawState: EvaluationFormState): EvaluationRequest {
+  const state = normalizeFormState(rawState);
   return {
     task: state.task,
     target: state.target,
@@ -2064,6 +2450,11 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
     asr_inference_concurrency: toNumber(state.asr_inference_concurrency, 0),
     vad_inference_concurrency: toNumber(state.vad_inference_concurrency, 0),
     lid_inference_concurrency: toNumber(state.lid_inference_concurrency, 0),
+    enable_mos: state.enable_mos ?? false,
+    mos_target: state.mos_target.trim(),
+    enable_snr: state.enable_snr ?? false,
+    snr_target: state.snr_target.trim(),
+    sqa_inference_concurrency: toNumber(state.sqa_inference_concurrency, 0),
     lid_confidence_threshold: toNumber(state.lid_confidence_threshold, 0),
     remove_punctuation: state.remove_punctuation ?? false,
     mask_frame_seconds: toNumber(state.mask_frame_seconds, 0.01),
@@ -2071,6 +2462,38 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
     speech_padding_seconds: toNumber(state.speech_padding_seconds ?? "0", 0),
     hit_threshold: toNumber(state.hit_threshold, 0.9),
     streaming: state.streaming ?? false,
+  };
+}
+
+function normalizeFormState(state: EvaluationFormState): EvaluationFormState {
+  const { enable_sqa: _enableSqa, sqa_engines: _sqaEngines, ...knownState } =
+    state as EvaluationFormState & {
+      enable_sqa?: unknown;
+      sqa_engines?: unknown;
+    };
+  return {
+    ...DEFAULT_FORM_STATE,
+    ...knownState,
+    enable_mos:
+      typeof state.enable_mos === "boolean"
+        ? state.enable_mos
+        : DEFAULT_FORM_STATE.enable_mos,
+    mos_target:
+      typeof state.mos_target === "string"
+        ? state.mos_target
+        : DEFAULT_FORM_STATE.mos_target,
+    enable_snr:
+      typeof state.enable_snr === "boolean"
+        ? state.enable_snr
+        : DEFAULT_FORM_STATE.enable_snr,
+    snr_target:
+      typeof state.snr_target === "string"
+        ? state.snr_target
+        : DEFAULT_FORM_STATE.snr_target,
+    sqa_inference_concurrency:
+      typeof state.sqa_inference_concurrency === "string"
+        ? state.sqa_inference_concurrency
+        : DEFAULT_FORM_STATE.sqa_inference_concurrency,
   };
 }
 
@@ -2211,6 +2634,97 @@ function formatConfidence(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value)
     ? value.toFixed(4)
     : "-";
+}
+
+function formatSqaScore(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(2)
+    : "-";
+}
+
+function parseMarkdown(markdown: string): MarkdownBlock[] {
+  const blocks: MarkdownBlock[] = [];
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  let paragraph: string[] = [];
+  let listItems: string[] = [];
+  let codeLines: string[] = [];
+  let codeLanguage = "";
+  let inCode = false;
+
+  function flushParagraph() {
+    if (paragraph.length) {
+      blocks.push({ type: "paragraph", text: paragraph.join(" ") });
+      paragraph = [];
+    }
+  }
+
+  function flushList() {
+    if (listItems.length) {
+      blocks.push({ type: "list", items: listItems });
+      listItems = [];
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith("```")) {
+      if (inCode) {
+        blocks.push({
+          type: "code",
+          language: codeLanguage,
+          text: codeLines.join("\n"),
+        });
+        codeLines = [];
+        codeLanguage = "";
+        inCode = false;
+      } else {
+        flushParagraph();
+        flushList();
+        codeLanguage = line.slice(3).trim();
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      blocks.push({
+        type: "heading",
+        level: heading[1].length as 1 | 2 | 3,
+        text: heading[2],
+      });
+      continue;
+    }
+
+    if (trimmed.startsWith("- ")) {
+      flushParagraph();
+      listItems.push(trimmed.slice(2));
+      continue;
+    }
+
+    flushList();
+    paragraph.push(trimmed);
+  }
+
+  if (inCode) {
+    blocks.push({ type: "code", language: codeLanguage, text: codeLines.join("\n") });
+  }
+  flushParagraph();
+  flushList();
+  return blocks;
 }
 
 function getVadTimelineWidth(duration: number): number {

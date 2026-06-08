@@ -18,13 +18,14 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import librosa
+import grpc
 import numpy as np
 import pandas as pd
 import soundfile as sf
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from prama.evaluator.evaluator import get_cer, get_wer
 
 from prama_server.evaluator import (
@@ -35,6 +36,7 @@ from prama_server.evaluator import (
 from prama_server.evaluator.vad import VadEvaluator
 from prama_server.inferencers.asr import AsrGrpcInferencer
 from prama_server.inferencers.lid import LidGrpcInferencer
+from prama_server.inferencers.sqa import SqaGrpcInferencer
 from prama_server.inferencers.vad import VadGrpcInferencer
 from prama_server.metrics.prama_warpper import get_cer_pd, get_wer_pd
 from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, MessageManager
@@ -67,11 +69,20 @@ class EvaluationRequest(BaseModel):
     asr_inference_concurrency: int = Field(0, ge=0, description="ASR 样本级推理并发数")
     vad_inference_concurrency: int = Field(0, ge=0, description="VAD 样本级推理并发数")
     lid_inference_concurrency: int = Field(0, ge=0, description="LID 样本级推理并发数")
+    enable_mos: bool = Field(False, description="是否启用 MOS 语音质量评估")
+    mos_target: str = Field("", description="MOS gRPC 服务地址")
+    enable_snr: bool = Field(False, description="是否启用 SNR 语音质量评估")
+    snr_target: str = Field("", description="SNR gRPC 服务地址")
+    sqa_inference_concurrency: int = Field(
+        0,
+        ge=0,
+        description="MOS/SNR 推理并发数，0 表示串行",
+    )
     lid_confidence_threshold: float = Field(
         0.0,
         ge=0,
         le=1,
-        description="LID 置信度阈值；低于阈值时预测为 other",
+        description="LID 置信度阈值兼容字段；当前严格按模型输出标签判定",
     )
     remove_punctuation: bool = Field(False, description="ASR 评估时是否移除标点")
     mask_frame_seconds: float = Field(0.01, gt=0, description="VAD mask 帧长秒数")
@@ -84,6 +95,16 @@ class EvaluationRequest(BaseModel):
     hit_threshold: float = Field(0.9, ge=0, le=1, description="VAD 段命中阈值")
     streaming: bool = Field(False, description="是否使用 VAD 流式接口")
 
+    @model_validator(mode="after")
+    def validate_sqa_config(self) -> EvaluationRequest:
+        self.mos_target = self.mos_target.strip()
+        self.snr_target = self.snr_target.strip()
+        if self.enable_mos and not self.mos_target:
+            raise ValueError("启用 MOS 时 MOS 引擎地址不能为空")
+        if self.enable_snr and not self.snr_target:
+            raise ValueError("启用 SNR 时 SNR 引擎地址不能为空")
+        return self
+
 
 class EvaluationCreated(BaseModel):
     job_id: str
@@ -95,6 +116,22 @@ class RecalculateMetricsRequest(BaseModel):
         default_factory=list,
         description="不参与指标重算的样本 ID",
     )
+
+
+class EngineConnectivityRequest(BaseModel):
+    target: str = Field(..., description="gRPC 服务地址")
+    timeout_seconds: float = Field(3.0, gt=0, description="连接超时秒数")
+
+
+class EngineConnectivityResult(BaseModel):
+    ok: bool
+    target: str
+    message: str
+
+
+class HelpDocument(BaseModel):
+    title: str
+    markdown: str
 
 
 class DirectoryEntry(BaseModel):
@@ -114,6 +151,111 @@ class DatasetUploadResult(BaseModel):
     imported_count: int
     skipped_count: int = 0
     message: str | None = None
+
+
+@dataclass
+class SqaRuntimeEngine:
+    name: str
+    target: str
+    inferencer: SqaGrpcInferencer | None = None
+    error: str | None = None
+
+
+class SqaAssessor:
+    def __init__(self, request: EvaluationRequest) -> None:
+        self.concurrency = request.sqa_inference_concurrency
+        engine_configs = _sqa_engine_configs(request)
+        self.enabled = bool(engine_configs)
+        self.semaphore = (
+            threading.Semaphore(self.concurrency)
+            if self.enabled and self.concurrency > 0
+            else None
+        )
+        self.engines: list[SqaRuntimeEngine] = []
+        if not self.enabled:
+            return
+        for name, target in engine_configs:
+            try:
+                inferencer = SqaGrpcInferencer(
+                    target=target,
+                    sample_rate=request.sample_rate,
+                    request_timeout_seconds=request.request_timeout_seconds,
+                    connect_timeout_seconds=request.connect_timeout_seconds,
+                )
+                self.engines.append(
+                    SqaRuntimeEngine(name=name, target=target, inferencer=inferencer)
+                )
+            except Exception as exc:  # noqa: BLE001 - SQA 不应拖垮主评估
+                logger.exception(
+                    "SQA 引擎初始化失败，将记录为空分: name=%s target=%s",
+                    name,
+                    target,
+                )
+                self.engines.append(
+                    SqaRuntimeEngine(name=name, target=target, error=str(exc))
+                )
+
+    def assess(self, audio_array: np.ndarray) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        if self.concurrency <= 0 or len(self.engines) <= 1:
+            return [self._assess_engine(engine, audio_array) for engine in self.engines]
+
+        max_workers = min(self.concurrency, len(self.engines))
+        results: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._assess_engine, engine, audio_array): index
+                for index, engine in enumerate(self.engines)
+            }
+            for future in as_completed(futures):
+                results.append((futures[future], future.result()))
+        return [result for _, result in sorted(results, key=lambda item: item[0])]
+
+    def close(self) -> None:
+        for engine in self.engines:
+            if engine.inferencer is not None:
+                engine.inferencer.close()
+
+    def _assess_engine(
+        self,
+        engine: SqaRuntimeEngine,
+        audio_array: np.ndarray,
+    ) -> dict[str, Any]:
+        payload = {
+            "engine_name": engine.name,
+            "target": engine.target,
+            "score": None,
+            "error": engine.error,
+        }
+        if engine.inferencer is None:
+            return payload
+
+        try:
+            if self.semaphore is None:
+                result = engine.inferencer.infer(audio_array)
+            else:
+                with self.semaphore:
+                    result = engine.inferencer.infer(audio_array)
+            payload["score"] = result.score
+            payload["error"] = None
+        except Exception as exc:  # noqa: BLE001 - 单个 SQA 分数失败不影响主评估
+            logger.exception(
+                "SQA 评估失败: name=%s target=%s",
+                engine.name,
+                engine.target,
+            )
+            payload["error"] = str(exc)
+        return payload
+
+
+def _sqa_engine_configs(request: EvaluationRequest) -> list[tuple[str, str]]:
+    configs: list[tuple[str, str]] = []
+    if request.enable_mos:
+        configs.append(("MOS", request.mos_target))
+    if request.enable_snr:
+        configs.append(("SNR", request.snr_target))
+    return configs
 
 
 @dataclass
@@ -166,6 +308,17 @@ ALLOWED_UPLOAD_SUFFIXES = {
 @app.get("/")
 def index() -> dict[str, str]:
     return {"name": "Prama ASR Evaluation Service", "status": "ok"}
+
+
+@app.get("/api/help", response_model=HelpDocument)
+def get_help_document() -> HelpDocument:
+    help_path = Path(__file__).resolve().parents[1] / "help" / "datasets.md"
+    if not help_path.exists():
+        raise HTTPException(status_code=404, detail="帮助文档不存在")
+    return HelpDocument(
+        title="数据集格式说明",
+        markdown=help_path.read_text(encoding="utf-8"),
+    )
 
 
 @app.get("/api/files/directories", response_model=DirectoryListing)
@@ -269,6 +422,27 @@ def create_evaluation(request: EvaluationRequest) -> EvaluationCreated:
     thread.start()
     logger.info("评估任务已创建: job_id=%s target=%s", job_id, request.target)
     return EvaluationCreated(job_id=job_id, status=job.status)
+
+
+@app.post("/api/engines/connectivity", response_model=EngineConnectivityResult)
+def test_engine_connectivity(
+    request: EngineConnectivityRequest,
+) -> EngineConnectivityResult:
+    target = request.target.strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="引擎地址不能为空")
+    channel = grpc.insecure_channel(target)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=request.timeout_seconds)
+    except Exception as exc:  # noqa: BLE001 - 返回连通性错误详情给前端
+        return EngineConnectivityResult(
+            ok=False,
+            target=target,
+            message=str(exc) or "连接失败",
+        )
+    finally:
+        channel.close()
+    return EngineConnectivityResult(ok=True, target=target, message="连接成功")
 
 
 @app.get("/api/evaluations/{job_id}")
@@ -493,6 +667,7 @@ def _run_evaluation(job: EvaluationJob) -> None:
             _run_lid_evaluation(job)
             return
 
+        sqa_assessor = SqaAssessor(request)
         inferencer = AsrGrpcInferencer(
             target=request.target,
             sample_rate=request.sample_rate,
@@ -510,12 +685,12 @@ def _run_evaluation(job: EvaluationJob) -> None:
             sample_rate=request.sample_rate,
             min_reference_words=request.min_reference_words,
         )
-        _register_asr_sample_records(job, dataset)
+        inference_start_time = time.perf_counter()
+        _register_asr_sample_records(job, dataset, sqa_assessor=sqa_assessor)
         total = len(dataset)
         evaluated = 0
         progress_lock = threading.Lock()
         inference_rows: list[dict[str, Any]] = []
-        inference_start_time = time.perf_counter()
 
         def publish_partial_infer_result(
             result: EvaluationPartialInferenceResult,
@@ -563,6 +738,7 @@ def _run_evaluation(job: EvaluationJob) -> None:
                 "hypothesis": result.hypothesis,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": sample_record.get("sqa_scores", []),
             }
             with progress_lock:
                 inference_rows.append(row)
@@ -579,6 +755,7 @@ def _run_evaluation(job: EvaluationJob) -> None:
                 "is_final": True,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": sample_record.get("sqa_scores", []),
             }
             with job.lock:
                 job.latest_progress = payload
@@ -624,6 +801,7 @@ def _run_evaluation(job: EvaluationJob) -> None:
                 excluded_sample_ids=set(),
                 total_count=len(inference_rows),
             ),
+            **_sqa_summary_payload(inference_rows),
         }
         with job.lock:
             job.status = "completed"
@@ -643,6 +821,8 @@ def _run_evaluation(job: EvaluationJob) -> None:
             )
         )
     finally:
+        if request.task == "asr" and "sqa_assessor" in locals():
+            sqa_assessor.close()
         message_manager.close_job(job.job_id)
 
 
@@ -691,7 +871,12 @@ def remove_punctuation(text: str) -> str:
     return " ".join(without_punctuation.split())
 
 
-def _register_asr_sample_records(job: EvaluationJob, dataset: Dataset) -> None:
+def _register_asr_sample_records(
+    job: EvaluationJob,
+    dataset: Dataset,
+    *,
+    sqa_assessor: SqaAssessor,
+) -> None:
     request = job.request
     for index, sample in enumerate(dataset, start=1):
         sample_id = str(sample.get("id") or sample.get("utt_id") or index)
@@ -701,7 +886,7 @@ def _register_asr_sample_records(job: EvaluationJob, dataset: Dataset) -> None:
                 f"样本采样率与 ASR 配置不一致: id={sample_id} "
                 f"audio_sample_rate={audio_sample_rate} sample_rate={request.sample_rate}"
             )
-        _register_sample_record(
+        sample_record = _register_sample_record(
             job=job,
             sample=sample,
             sample_id=sample_id,
@@ -709,6 +894,7 @@ def _register_asr_sample_records(job: EvaluationJob, dataset: Dataset) -> None:
             audio_array=audio_array,
             sample_rate=audio_sample_rate,
         )
+        sample_record["sqa_scores"] = sqa_assessor.assess(audio_array)
 
 
 def _register_sample_record(
@@ -838,6 +1024,7 @@ def _audio_media_type(audio_path: Path) -> str:
 
 def _run_vad_evaluation(job: EvaluationJob) -> None:
     request = job.request
+    sqa_assessor = SqaAssessor(request)
     inferencer = VadGrpcInferencer(
         target=request.target,
         sample_rate=request.sample_rate,
@@ -899,6 +1086,7 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
                     "duration_seconds",
                     report_sample["duration_seconds"],
                 ),
+                "sqa_scores": sqa_assessor.assess(audio_array),
             }
         )
         return {
@@ -922,6 +1110,7 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
                 "result": result_dict,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": report_sample.get("sqa_scores", []),
             },
         }
 
@@ -977,14 +1166,17 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
                     excluded_sample_ids=set(),
                     total_count=len(rows),
                 ),
+                **_sqa_summary_payload(report_samples),
             }
         logger.info("VAD 评估任务完成: job_id=%s", job.job_id)
     finally:
+        sqa_assessor.close()
         inferencer.close()
 
 
 def _run_lid_evaluation(job: EvaluationJob) -> None:
     request = job.request
+    sqa_assessor = SqaAssessor(request)
     inferencer = LidGrpcInferencer(
         target=request.target,
         sample_rate=request.sample_rate,
@@ -1003,7 +1195,7 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
 
     def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
         sample_id = str(sample.get("id") or sample.get("utt_id") or index)
-        reference_language = _normalize_lid_language(sample["language_id"])
+        reference_language = str(sample["language_id"])
         audio_array = _prepare_vad_audio(sample["audio"], sample_rate=request.sample_rate)
         sample_record = _register_sample_record(
             job=job,
@@ -1014,11 +1206,7 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
             sample_rate=request.sample_rate,
         )
         prediction = inferencer.infer(audio_array)
-        predicted_language = _lid_predicted_language(
-            raw_language=prediction.lang,
-            confidence=prediction.score,
-            threshold=request.lid_confidence_threshold,
-        )
+        predicted_language = str(prediction.lang)
         correct = predicted_language == reference_language
         report_sample = {
             "id": sample_id,
@@ -1030,6 +1218,7 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
             "raw_language": prediction.lang,
             "confidence": prediction.score,
             "correct": correct,
+            "sqa_scores": sqa_assessor.assess(audio_array),
         }
         return {
             "report_sample": report_sample,
@@ -1045,6 +1234,7 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
                 "result": report_sample,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": report_sample.get("sqa_scores", []),
             },
         }
 
@@ -1097,9 +1287,11 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
                     excluded_sample_ids=set(),
                     total_count=len(report_samples),
                 ),
+                **_sqa_summary_payload(report_samples),
             }
         logger.info("LID 评估任务完成: job_id=%s", job.job_id)
     finally:
+        sqa_assessor.close()
         inferencer.close()
 
 
@@ -1376,6 +1568,7 @@ def _recalculate_asr_result(
             excluded_sample_ids=excluded_sample_ids,
             total_count=len(job.asr_inference_rows),
         ),
+        **_sqa_summary_payload(rows),
     }
 
 
@@ -1442,6 +1635,7 @@ def _recalculate_vad_result(
             excluded_sample_ids=excluded_sample_ids,
             total_count=len(job.vad_metric_rows),
         ),
+        **_sqa_summary_payload(samples),
     }
 
 
@@ -1465,6 +1659,7 @@ def _recalculate_lid_result(
             excluded_sample_ids=excluded_sample_ids,
             total_count=len(job.lid_report_samples),
         ),
+        **_sqa_summary_payload(samples),
     }
 
 
@@ -1530,6 +1725,55 @@ def _sum_sample_duration(samples: list[dict[str, Any]]) -> float:
     )
 
 
+def _sqa_summary_payload(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _build_sqa_summary(samples)
+    return {"sqa_summary": summary} if summary else {}
+
+
+def _build_sqa_summary(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary_by_engine: dict[tuple[str, str], dict[str, Any]] = {}
+    for sample in samples:
+        scores = sample.get("sqa_scores")
+        if not isinstance(scores, list):
+            continue
+        for score_item in scores:
+            if not isinstance(score_item, dict):
+                continue
+            engine_name = str(score_item.get("engine_name") or "")
+            target = str(score_item.get("target") or "")
+            if not engine_name:
+                continue
+            key = (engine_name, target)
+            summary = summary_by_engine.setdefault(
+                key,
+                {
+                    "engine_name": engine_name,
+                    "target": target,
+                    "scores": [],
+                    "failed_count": 0,
+                },
+            )
+            score = _as_float(score_item.get("score"))
+            if score is None:
+                summary["failed_count"] += 1
+            else:
+                summary["scores"].append(score)
+
+    payload: list[dict[str, Any]] = []
+    for summary in summary_by_engine.values():
+        scores = summary["scores"]
+        payload.append(
+            {
+                "engine_name": summary["engine_name"],
+                "target": summary["target"],
+                "mean_score": float(np.mean(scores)) if scores else None,
+                "scored_count": len(scores),
+                "failed_count": summary["failed_count"],
+            }
+        )
+    return payload
+
+
 def _normalize_lid_language(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("_", "-")
     if normalized in {"en", "eng", "en-us", "en-gb", "english"}:
@@ -1550,15 +1794,12 @@ def _normalize_lid_language(value: Any) -> str:
 
 
 def _lid_predicted_language(
-    *,
-    raw_language: Any,
+    raw_language: str,
     confidence: float,
     threshold: float,
 ) -> str:
-    if confidence < threshold:
-        return "other"
-    return _normalize_lid_language(raw_language)
-
+    del confidence, threshold
+    return str(raw_language)
 
 def _task_inference_concurrency(
     request: EvaluationRequest,
@@ -1841,6 +2082,7 @@ def _wer_utterance_to_payload(
         "index": row.get("index", fallback_index),
         "audio_url": row.get("audio_url"),
         "duration_seconds": row.get("duration_seconds"),
+        "sqa_scores": row.get("sqa_scores", []),
         "summary": _wer_counts_to_payload(summary),
         "tokens": [
             {

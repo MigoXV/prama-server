@@ -14,9 +14,11 @@ from prama_server.evaluator.vad import evaluate_masks
 from prama_server.servicer.http import (
     EvaluationJob,
     EvaluationRequest,
+    SqaAssessor,
+    _build_sqa_summary,
     _build_cer_report,
     _build_wer_report,
-    _lid_predicted_language,
+    _build_lid_report,
     app,
     jobs,
     jobs_lock,
@@ -44,6 +46,14 @@ class HttpRecalculateTest(unittest.TestCase):
                 "reference": "hello world",
                 "hypothesis": "hello world",
                 "duration_seconds": 12.5,
+                "sqa_scores": [
+                    {
+                        "engine_name": "MOS",
+                        "target": "127.0.0.1:50111",
+                        "score": 4.0,
+                        "error": None,
+                    }
+                ],
             },
             {
                 "id": "bad",
@@ -51,6 +61,14 @@ class HttpRecalculateTest(unittest.TestCase):
                 "reference": "hello world",
                 "hypothesis": "bad world",
                 "duration_seconds": 7.5,
+                "sqa_scores": [
+                    {
+                        "engine_name": "MOS",
+                        "target": "127.0.0.1:50111",
+                        "score": 1.0,
+                        "error": None,
+                    }
+                ],
             },
         ]
         job.result = {"processing_elapsed_seconds": 5.0}
@@ -78,6 +96,11 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in payload["cer_report"]["utterances"]],
             ["ok"],
+        )
+        self.assertEqual(payload["sqa_summary"][0]["mean_score"], 4.0)
+        self.assertEqual(
+            payload["wer_report"]["utterances"][0]["sqa_scores"][0]["score"],
+            4.0,
         )
 
     def test_recalculate_vad_metrics_excludes_selected_sample(self) -> None:
@@ -238,23 +261,181 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertEqual(payload["accuracy"], 2 / 3)
         self.assertEqual(payload["recall"], 0.75)
 
-    def test_lid_confidence_threshold_maps_low_score_to_other(self) -> None:
-        self.assertEqual(
-            _lid_predicted_language(
-                raw_language="en",
-                confidence=0.79,
-                threshold=0.8,
-            ),
-            "other",
+    def test_lid_metrics_use_strict_language_labels(self) -> None:
+        report = _build_lid_report(
+            [
+                {
+                    "id": "strict-mismatch",
+                    "reference_language": "cn",
+                    "predicted_language": "zh",
+                    "confidence": 0.99,
+                    "correct": False,
+                },
+                {
+                    "id": "strict-match",
+                    "reference_language": "en",
+                    "predicted_language": "en",
+                    "confidence": 0.1,
+                    "correct": True,
+                },
+            ]
         )
+
+        self.assertEqual(report["accuracy"], 0.5)
+        self.assertEqual(report["recall"], 0.5)
+        self.assertFalse(report["lid_report"]["samples"][0]["correct"])
         self.assertEqual(
-            _lid_predicted_language(
-                raw_language="cn",
-                confidence=0.8,
-                threshold=0.8,
-            ),
+            report["lid_report"]["samples"][0]["predicted_language"],
             "zh",
         )
+
+    def test_sqa_request_requires_target_when_enabled(self) -> None:
+        with self.assertRaises(ValueError):
+            EvaluationRequest(task="asr", enable_mos=True, mos_target="")
+
+        with self.assertRaises(ValueError):
+            EvaluationRequest(
+                task="asr",
+                enable_snr=True,
+                snr_target="",
+            )
+
+        request = EvaluationRequest(task="asr", enable_mos=False, enable_snr=False)
+        self.assertEqual(request.mos_target, "")
+        self.assertEqual(request.snr_target, "")
+
+    def test_sqa_summary_averages_successes_and_counts_failures(self) -> None:
+        summary = _build_sqa_summary(
+            [
+                {
+                    "id": "ok",
+                    "sqa_scores": [
+                        {
+                            "engine_name": "MOS",
+                            "target": "127.0.0.1:50111",
+                            "score": 4.0,
+                            "error": None,
+                        },
+                        {
+                            "engine_name": "SNR",
+                            "target": "127.0.0.1:50112",
+                            "score": None,
+                            "error": "unavailable",
+                        },
+                    ],
+                },
+                {
+                    "id": "bad",
+                    "sqa_scores": [
+                        {
+                            "engine_name": "MOS",
+                            "target": "127.0.0.1:50111",
+                            "score": 2.0,
+                            "error": None,
+                        }
+                    ],
+                },
+            ]
+        )
+
+        self.assertEqual(summary[0]["engine_name"], "MOS")
+        self.assertEqual(summary[0]["mean_score"], 3.0)
+        self.assertEqual(summary[0]["scored_count"], 2)
+        self.assertEqual(summary[0]["failed_count"], 0)
+        self.assertEqual(summary[1]["engine_name"], "SNR")
+        self.assertIsNone(summary[1]["mean_score"])
+        self.assertEqual(summary[1]["scored_count"], 0)
+        self.assertEqual(summary[1]["failed_count"], 1)
+
+    def test_sqa_assessor_records_success_and_failure_per_sample(self) -> None:
+        class FakeSqaResult:
+            def __init__(self, score: float) -> None:
+                self.score = score
+
+        class FakeSqaInferencer:
+            def __init__(self, target: str, **_: object) -> None:
+                self.target = target
+
+            def infer(self, audio: np.ndarray) -> FakeSqaResult:
+                if self.target == "bad:50111":
+                    raise RuntimeError("sqa failed")
+                return FakeSqaResult(score=float(len(audio)))
+
+            def close(self) -> None:
+                return None
+
+        request = EvaluationRequest(
+            task="asr",
+            enable_mos=True,
+            mos_target="ok:50111",
+            enable_snr=True,
+            snr_target="bad:50111",
+            sqa_inference_concurrency=2,
+        )
+        with (
+            patch("prama_server.servicer.http.SqaGrpcInferencer", FakeSqaInferencer),
+            patch("prama_server.servicer.http.logger.exception"),
+        ):
+            assessor = SqaAssessor(request)
+            scores = assessor.assess(np.zeros(160, dtype=np.float32))
+            assessor.close()
+
+        self.assertEqual(scores[0]["engine_name"], "MOS")
+        self.assertEqual(scores[0]["score"], 160.0)
+        self.assertIsNone(scores[0]["error"])
+        self.assertEqual(scores[1]["engine_name"], "SNR")
+        self.assertIsNone(scores[1]["score"])
+        self.assertIn("sqa failed", scores[1]["error"])
+
+    def test_engine_connectivity_endpoint_reports_success_and_failure(self) -> None:
+        class FakeChannel:
+            def close(self) -> None:
+                return None
+
+        class FakeFuture:
+            def __init__(self, should_fail: bool = False) -> None:
+                self.should_fail = should_fail
+
+            def result(self, timeout: float) -> None:
+                if self.should_fail:
+                    raise TimeoutError(f"timeout={timeout}")
+
+        def fake_ready_future(channel: FakeChannel) -> FakeFuture:
+            return FakeFuture(should_fail=getattr(channel, "should_fail", False))
+
+        def fake_channel(target: str) -> FakeChannel:
+            channel = FakeChannel()
+            channel.should_fail = target == "bad:50111"  # type: ignore[attr-defined]
+            return channel
+
+        with (
+            patch("prama_server.servicer.http.grpc.insecure_channel", fake_channel),
+            patch("prama_server.servicer.http.grpc.channel_ready_future", fake_ready_future),
+        ):
+            ok_response = client.post(
+                "/api/engines/connectivity",
+                json={"target": "ok:50111", "timeout_seconds": 1},
+            )
+            bad_response = client.post(
+                "/api/engines/connectivity",
+                json={"target": "bad:50111", "timeout_seconds": 1},
+            )
+
+        self.assertEqual(ok_response.status_code, 200)
+        self.assertTrue(ok_response.json()["ok"])
+        self.assertEqual(bad_response.status_code, 200)
+        self.assertFalse(bad_response.json()["ok"])
+
+    def test_help_endpoint_returns_markdown_with_code_blocks(self) -> None:
+        response = client.get("/api/help")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["title"], "数据集格式说明")
+        self.assertIn("```jsonl", payload["markdown"])
+        self.assertIn("ASR 数据集", payload["markdown"])
+        self.assertIn("VAD 数据集", payload["markdown"])
+        self.assertIn("LID 数据集", payload["markdown"])
 
     def test_recalculate_with_all_samples_excluded_returns_empty_report(self) -> None:
         job = EvaluationJob(
