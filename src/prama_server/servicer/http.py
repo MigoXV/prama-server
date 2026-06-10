@@ -35,6 +35,7 @@ from prama_server.evaluator import (
 )
 from prama_server.evaluator.vad import VadEvaluator
 from prama_server.inferencers.asr import AsrGrpcInferencer
+from prama_server.inferencers.denoise import DenoiseGrpcInferencer
 from prama_server.inferencers.lid import LidGrpcInferencer
 from prama_server.inferencers.sqa import SqaGrpcInferencer
 from prama_server.inferencers.vad import VadGrpcInferencer
@@ -44,7 +45,7 @@ from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, Messa
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "completed", "failed"]
-EvaluationTask = Literal["asr", "vad", "lid"]
+EvaluationTask = Literal["asr", "vad", "lid", "denoise"]
 
 
 class EvaluationRequest(BaseModel):
@@ -99,6 +100,8 @@ class EvaluationRequest(BaseModel):
     def validate_sqa_config(self) -> EvaluationRequest:
         self.mos_target = self.mos_target.strip()
         self.snr_target = self.snr_target.strip()
+        if self.task == "denoise" and not self.enable_mos and not self.enable_snr:
+            raise ValueError("SE 评估必须至少启用 MOS 或 SNR")
         if self.enable_mos and not self.mos_target:
             raise ValueError("启用 MOS 时 MOS 引擎地址不能为空")
         if self.enable_snr and not self.snr_target:
@@ -268,6 +271,7 @@ class EvaluationJob:
     error: str | None = None
     sample_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     asr_inference_rows: list[dict[str, Any]] = field(default_factory=list)
+    denoise_report_samples: list[dict[str, Any]] = field(default_factory=list)
     lid_report_samples: list[dict[str, Any]] = field(default_factory=list)
     vad_metric_rows: list[dict[str, Any]] = field(default_factory=list)
     vad_report_samples: list[dict[str, Any]] = field(default_factory=list)
@@ -469,6 +473,25 @@ def get_sample_audio(job_id: str, sample_id: str) -> FileResponse:
     )
 
 
+@app.get("/api/evaluations/{job_id}/samples/{sample_id}/denoised-audio")
+def get_sample_denoised_audio(job_id: str, sample_id: str) -> FileResponse:
+    job = _get_job(job_id)
+    with job.lock:
+        record = job.sample_records.get(sample_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"样本不存在: {sample_id}")
+
+    audio_path = Path(str(record.get("denoised_audio_path") or ""))
+    if not audio_path.exists() or not audio_path.is_file():
+        raise HTTPException(status_code=404, detail=f"SE 音频不存在: {sample_id}")
+
+    return FileResponse(
+        audio_path,
+        media_type=_audio_media_type(audio_path),
+        filename=audio_path.name,
+    )
+
+
 @app.post("/api/evaluations/{job_id}/metrics/recalculate")
 def recalculate_evaluation_metrics(
     job_id: str,
@@ -490,6 +513,8 @@ def recalculate_evaluation_metrics(
             result = _recalculate_vad_result(job, excluded_sample_ids)
         elif job.request.task == "lid":
             result = _recalculate_lid_result(job, excluded_sample_ids)
+        elif job.request.task == "denoise":
+            result = _recalculate_denoise_result(job, excluded_sample_ids)
         else:
             result = _recalculate_asr_result(job, excluded_sample_ids)
         job.result = result
@@ -665,6 +690,9 @@ def _run_evaluation(job: EvaluationJob) -> None:
             return
         if request.task == "lid":
             _run_lid_evaluation(job)
+            return
+        if request.task == "denoise":
+            _run_denoise_evaluation(job)
             return
 
         sqa_assessor = SqaAssessor(request)
@@ -993,6 +1021,7 @@ def _write_job_audio_file(
     sample_id: str,
     audio_array: np.ndarray,
     sample_rate: int,
+    name_suffix: str = "",
 ) -> Path:
     with job.lock:
         if job.temp_dir is None:
@@ -1002,13 +1031,21 @@ def _write_job_audio_file(
         char if char.isalnum() or char in ("-", "_", ".") else "_"
         for char in sample_id
     )
-    audio_path = temp_dir / f"{safe_name or 'sample'}.wav"
+    suffix = f"-{name_suffix}" if name_suffix else ""
+    audio_path = temp_dir / f"{safe_name or 'sample'}{suffix}.wav"
     sf.write(audio_path, audio_array, sample_rate)
     return audio_path
 
 
 def _sample_audio_url(job_id: str, sample_id: str) -> str:
     return f"/api/evaluations/{job_id}/samples/{quote(sample_id, safe='')}/audio"
+
+
+def _sample_denoised_audio_url(job_id: str, sample_id: str) -> str:
+    return (
+        f"/api/evaluations/{job_id}/samples/"
+        f"{quote(sample_id, safe='')}/denoised-audio"
+    )
 
 
 def _audio_media_type(audio_path: Path) -> str:
@@ -1295,6 +1332,177 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
         inferencer.close()
 
 
+def _run_denoise_evaluation(job: EvaluationJob) -> None:
+    request = job.request
+    sqa_assessor = SqaAssessor(request)
+    inferencer = DenoiseGrpcInferencer(
+        target=request.target,
+        sample_rate=request.sample_rate,
+        request_timeout_seconds=request.request_timeout_seconds,
+        connect_timeout_seconds=request.connect_timeout_seconds,
+    )
+    dataset = _load_denoise_dataset(
+        Path(request.dataset_path),
+        split=request.split,
+        limit=request.limit,
+        sample_rate=request.sample_rate,
+    )
+    total = len(dataset)
+    report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
+
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        audio_array = _prepare_vad_audio(sample["audio"], sample_rate=request.sample_rate)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=request.sample_rate,
+        )
+        original_scores = sqa_assessor.assess(audio_array)
+        denoised_scores: list[dict[str, Any]] = []
+        denoised_audio_url = None
+        error = None
+
+        try:
+            denoised_audio = inferencer.infer(audio_array)
+            denoised_audio = _prepare_audio_for_export(denoised_audio)
+            denoised_audio_path = _write_job_audio_file(
+                job=job,
+                sample_id=sample_id,
+                audio_array=denoised_audio,
+                sample_rate=request.sample_rate,
+                name_suffix="denoised",
+            )
+            denoised_audio_url = _sample_denoised_audio_url(job.job_id, sample_id)
+            with job.lock:
+                sample_record["denoised_audio_path"] = str(denoised_audio_path)
+                sample_record["denoised_audio_url"] = denoised_audio_url
+            denoised_scores = sqa_assessor.assess(denoised_audio)
+        except Exception as exc:  # noqa: BLE001 - 单样本失败要进入报告
+            logger.exception("SE 样本处理失败: job_id=%s id=%s", job.job_id, sample_id)
+            error = str(exc)
+
+        sample_payload = _build_denoise_sample_payload(
+            sample_id=sample_id,
+            index=index,
+            audio_url=sample_record.get("audio_url"),
+            denoised_audio_url=denoised_audio_url,
+            duration_seconds=sample_record.get("duration_seconds"),
+            original_scores=original_scores,
+            denoised_scores=denoised_scores,
+            error=error,
+        )
+        return {
+            "report_sample": sample_payload,
+            "payload": {
+                "status": "running",
+                "tag": job.job_id,
+                "total": total,
+                "id": sample_id,
+                "current_id": sample_id,
+                "reference": "原始音频",
+                "hypothesis": "SE 完成" if error is None else "SE 失败",
+                "is_final": True,
+                "result": sample_payload,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+            },
+        }
+
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        inference_concurrency = _task_inference_concurrency(request, "denoise")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        with job.lock:
+            job.status = "completed"
+            job.denoise_report_samples = report_samples
+            job.result = {
+                **_build_denoise_report(report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
+                **_sample_count_payload(
+                    included_count=len(report_samples),
+                    excluded_sample_ids=set(),
+                    total_count=len(report_samples),
+                ),
+            }
+        logger.info("SE 评估任务完成: job_id=%s", job.job_id)
+    finally:
+        sqa_assessor.close()
+        inferencer.close()
+
+
+def _load_denoise_dataset(
+    dataset_path: Path,
+    *,
+    split: str,
+    limit: int | None,
+    sample_rate: int,
+) -> Dataset:
+    logger.info("加载 SE 数据集: path=%s split=%s", dataset_path, split)
+    if _is_audiofolder_dataset_dir(dataset_path):
+        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
+    elif dataset_path.exists() and dataset_path.is_dir():
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            if split not in loaded:
+                available_splits = ", ".join(loaded.keys())
+                raise ValueError(
+                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
+                )
+            dataset = loaded[split]
+        else:
+            dataset = loaded
+    else:
+        dataset = load_dataset(str(dataset_path), split=split)
+
+    if "audio" not in dataset.column_names:
+        raise ValueError("SE 数据集缺少必要字段: audio")
+
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+    if limit is not None:
+        dataset = dataset.select(range(min(limit, len(dataset))))
+    logger.info("SE 数据集已加载: size=%s", len(dataset))
+    return dataset
+
+
 def _load_lid_dataset(
     dataset_path: Path,
     *,
@@ -1543,6 +1751,61 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _build_denoise_sample_payload(
+    *,
+    sample_id: str,
+    index: int,
+    audio_url: str | None,
+    denoised_audio_url: str | None,
+    duration_seconds: Any,
+    original_scores: list[dict[str, Any]],
+    denoised_scores: list[dict[str, Any]],
+    error: str | None,
+) -> dict[str, Any]:
+    original_snr = _score_for_engine(original_scores, "SNR")
+    denoised_snr = _score_for_engine(denoised_scores, "SNR")
+    original_mos = _score_for_engine(original_scores, "MOS")
+    denoised_mos = _score_for_engine(denoised_scores, "MOS")
+    return {
+        "id": sample_id,
+        "index": index,
+        "audio_url": audio_url,
+        "denoised_audio_url": denoised_audio_url,
+        "duration_seconds": duration_seconds,
+        "original_sqa_scores": original_scores,
+        "denoised_sqa_scores": denoised_scores,
+        "original_snr": original_snr,
+        "denoised_snr": denoised_snr,
+        "snr_delta": _score_delta(original_snr, denoised_snr),
+        "original_mos": original_mos,
+        "denoised_mos": denoised_mos,
+        "mos_delta": _score_delta(original_mos, denoised_mos),
+        "error": error,
+    }
+
+
+def _build_denoise_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    snr_deltas = _finite_values(sample.get("snr_delta") for sample in samples)
+    mos_deltas = _finite_values(sample.get("mos_delta") for sample in samples)
+    original_snrs = _finite_values(sample.get("original_snr") for sample in samples)
+    denoised_snrs = _finite_values(sample.get("denoised_snr") for sample in samples)
+    original_moss = _finite_values(sample.get("original_mos") for sample in samples)
+    denoised_moss = _finite_values(sample.get("denoised_mos") for sample in samples)
+    return {
+        "mean_snr_delta": _mean_or_none(snr_deltas),
+        "mean_mos_delta": _mean_or_none(mos_deltas),
+        "mean_original_snr": _mean_or_none(original_snrs),
+        "mean_denoised_snr": _mean_or_none(denoised_snrs),
+        "mean_original_mos": _mean_or_none(original_moss),
+        "mean_denoised_mos": _mean_or_none(denoised_moss),
+        "sample_count": len(samples),
+        "scored_snr_sample_count": len(snr_deltas),
+        "scored_mos_sample_count": len(mos_deltas),
+        "failed_sample_count": sum(1 for sample in samples if sample.get("error")),
+        "denoise_report": {"samples": samples},
+    }
+
+
 def _recalculate_asr_result(
     job: EvaluationJob,
     excluded_sample_ids: set[str],
@@ -1663,6 +1926,29 @@ def _recalculate_lid_result(
     }
 
 
+def _recalculate_denoise_result(
+    job: EvaluationJob,
+    excluded_sample_ids: set[str],
+) -> dict[str, Any]:
+    samples = [
+        sample
+        for sample in job.denoise_report_samples
+        if str(sample["id"]) not in excluded_sample_ids
+    ]
+    return {
+        **_build_denoise_report(samples),
+        **_recalculated_performance_payload(
+            job=job,
+            audio_duration_seconds=_sum_sample_duration(samples),
+        ),
+        **_sample_count_payload(
+            included_count=len(samples),
+            excluded_sample_ids=excluded_sample_ids,
+            total_count=len(job.denoise_report_samples),
+        ),
+    }
+
+
 def _sample_count_payload(
     *,
     included_count: int,
@@ -1774,6 +2060,37 @@ def _build_sqa_summary(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return payload
 
 
+def _score_for_engine(scores: list[dict[str, Any]], engine_name: str) -> float | None:
+    for score_item in scores:
+        if not isinstance(score_item, dict):
+            continue
+        if str(score_item.get("engine_name") or "").upper() != engine_name:
+            continue
+        return _as_float(score_item.get("score"))
+    return None
+
+
+def _score_delta(
+    original_score: float | None,
+    denoised_score: float | None,
+) -> float | None:
+    if original_score is None or denoised_score is None:
+        return None
+    return denoised_score - original_score
+
+
+def _finite_values(values: Any) -> list[float]:
+    return [
+        value
+        for value in (_as_float(item) for item in values)
+        if value is not None
+    ]
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    return float(np.mean(values)) if values else None
+
+
 def _normalize_lid_language(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("_", "-")
     if normalized in {"en", "eng", "en-us", "en-gb", "english"}:
@@ -1811,6 +2128,8 @@ def _task_inference_concurrency(
         return request.vad_inference_concurrency or request.inference_concurrency
     if task == "lid":
         return request.lid_inference_concurrency or request.inference_concurrency
+    if task == "denoise":
+        return request.inference_concurrency
     return request.inference_concurrency
 
 

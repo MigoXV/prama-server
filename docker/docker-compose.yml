@@ -1,6 +1,6 @@
 services:
   backend:
-    image: registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-backend:0.6.0a1
+    image: registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-backend:0.7.0
     container_name: prama-server-backend
     environment:
       PRAMA_WORKDIR: ${PRAMA_WORKDIR:-/data-bin}
@@ -8,7 +8,7 @@ services:
       - ${PWD}/data-bin:/data-bin
 
   frontend:
-    image: registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-frontend:0.6.0a1
+    image: registry.cn-hangzhou.aliyuncs.com/migo-dl/prama-server-frontend:0.7.0
     container_name: prama-server-frontend
     environment:
       API_UPSTREAM: http://backend:8000

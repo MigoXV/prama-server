@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-0.6.0a1}"
+VERSION="${VERSION:-0.7.0}"
 REGISTRY="${REGISTRY:-registry.cn-hangzhou.aliyuncs.com/migo-dl}"
 FRONTEND_IMAGE="${FRONTEND_IMAGE:-${REGISTRY}/prama-server-frontend:${VERSION}}"
 BACKEND_IMAGE="${BACKEND_IMAGE:-${REGISTRY}/prama-server-backend:${VERSION}}"

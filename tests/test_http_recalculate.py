@@ -15,6 +15,7 @@ from prama_server.servicer.http import (
     EvaluationJob,
     EvaluationRequest,
     SqaAssessor,
+    _build_denoise_report,
     _build_sqa_summary,
     _build_cer_report,
     _build_wer_report,
@@ -206,6 +207,64 @@ class HttpRecalculateTest(unittest.TestCase):
             ["ok"],
         )
 
+    def test_recalculate_denoise_metrics_excludes_selected_sample(self) -> None:
+        job = EvaluationJob(
+            job_id="test-denoise-recalculate",
+            request=EvaluationRequest(
+                task="denoise",
+                enable_mos=True,
+                mos_target="mos:50111",
+            ),
+            status="completed",
+        )
+        job.sample_records = {
+            "ok": {"id": "ok", "index": 1},
+            "bad": {"id": "bad", "index": 2},
+        }
+        job.denoise_report_samples = [
+            {
+                "id": "ok",
+                "index": 1,
+                "duration_seconds": 3.0,
+                "original_snr": 10.0,
+                "denoised_snr": 12.0,
+                "snr_delta": 2.0,
+                "original_mos": 3.0,
+                "denoised_mos": 3.5,
+                "mos_delta": 0.5,
+            },
+            {
+                "id": "bad",
+                "index": 2,
+                "duration_seconds": 5.0,
+                "original_snr": 9.0,
+                "denoised_snr": 8.0,
+                "snr_delta": -1.0,
+                "original_mos": 2.0,
+                "denoised_mos": 1.5,
+                "mos_delta": -0.5,
+            },
+        ]
+        job.result = {"processing_elapsed_seconds": 2.0}
+        _put_job(job)
+
+        response = client.post(
+            f"/api/evaluations/{job.job_id}/metrics/recalculate",
+            json={"excluded_sample_ids": ["bad"]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["mean_snr_delta"], 2.0)
+        self.assertEqual(payload["mean_mos_delta"], 0.5)
+        self.assertEqual(payload["included_sample_count"], 1)
+        self.assertEqual(payload["excluded_sample_ids"], ["bad"])
+        self.assertEqual(payload["audio_duration_seconds"], 3.0)
+        self.assertEqual(
+            [item["id"] for item in payload["denoise_report"]["samples"]],
+            ["ok"],
+        )
+
     def test_recalculate_lid_metrics_uses_macro_recall_by_reference_language(self) -> None:
         job = EvaluationJob(
             job_id="test-lid-macro-recall",
@@ -303,6 +362,58 @@ class HttpRecalculateTest(unittest.TestCase):
         request = EvaluationRequest(task="asr", enable_mos=False, enable_snr=False)
         self.assertEqual(request.mos_target, "")
         self.assertEqual(request.snr_target, "")
+
+    def test_denoise_request_requires_mos_or_snr(self) -> None:
+        with self.assertRaises(ValueError):
+            EvaluationRequest(task="denoise", enable_mos=False, enable_snr=False)
+
+        mos_request = EvaluationRequest(
+            task="denoise",
+            enable_mos=True,
+            mos_target="mos:50111",
+        )
+        self.assertTrue(mos_request.enable_mos)
+
+        snr_request = EvaluationRequest(
+            task="denoise",
+            enable_snr=True,
+            snr_target="snr:50112",
+        )
+        self.assertTrue(snr_request.enable_snr)
+
+        with self.assertRaises(ValueError):
+            EvaluationRequest(task="denoise", enable_mos=True, mos_target="")
+
+    def test_denoise_report_averages_score_deltas(self) -> None:
+        report = _build_denoise_report(
+            [
+                {
+                    "id": "first",
+                    "original_snr": 10.0,
+                    "denoised_snr": 13.0,
+                    "snr_delta": 3.0,
+                    "original_mos": 3.0,
+                    "denoised_mos": 3.4,
+                    "mos_delta": 0.4,
+                },
+                {
+                    "id": "second",
+                    "original_snr": 7.0,
+                    "denoised_snr": 8.0,
+                    "snr_delta": 1.0,
+                    "original_mos": 2.0,
+                    "denoised_mos": 2.6,
+                    "mos_delta": 0.6,
+                },
+                {"id": "failed", "error": "denoise failed"},
+            ]
+        )
+
+        self.assertEqual(report["mean_snr_delta"], 2.0)
+        self.assertEqual(report["mean_mos_delta"], 0.5)
+        self.assertEqual(report["scored_snr_sample_count"], 2)
+        self.assertEqual(report["scored_mos_sample_count"], 2)
+        self.assertEqual(report["failed_sample_count"], 1)
 
     def test_sqa_summary_averages_successes_and_counts_failures(self) -> None:
         summary = _build_sqa_summary(
@@ -436,6 +547,7 @@ class HttpRecalculateTest(unittest.TestCase):
         self.assertIn("ASR 数据集", payload["markdown"])
         self.assertIn("VAD 数据集", payload["markdown"])
         self.assertIn("LID 数据集", payload["markdown"])
+        self.assertIn("SE 评估数据集", payload["markdown"])
 
     def test_recalculate_with_all_samples_excluded_returns_empty_report(self) -> None:
         job = EvaluationJob(

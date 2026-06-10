@@ -1,6 +1,6 @@
 # 数据集格式说明
 
-Prama 在线评估当前支持 ASR、VAD、LID 三类测试。每类任务都必须提供包含 `audio` 字段的数据集，音频会按评估表单里的采样率读取。
+Prama 在线评估当前支持 ASR、VAD、LID、SE 四类测试。每类任务都必须提供包含 `audio` 字段的数据集，音频会按评估表单里的采样率读取。
 
 ## 通用要求
 
@@ -20,7 +20,7 @@ dataset/
 
 ## ASR 数据集
 
-ASR 用于语音识别评估。每条样本必须包含：
+ASR 评估每条样本必须包含：
 
 - `audio`: 音频文件或可解码音频对象。
 - `text`: 参考转写文本。
@@ -35,7 +35,7 @@ ASR 用于语音识别评估。每条样本必须包含：
 
 ## VAD 数据集
 
-VAD 用于语音活动检测评估。每条样本必须包含：
+VAD 评估每条样本必须包含：
 
 - `audio`: 音频文件或可解码音频对象。
 - `seconds`: 参考语音段列表，单位为秒。
@@ -50,7 +50,7 @@ VAD 用于语音活动检测评估。每条样本必须包含：
 
 ## LID 数据集
 
-LID 用于语种识别评估。每条样本必须包含：
+LID 评估每条样本必须包含：
 
 - `audio`: 音频文件或可解码音频对象。
 - `language_id`: 真实语种标签。
@@ -73,5 +73,31 @@ MOS 和 SNR 是可选附加评估，不改变 ASR、VAD、LID 的数据集格式
   "mos_target": "192.168.0.213:50111",
   "enable_snr": true,
   "snr_target": "192.168.0.213:50112"
+}
+```
+
+## SE 评估数据集
+
+SE 评估用于比较原始音频和 SE 后音频的 SNR、MOS 分数变化。每条样本必须包含：
+
+- `audio`: 音频文件或可解码音频对象。
+- `id` 或 `utt_id`: 可选样本 ID。
+
+`audiofolder` 的 `metadata.jsonl` 只需要 `file_name` 和 `id`：
+
+```jsonl
+{"file_name":"denoise_001.wav","id":"denoise_001"}
+{"file_name":"denoise_002.wav","id":"denoise_002"}
+```
+
+SE 评估必须至少启用 MOS 或 SNR 中的一个质量评估引擎；允许只配置其中一个。`target` 填写 SE 引擎地址，例如：
+
+```json
+{
+  "task": "denoise",
+  "target": "192.168.0.222:50027",
+  "dataset_path": "data-bin/audiofolder/denoise-demo",
+  "enable_mos": true,
+  "mos_target": "192.168.0.213:50111"
 }
 ```

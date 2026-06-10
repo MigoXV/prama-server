@@ -1,7 +1,7 @@
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 
 export type ThemeMode = "system" | "light" | "dark";
-export type EvaluationTask = "asr" | "vad" | "lid";
+export type EvaluationTask = "asr" | "vad" | "lid" | "denoise";
 
 export interface HelpDocument {
   title: string;
@@ -114,8 +114,31 @@ export interface EvaluationResult {
   cer_report?: WerReport;
   vad_report?: VadReport;
   lid_report?: LidReport;
+  denoise_report?: DenoiseReport;
   sqa_summary?: SqaSummary[];
   [key: string]: unknown;
+}
+
+export interface DenoiseReport {
+  samples: DenoiseReportSample[];
+}
+
+export interface DenoiseReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  denoised_audio_url?: string | null;
+  duration_seconds?: number;
+  original_sqa_scores?: SqaScore[];
+  denoised_sqa_scores?: SqaScore[];
+  original_snr?: number | null;
+  denoised_snr?: number | null;
+  snr_delta?: number | null;
+  original_mos?: number | null;
+  denoised_mos?: number | null;
+  mos_delta?: number | null;
+  error?: string | null;
+  excluded?: boolean;
 }
 
 export interface LidReport {

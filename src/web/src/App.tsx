@@ -51,6 +51,7 @@ import type {
   EvaluationResult,
   EvaluationSnapshot,
   EvaluationTask,
+  DenoiseReportSample,
   HelpDocument,
   JobStatus,
   LidReportSample,
@@ -121,6 +122,11 @@ const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
     dataset_path: "data-bin/audiofolder/lid-demo",
     min_reference_words: "0",
   },
+  denoise: {
+    target: "192.168.0.222:50027",
+    dataset_path: "data-bin/audiofolder/denoise-demo",
+    min_reference_words: "0",
+  },
 };
 
 type TaskRememberedFields = Pick<EvaluationFormState, "target" | "dataset_path">;
@@ -137,6 +143,10 @@ const TASK_REMEMBERED_DEFAULTS: Record<EvaluationTask, TaskRememberedFields> = {
   lid: {
     target: "192.168.0.222:50026",
     dataset_path: "data-bin/audiofolder/lid-demo",
+  },
+  denoise: {
+    target: "192.168.0.222:50027",
+    dataset_path: "data-bin/audiofolder/denoise-demo",
   },
 };
 
@@ -321,10 +331,12 @@ export default function App() {
   const werReport = finalResult?.wer_report;
   const cerReport = finalResult?.cer_report;
   const lidReport = finalResult?.lid_report;
+  const denoiseReport = finalResult?.denoise_report;
   const canExport = finalResult !== null;
   const displayTask = jobId || progress || finalResult ? runTask : formState.task;
   const isVad = displayTask === "vad";
   const isLid = displayTask === "lid";
+  const isDenoise = displayTask === "denoise";
   const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
 
   function resetRunState() {
@@ -644,6 +656,16 @@ export default function App() {
                     >
                       LID
                     </button>
+                    <button
+                      type="button"
+                      className={formState.task === "denoise" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("denoise");
+                      }}
+                    >
+                      SE
+                    </button>
                   </div>
                 ) : null}
               </div>
@@ -702,14 +724,22 @@ export default function App() {
             <TabButton
               active={activeTab === "report"}
               label={
-                isVad ? "VAD 指标" : isLid ? "LID 报告" : "对齐报告"
+                isVad
+                  ? "VAD 指标"
+                  : isLid
+                    ? "LID 报告"
+                    : isDenoise
+                      ? "SE 报告"
+                      : "对齐报告"
               }
               meta={
                 isVad
                   ? `${formatNumber(finalResult?.sample_count)} 个样本`
                   : isLid
                     ? `${lidReport?.samples.length ?? 0} 个样本`
-                    : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
+                    : isDenoise
+                      ? `${denoiseReport?.samples.length ?? 0} 个样本`
+                      : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
               }
               onClick={() => setActiveTab("report")}
             />
@@ -820,7 +850,7 @@ export default function App() {
               <div className="panel-heading">
                 <div>
                   <h2>设置</h2>
-                  <span>ASR、VAD 与 LID 的高级评估参数</span>
+                  <span>ASR、VAD、LID 与 SE 的高级评估参数</span>
                 </div>
                 <button type="button" className="ghost-button" onClick={resetForm}>
                   重置
@@ -1169,11 +1199,12 @@ export default function App() {
                 </div>
                 {isVad ? <VadOverviewMetrics result={finalResult} /> : null}
                 {isLid ? <LidOverviewMetrics result={finalResult} /> : null}
-                {!isVad && !isLid ? (
+                {isDenoise ? <DenoiseOverviewMetrics result={finalResult} /> : null}
+                {!isVad && !isLid && !isDenoise ? (
                   <AsrOverviewMetrics result={finalResult} />
                 ) : null}
 
-                {!isVad ? (
+                {!isVad && !isDenoise ? (
                   <div className="panel sample-panel">
                     <div className="panel-heading compact-heading">
                       <div>
@@ -1208,6 +1239,15 @@ export default function App() {
                 />
               ) : isLid ? (
                 <LidReportPanel
+                  result={finalResult}
+                  excludedSampleIds={excludedSampleIds}
+                  onExcludedChange={toggleExcludedSample}
+                  canRecalculate={canRecalculate}
+                  recalculating={recalculating}
+                  onRecalculate={() => void handleRecalculateMetrics()}
+                />
+              ) : isDenoise ? (
+                <DenoiseReportPanel
                   result={finalResult}
                   excludedSampleIds={excludedSampleIds}
                   onExcludedChange={toggleExcludedSample}
@@ -1670,6 +1710,28 @@ function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   );
 }
 
+function DenoiseOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="panel denoise-overview-panel">
+      <div className="metric-strip denoise-overview-metrics">
+        <Metric label="SNR Δ" value={formatSignedScore(result.mean_snr_delta)} />
+        <Metric label="MOS Δ" value={formatSignedScore(result.mean_mos_delta)} />
+        <Metric label="SNR Samples" value={formatNumber(result.scored_snr_sample_count)} />
+        <Metric label="MOS Samples" value={formatNumber(result.scored_mos_sample_count)} />
+        <Metric label="Failed" value={formatNumber(result.failed_sample_count)} />
+      </div>
+      <SampleCountStrip
+        result={result}
+        fallbackCount={result.denoise_report?.samples.length ?? 0}
+      />
+    </div>
+  );
+}
+
 function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   const frame = metrics.frame;
   const segment = metrics.segment;
@@ -2014,6 +2076,170 @@ function LidReportPanel({
   );
 }
 
+function DenoiseReportPanel({
+  result,
+  excludedSampleIds,
+  onExcludedChange,
+  canRecalculate,
+  recalculating,
+  onRecalculate,
+}: {
+  result: EvaluationResult | null;
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+  canRecalculate: boolean;
+  recalculating: boolean;
+  onRecalculate: () => void;
+}) {
+  const samples = result?.denoise_report?.samples ?? [];
+  return (
+    <div className="panel report-panel">
+      <div className="panel-heading compact-heading">
+        <div>
+          <h2>SE 报告</h2>
+          <span>{formatNumber(result?.sample_count)} 个样本</span>
+        </div>
+        <div className="report-controls">
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={!canRecalculate}
+            onClick={onRecalculate}
+          >
+            {recalculating ? "重算中..." : "重新计算评估指标"}
+          </button>
+        </div>
+      </div>
+      {result ? (
+        <>
+          <div className="report-summary denoise-summary">
+            <Metric label="SNR Δ" value={formatSignedScore(result.mean_snr_delta)} />
+            <Metric label="MOS Δ" value={formatSignedScore(result.mean_mos_delta)} />
+            <Metric label="SNR Before" value={formatSqaScore(result.mean_original_snr)} />
+            <Metric label="SNR After" value={formatSqaScore(result.mean_denoised_snr)} />
+            <Metric label="MOS Before" value={formatSqaScore(result.mean_original_mos)} />
+            <Metric label="MOS After" value={formatSqaScore(result.mean_denoised_mos)} />
+          </div>
+          <SampleCountStrip result={result} fallbackCount={samples.length} />
+          <PerformanceMetrics result={result} />
+          <DenoiseSampleList
+            samples={samples}
+            excludedSampleIds={excludedSampleIds}
+            onExcludedChange={onExcludedChange}
+          />
+        </>
+      ) : (
+        <div className="empty-state">评估完成后生成 SE 报告</div>
+      )}
+    </div>
+  );
+}
+
+function DenoiseSampleList({
+  samples,
+  excludedSampleIds,
+  onExcludedChange,
+}: {
+  samples: DenoiseReportSample[];
+  excludedSampleIds: Set<string>;
+  onExcludedChange: (sampleId: string, excluded: boolean) => void;
+}) {
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成 SE 结果</div>;
+  }
+
+  return (
+    <div className="denoise-sample-list">
+      {samples.map((sample) => (
+        <section
+          className={`denoise-sample ${sample.error ? "failed" : ""}`}
+          key={sample.id}
+        >
+          <div className="denoise-sample-title">
+            <span className="denoise-sample-name">
+              <ExcludeCheckbox
+                checked={excludedSampleIds.has(sample.id)}
+                onChange={(checked) => onExcludedChange(sample.id, checked)}
+              />
+              <strong>#{sample.index ?? "-"}</strong>
+              <span title={sample.id}>{sample.id}</span>
+            </span>
+            {sample.error ? (
+              <span className="denoise-error" title={sample.error}>
+                {sample.error}
+              </span>
+            ) : null}
+          </div>
+          <div className="denoise-audio-grid">
+            <div>
+              <span>原始</span>
+              <AudioPlayer
+                src={sample.audio_url}
+                durationSeconds={sample.duration_seconds}
+              />
+            </div>
+            <div>
+              <span>SE</span>
+              <AudioPlayer
+                src={sample.denoised_audio_url || undefined}
+                durationSeconds={sample.duration_seconds}
+              />
+            </div>
+          </div>
+          <DenoiseSampleMetrics sample={sample} />
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function DenoiseSampleMetrics({ sample }: { sample: DenoiseReportSample }) {
+  const rows = [
+    {
+      label: "SNR",
+      before: sample.original_snr,
+      after: sample.denoised_snr,
+      delta: sample.snr_delta,
+    },
+    {
+      label: "MOS",
+      before: sample.original_mos,
+      after: sample.denoised_mos,
+      delta: sample.mos_delta,
+    },
+  ].filter(
+    (row) =>
+      hasFiniteNumber(row.before) ||
+      hasFiniteNumber(row.after) ||
+      hasFiniteNumber(row.delta),
+  );
+
+  if (!rows.length) {
+    return <div className="denoise-metric-empty">暂无质量指标</div>;
+  }
+
+  return (
+    <div className="denoise-metric-table" role="table" aria-label="SE 质量指标">
+      <div className="denoise-metric-row denoise-metric-header" role="row">
+        <span role="columnheader">指标</span>
+        <span role="columnheader">Before</span>
+        <span role="columnheader">After</span>
+        <span role="columnheader">Δ</span>
+      </div>
+      {rows.map((row) => (
+        <div className="denoise-metric-row" role="row" key={row.label}>
+          <strong role="rowheader">{row.label}</strong>
+          <span role="cell">{formatSqaScore(row.before)}</span>
+          <span role="cell">{formatSqaScore(row.after)}</span>
+          <span className="delta" role="cell">
+            {formatSignedScore(row.delta)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function LidSampleList({
   samples,
   excludedSampleIds,
@@ -2024,7 +2250,7 @@ function LidSampleList({
   onExcludedChange: (sampleId: string, excluded: boolean) => void;
 }) {
   if (!samples.length) {
-    return <div className="empty-state">评估完成后生成语种识别结果</div>;
+    return <div className="empty-state">评估完成后生成 LID 结果</div>;
   }
 
   return (
@@ -2558,21 +2784,30 @@ function evaluationTaskShortLabel(task: EvaluationTask): string {
   if (task === "lid") {
     return "LID";
   }
+  if (task === "denoise") {
+    return "SE";
+  }
   return "ASR";
 }
 
 function evaluationTaskEnglishLabel(task: EvaluationTask): string {
+  if (task === "denoise") {
+    return "SE Evaluation";
+  }
   return `${evaluationTaskShortLabel(task)} Evaluation`;
 }
 
 function evaluationTaskTitle(task: EvaluationTask): string {
   if (task === "vad") {
-    return "语音活动检测评估";
+    return "VAD 评估";
   }
   if (task === "lid") {
-    return "语种识别评估";
+    return "LID 评估";
   }
-  return "语音识别评估";
+  if (task === "denoise") {
+    return "SE 评估";
+  }
+  return "ASR 评估";
 }
 
 function pickTaskRememberedFields(
@@ -2640,6 +2875,17 @@ function formatSqaScore(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value)
     ? value.toFixed(2)
     : "-";
+}
+
+function hasFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function formatSignedScore(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "-";
+  }
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
 }
 
 function parseMarkdown(markdown: string): MarkdownBlock[] {
