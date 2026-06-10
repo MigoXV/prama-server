@@ -6,7 +6,6 @@ import {
   CircleDashed,
   Clipboard,
   Download,
-  EyeOff,
   Upload,
   Moon,
   Pause,
@@ -17,7 +16,9 @@ import {
   TriangleAlert,
   Monitor,
 } from "lucide-react";
-import type { ChangeEvent, FormEvent, MouseEvent } from "react";
+import katex from "katex";
+import "katex/dist/katex.min.css";
+import type { ChangeEvent, FormEvent, MouseEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
@@ -39,7 +40,6 @@ import {
   getHelpDocument,
   getEvaluation,
   listServerDirectory,
-  recalculateEvaluationMetrics,
   subscribeEvaluationEvents,
   testEngineConnectivity,
   uploadDatasetFiles,
@@ -54,6 +54,7 @@ import type {
   DenoiseReportSample,
   HelpDocument,
   JobStatus,
+  KeywordReportSample,
   LidReportSample,
   SqaScore,
   SqaSummary,
@@ -122,6 +123,11 @@ const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
     dataset_path: "data-bin/audiofolder/lid-demo",
     min_reference_words: "0",
   },
+  keyword: {
+    target: "192.168.0.222:50011",
+    dataset_path: "data-bin/audiofolder/keyword-demo",
+    min_reference_words: "0",
+  },
   denoise: {
     target: "192.168.0.222:50027",
     dataset_path: "data-bin/audiofolder/denoise-demo",
@@ -143,6 +149,10 @@ const TASK_REMEMBERED_DEFAULTS: Record<EvaluationTask, TaskRememberedFields> = {
   lid: {
     target: "192.168.0.222:50026",
     dataset_path: "data-bin/audiofolder/lid-demo",
+  },
+  keyword: {
+    target: "192.168.0.222:50011",
+    dataset_path: "data-bin/audiofolder/keyword-demo",
   },
   denoise: {
     target: "192.168.0.222:50027",
@@ -184,11 +194,57 @@ type ConnectivityStatus = {
   state: ConnectivityState;
   message: string;
 };
+type EvaluationRunState = {
+  status: JobStatus | "idle" | "started";
+  jobId: string;
+  progress: EvaluationProgress | null;
+  finalResult: EvaluationResult | null;
+  errorMessage: string;
+  connectionWarning: string;
+  busy: boolean;
+};
+type TaskEventClosers = Record<EvaluationTask, (() => void) | null>;
 type MarkdownBlock =
-  | { type: "heading"; level: 1 | 2 | 3; text: string }
+  | { type: "heading"; level: 1 | 2 | 3; text: string; id: string }
   | { type: "paragraph"; text: string }
   | { type: "list"; items: string[] }
-  | { type: "code"; language: string; text: string };
+  | { type: "code"; language: string; text: string }
+  | { type: "formula"; text: string }
+  | { type: "table"; headers: string[]; rows: string[][] };
+
+const EMPTY_RUN_STATE: EvaluationRunState = {
+  status: "idle",
+  jobId: "",
+  progress: null,
+  finalResult: null,
+  errorMessage: "",
+  connectionWarning: "",
+  busy: false,
+};
+
+function createRunState(): EvaluationRunState {
+  return { ...EMPTY_RUN_STATE };
+}
+
+function createTaskRunStates(): Record<EvaluationTask, EvaluationRunState> {
+  return {
+    asr: createRunState(),
+    vad: createRunState(),
+    lid: createRunState(),
+    keyword: createRunState(),
+    denoise: createRunState(),
+  };
+}
+
+function createTaskEventClosers(): TaskEventClosers {
+  return {
+    asr: null,
+    vad: null,
+    lid: null,
+    keyword: null,
+    denoise: null,
+  };
+}
 
 export default function App() {
   const { themeMode, effectiveTheme, setThemeMode } = useThemeMode();
@@ -200,26 +256,17 @@ export default function App() {
   const [taskRememberedFields, setTaskRememberedFields] = usePersistentState<
     Record<EvaluationTask, TaskRememberedFields>
   >("prama.taskRememberedFields", TASK_REMEMBERED_DEFAULTS);
-  const [status, setStatus] = useState<JobStatus | "idle" | "started">("idle");
-  const [jobId, setJobId] = useState("");
+  const [runStates, setRunStates] = useState<Record<EvaluationTask, EvaluationRunState>>(
+    () => createTaskRunStates(),
+  );
   const [rememberedJobId, setRememberedJobId] = usePersistentState<string>(
     LAST_EVALUATION_JOB_KEY,
     "",
   );
-  const [runTask, setRunTask] = useState<EvaluationTask>(formState.task);
-  const [progress, setProgress] = useState<EvaluationProgress | null>(null);
-  const [finalResult, setFinalResult] = useState<EvaluationResult | null>(null);
-  const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [errorMessage, setErrorMessage] = useState("");
-  const [connectionWarning, setConnectionWarning] = useState("");
   const [connectivityStatus, setConnectivityStatus] = useState<
     Record<string, ConnectivityStatus>
   >({});
-  const [busy, setBusy] = useState(false);
   const [datasetUploading, setDatasetUploading] = useState(false);
-  const [recalculating, setRecalculating] = useState(false);
   const [activeModule, setActiveModule] = useState<ConsoleModule>("evaluation");
   const [activeTab, setActiveTab] = useState<"overview" | "report">("overview");
   const [activeAlignmentMetric, setActiveAlignmentMetric] =
@@ -233,19 +280,50 @@ export default function App() {
   const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
     formState.dataset_path,
   );
-  const closeEventsRef = useRef<(() => void) | null>(null);
+  const eventClosersRef = useRef<TaskEventClosers>(createTaskEventClosers());
   const datasetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
+  const activeRunState = runStates[formState.task] ?? EMPTY_RUN_STATE;
+  const status = activeRunState.status;
+  const jobId = activeRunState.jobId;
+  const progress = activeRunState.progress;
+  const finalResult = activeRunState.finalResult;
+  const errorMessage = activeRunState.errorMessage;
+  const connectionWarning = activeRunState.connectionWarning;
+  const busy = activeRunState.busy;
+
+  function updateTaskRunState(
+    task: EvaluationTask,
+    update:
+      | Partial<EvaluationRunState>
+      | ((current: EvaluationRunState) => EvaluationRunState),
+  ) {
+    setRunStates((current) => {
+      const currentTaskState = current[task] ?? createRunState();
+      const nextTaskState =
+        typeof update === "function"
+          ? update(currentTaskState)
+          : { ...currentTaskState, ...update };
+      return {
+        ...current,
+        [task]: nextTaskState,
+      };
+    });
+  }
 
   useEffect(() => {
-    return () => closeEventsRef.current?.();
+    return () => {
+      Object.values(eventClosersRef.current).forEach((closeEvents) => {
+        closeEvents?.();
+      });
+    };
   }, []);
 
   useEffect(() => {
     if (
       activeModule !== "evaluation" ||
       jobId ||
-      busy ||
+      activeRunState.busy ||
       !rememberedJobId
     ) {
       return;
@@ -259,8 +337,7 @@ export default function App() {
         }
         applyEvaluationSnapshot(snapshot);
         if (snapshot.status === "queued" || snapshot.status === "running") {
-          setBusy(true);
-          subscribeToEvaluation(snapshot.job_id);
+          subscribeToEvaluation(snapshot.job_id, snapshot.request.task);
         }
       })
       .catch((error) => {
@@ -273,13 +350,15 @@ export default function App() {
           setRememberedJobId("");
           return;
         }
-        setConnectionWarning(message);
+        updateTaskRunState(formState.task, {
+          connectionWarning: message,
+        });
       });
 
     return () => {
       canceled = true;
     };
-  }, [activeModule, rememberedJobId, jobId, busy]);
+  }, [activeModule, rememberedJobId, jobId, activeRunState.busy, formState.task]);
 
   useEffect(() => {
     datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
@@ -332,35 +411,18 @@ export default function App() {
   const cerReport = finalResult?.cer_report;
   const lidReport = finalResult?.lid_report;
   const denoiseReport = finalResult?.denoise_report;
+  const keywordReport = finalResult?.keyword_report;
   const canExport = finalResult !== null;
-  const displayTask = jobId || progress || finalResult ? runTask : formState.task;
+  const displayTask = formState.task;
   const isVad = displayTask === "vad";
   const isLid = displayTask === "lid";
   const isDenoise = displayTask === "denoise";
-  const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
-
-  function resetRunState() {
-    closeEventsRef.current?.();
-    closeEventsRef.current = null;
-    setStatus("idle");
-    setJobId("");
-    setRunTask(formState.task);
-    setProgress(null);
-    setFinalResult(null);
-    setExcludedSampleIds(new Set());
-    setErrorMessage("");
-    setConnectionWarning("");
-    setBusy(false);
-    setRecalculating(false);
-  }
+  const isKeyword = displayTask === "keyword";
 
   function handleTaskChange(task: EvaluationTask) {
     if (task === formState.task) {
       return;
     }
-    resetRunState();
-    setRememberedJobId("");
-    setRunTask(task);
     const nextTaskRemembered =
       taskRememberedFields[task] ?? TASK_REMEMBERED_DEFAULTS[task];
     setTaskRememberedFields((current) => ({
@@ -378,63 +440,34 @@ export default function App() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    closeEventsRef.current?.();
-    closeEventsRef.current = null;
-    setBusy(true);
-    setErrorMessage("");
-    setConnectionWarning("");
-    setProgress(null);
-    setFinalResult(null);
-    setExcludedSampleIds(new Set());
-    setStatus("queued");
-    setJobId("");
+    const requestTask = formState.task;
+    updateTaskRunState(requestTask, {
+      busy: true,
+      errorMessage: "",
+      connectionWarning: "",
+    });
 
     try {
       const request = buildRequest(formState);
       const created = await createEvaluation(request);
+      closeTaskEvents(request.task);
       setRememberedJobId(created.job_id);
-      setJobId(created.job_id);
-      setRunTask(request.task);
-      setStatus(created.status);
-      subscribeToEvaluation(created.job_id);
+      updateTaskRunState(request.task, {
+        status: created.status,
+        jobId: created.job_id,
+        progress: null,
+        finalResult: null,
+        errorMessage: "",
+        connectionWarning: "",
+        busy: true,
+      });
+      subscribeToEvaluation(created.job_id, request.task);
     } catch (error) {
-      setStatus("failed");
-      setErrorMessage(error instanceof Error ? error.message : "评估任务创建失败");
-      setBusy(false);
-    }
-  }
-
-  function toggleExcludedSample(sampleId: string, excluded: boolean) {
-    setExcludedSampleIds((current) => {
-      const next = new Set(current);
-      if (excluded) {
-        next.add(sampleId);
-      } else {
-        next.delete(sampleId);
-      }
-      return next;
-    });
-  }
-
-  async function handleRecalculateMetrics() {
-    if (!jobId || !canRecalculate) {
-      return;
-    }
-    setRecalculating(true);
-    setErrorMessage("");
-    try {
-      const nextResult = await recalculateEvaluationMetrics(
-        jobId,
-        [...excludedSampleIds],
-      );
-      setFinalResult(nextResult);
-      setExcludedSampleIds(new Set(nextResult.excluded_sample_ids ?? []));
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "重新计算评估指标失败",
-      );
-    } finally {
-      setRecalculating(false);
+      updateTaskRunState(requestTask, (current) => ({
+        ...current,
+        errorMessage: error instanceof Error ? error.message : "评估任务创建失败",
+        busy: false,
+      }));
     }
   }
 
@@ -476,45 +509,63 @@ export default function App() {
 
   function applyEvaluationSnapshot(snapshot: EvaluationSnapshot) {
     setRememberedJobId(snapshot.job_id);
-    setJobId(snapshot.job_id);
-    setRunTask(snapshot.request.task);
-    setStatus(snapshot.status);
-    setProgress(snapshot.progress);
-    setFinalResult(snapshot.result);
-    setExcludedSampleIds(new Set(snapshot.result?.excluded_sample_ids ?? []));
-    setErrorMessage(snapshot.error ?? "");
+    updateTaskRunState(snapshot.request.task, {
+      status: snapshot.status,
+      jobId: snapshot.job_id,
+      progress: snapshot.progress,
+      finalResult: snapshot.result,
+      errorMessage: snapshot.error ?? "",
+      busy: snapshot.status === "queued" || snapshot.status === "running",
+    });
   }
 
-  function subscribeToEvaluation(nextJobId: string) {
-    closeEventsRef.current?.();
-    closeEventsRef.current = subscribeEvaluationEvents(nextJobId, {
+  function subscribeToEvaluation(nextJobId: string, task: EvaluationTask) {
+    closeTaskEvents(task);
+    const closeEvents = subscribeEvaluationEvents(nextJobId, {
       onProgress: (nextProgress) => {
-        setConnectionWarning("");
-        setProgress(nextProgress);
-        setStatus(nextProgress.status ?? "running");
-        if (nextProgress.result) {
-          setFinalResult(nextProgress.result);
-        }
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          connectionWarning: "",
+          progress: nextProgress,
+          status: nextProgress.status ?? "running",
+          finalResult: nextProgress.result ?? current.finalResult,
+        }));
       },
       onPartialProgress: (nextProgress) => {
-        setConnectionWarning("");
-        setProgress(nextProgress);
-        setStatus(nextProgress.status ?? "running");
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          connectionWarning: "",
+          progress: nextProgress,
+          status: nextProgress.status ?? "running",
+        }));
       },
       onDone: (snapshot) => {
         applyEvaluationSnapshot(snapshot);
-        setBusy(false);
-        closeEventsRef.current = null;
+        if (eventClosersRef.current[task] === closeEvents) {
+          eventClosersRef.current[task] = null;
+        }
       },
       onError: (message) => {
-        setStatus("failed");
-        setErrorMessage(message);
-        setBusy(false);
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          status: "failed",
+          errorMessage: message,
+          busy: false,
+        }));
       },
       onConnectionError: () => {
-        setConnectionWarning("事件流连接暂时不可用");
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          connectionWarning: "事件流连接暂时不可用",
+        }));
       },
     });
+    eventClosersRef.current[task] = closeEvents;
+  }
+
+  function closeTaskEvents(task: EvaluationTask) {
+    eventClosersRef.current[task]?.();
+    eventClosersRef.current[task] = null;
   }
 
   function updateField(field: keyof EvaluationFormState, value: string) {
@@ -551,11 +602,13 @@ export default function App() {
       return;
     }
     setDatasetUploading(true);
-    setErrorMessage("");
+    updateTaskRunState(formState.task, { errorMessage: "" });
     try {
       await handleImportDataset(files);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "数据集上传失败");
+      updateTaskRunState(formState.task, {
+        errorMessage: error instanceof Error ? error.message : "数据集上传失败",
+      });
     } finally {
       setDatasetUploading(false);
       event.target.value = "";
@@ -658,6 +711,16 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      className={formState.task === "keyword" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("keyword");
+                      }}
+                    >
+                      Keyword
+                    </button>
+                    <button
+                      type="button"
                       className={formState.task === "denoise" ? "active" : ""}
                       onClick={() => {
                         setActiveModule("evaluation");
@@ -728,18 +791,22 @@ export default function App() {
                   ? "VAD 指标"
                   : isLid
                     ? "LID 报告"
-                    : isDenoise
-                      ? "SE 报告"
-                      : "对齐报告"
+                    : isKeyword
+                      ? "关键词报告"
+                      : isDenoise
+                        ? "SE 报告"
+                        : "对齐报告"
               }
               meta={
                 isVad
                   ? `${formatNumber(finalResult?.sample_count)} 个样本`
                   : isLid
                     ? `${lidReport?.samples.length ?? 0} 个样本`
-                    : isDenoise
-                      ? `${denoiseReport?.samples.length ?? 0} 个样本`
-                      : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
+                    : isKeyword
+                      ? `${keywordReport?.samples.length ?? 0} 个样本`
+                      : isDenoise
+                        ? `${denoiseReport?.samples.length ?? 0} 个样本`
+                        : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
               }
               onClick={() => setActiveTab("report")}
             />
@@ -1132,6 +1199,18 @@ export default function App() {
                       }
                       required
                     />
+                    <TextField
+                      label="LID 置信度阈值"
+                      value={formState.lid_confidence_threshold}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      onChange={(value) =>
+                        updateField("lid_confidence_threshold", value)
+                      }
+                      required
+                    />
                   </div>
                 </section>
               </div>
@@ -1199,8 +1278,9 @@ export default function App() {
                 </div>
                 {isVad ? <VadOverviewMetrics result={finalResult} /> : null}
                 {isLid ? <LidOverviewMetrics result={finalResult} /> : null}
+                {isKeyword ? <KeywordOverviewMetrics result={finalResult} /> : null}
                 {isDenoise ? <DenoiseOverviewMetrics result={finalResult} /> : null}
-                {!isVad && !isLid && !isDenoise ? (
+                {!isVad && !isLid && !isKeyword && !isDenoise ? (
                   <AsrOverviewMetrics result={finalResult} />
                 ) : null}
 
@@ -1214,11 +1294,19 @@ export default function App() {
                     </div>
                     <div className="sample-grid">
                       <TextBlock
-                        label={isLid ? "Reference Language" : "Reference"}
+                        label={
+                          isLid
+                            ? "Reference Language"
+                            : isKeyword
+                              ? "Expected"
+                              : "Reference"
+                        }
                         value={progress?.reference || "-"}
                       />
                       <TextBlock
-                        label={isLid ? "Prediction" : "Hypothesis"}
+                        label={
+                          isLid || isKeyword ? "Prediction" : "Hypothesis"
+                        }
                         value={progress?.hypothesis || "-"}
                       />
                     </div>
@@ -1231,29 +1319,18 @@ export default function App() {
               isVad ? (
                 <VadReportPanel
                   result={finalResult}
-                  excludedSampleIds={excludedSampleIds}
-                  onExcludedChange={toggleExcludedSample}
-                  canRecalculate={canRecalculate}
-                  recalculating={recalculating}
-                  onRecalculate={() => void handleRecalculateMetrics()}
                 />
               ) : isLid ? (
                 <LidReportPanel
                   result={finalResult}
-                  excludedSampleIds={excludedSampleIds}
-                  onExcludedChange={toggleExcludedSample}
-                  canRecalculate={canRecalculate}
-                  recalculating={recalculating}
-                  onRecalculate={() => void handleRecalculateMetrics()}
                 />
               ) : isDenoise ? (
                 <DenoiseReportPanel
                   result={finalResult}
-                  excludedSampleIds={excludedSampleIds}
-                  onExcludedChange={toggleExcludedSample}
-                  canRecalculate={canRecalculate}
-                  recalculating={recalculating}
-                  onRecalculate={() => void handleRecalculateMetrics()}
+                />
+              ) : isKeyword ? (
+                <KeywordReportPanel
+                  result={finalResult}
                 />
               ) : (
                 <AsrAlignmentReportPanel
@@ -1266,11 +1343,6 @@ export default function App() {
                   onSortModeChange={setReportSort}
                   wrapAlignment={wrapWerAlignment}
                   onWrapAlignmentChange={setWrapWerAlignment}
-                  excludedSampleIds={excludedSampleIds}
-                  onExcludedChange={toggleExcludedSample}
-                  canRecalculate={canRecalculate}
-                  recalculating={recalculating}
-                  onRecalculate={() => void handleRecalculateMetrics()}
                 />
               )
             ) : null}
@@ -1444,31 +1516,6 @@ function TextBlock({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ExcludeCheckbox({
-  checked,
-  onChange,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`exclude-toggle ${checked ? "excluded" : ""}`}
-      title={checked ? "取消屏蔽该样本" : "屏蔽该样本的推理结果"}
-      aria-label={checked ? "取消屏蔽该样本" : "屏蔽该样本的推理结果"}
-      aria-pressed={checked}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onChange(!checked);
-      }}
-    >
-      <EyeOff size={15} />
-    </button>
-  );
-}
-
 function AudioPlayer({
   src,
   durationSeconds,
@@ -1564,11 +1611,13 @@ function SampleCountStrip({
   fallbackCount: number;
 }) {
   const included = result?.included_sample_count ?? fallbackCount;
-  const excluded = result?.excluded_sample_count ?? 0;
+  const total = result?.total_sample_count;
   return (
     <div className="metric-strip sample-count-strip">
       <Metric label="参与样本" value={formatNumber(included)} />
-      <Metric label="屏蔽样本" value={formatNumber(excluded)} />
+      {typeof total === "number" && total !== included ? (
+        <Metric label="总样本" value={formatNumber(total)} />
+      ) : null}
     </div>
   );
 }
@@ -1583,6 +1632,43 @@ function PerformanceMetrics({ result }: { result: EvaluationResult | null }) {
       <Metric label="音频时长" value={formatSeconds(result.audio_duration_seconds)} />
       <Metric label="处理耗时" value={formatSeconds(result.processing_elapsed_seconds)} />
       <Metric label="倍时" value={formatRealtimeFactor(result.realtime_factor)} />
+    </div>
+  );
+}
+
+function CompactReportMeta({
+  result,
+  fallbackCount,
+  className = "",
+}: {
+  result: EvaluationResult | null;
+  fallbackCount: number;
+  className?: string;
+}) {
+  const included = result?.included_sample_count ?? fallbackCount;
+  const total = result?.total_sample_count;
+  const sampleText =
+    typeof total === "number" && total !== included
+      ? `${formatNumber(included)} / ${formatNumber(total)}`
+      : formatNumber(included);
+  const items = [
+    { label: "参与样本", value: sampleText },
+    { label: "音频时长", value: formatSeconds(result?.audio_duration_seconds) },
+    { label: "处理耗时", value: formatSeconds(result?.processing_elapsed_seconds) },
+    { label: "倍时", value: formatRealtimeFactor(result?.realtime_factor) },
+  ];
+
+  return (
+    <div
+      className={`compact-report-meta ${className}`.trim()}
+      aria-label="评估运行元信息"
+    >
+      {items.map((item) => (
+        <span key={item.label}>
+          <em>{item.label}</em>
+          <strong>{item.value}</strong>
+        </span>
+      ))}
     </div>
   );
 }
@@ -1639,7 +1725,14 @@ function MarkdownDocument({ markdown }: { markdown: string }) {
       {blocks.map((block, index) => {
         if (block.type === "heading") {
           const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
-          return <HeadingTag key={index}>{block.text}</HeadingTag>;
+          return (
+            <HeadingTag id={block.id} key={index}>
+              {renderInlineMarkdown(block.text)}
+            </HeadingTag>
+          );
+        }
+        if (block.type === "formula") {
+          return <LatexFormula key={index} text={block.text} displayMode />;
         }
         if (block.type === "code") {
           return (
@@ -1653,14 +1746,74 @@ function MarkdownDocument({ markdown }: { markdown: string }) {
           return (
             <ul key={index}>
               {block.items.map((item, itemIndex) => (
-                <li key={itemIndex}>{item}</li>
+                <li key={itemIndex}>{renderInlineMarkdown(item)}</li>
               ))}
             </ul>
           );
         }
-        return <p key={index}>{block.text}</p>;
+        if (block.type === "table") {
+          return (
+            <div className="table-wrap markdown-table-wrap" key={index}>
+              <table>
+                <thead>
+                  <tr>
+                    {block.headers.map((header, headerIndex) => (
+                      <th key={headerIndex}>{renderInlineMarkdown(header)}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {block.headers.map((_, cellIndex) => (
+                        <td key={cellIndex}>
+                          {renderInlineMarkdown(row[cellIndex] ?? "")}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        }
+        return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
       })}
     </article>
+  );
+}
+
+function LatexFormula({
+  text,
+  displayMode = false,
+}: {
+  text: string;
+  displayMode?: boolean;
+}) {
+  const html = useMemo(
+    () =>
+      katex.renderToString(text, {
+        displayMode,
+        throwOnError: false,
+        strict: false,
+        trust: false,
+      }),
+    [displayMode, text],
+  );
+
+  if (displayMode) {
+    return (
+      <div
+        className="markdown-formula"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
+  return (
+    <span
+      className="markdown-inline-formula"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
   );
 }
 
@@ -1702,10 +1855,33 @@ function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
 
   return (
     <div className="metric-strip lid-overview-metrics">
-      <Metric label="Accuracy" value={formatRate(result.accuracy)} />
-      <Metric label="Recall" value={formatRate(result.recall)} />
-      <Metric label="Correct" value={formatNumber(result.correct_count)} />
-      <Metric label="Samples" value={formatNumber(result.sample_count)} />
+      <Metric label="已知语种准确率" value={formatRate(result.known_accuracy ?? result.accuracy)} />
+      <Metric label="宏平均召回率" value={formatRate(result.macro_recall ?? result.recall)} />
+      <Metric label="未知误接收" value={formatNumber(result.unknown_false_accept_count)} />
+      <Metric label="已知被拒识" value={formatNumber(result.known_reject_count)} />
+    </div>
+  );
+}
+
+function KeywordOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="panel keyword-overview-panel">
+      <div className="metric-strip keyword-overview-metrics">
+        <Metric label="Accuracy" value={formatRate(result.accuracy)} />
+        <Metric label="Precision" value={formatRate(result.precision)} />
+        <Metric label="Recall" value={formatRate(result.recall)} />
+        <Metric label="F1" value={formatRate(result.f1)} />
+        <Metric label="Miss" value={formatNumber(result.miss_count)} />
+        <Metric label="False Alarm" value={formatNumber(result.false_alarm_count)} />
+      </div>
+      <SampleCountStrip
+        result={result}
+        fallbackCount={result.keyword_report?.samples.length ?? 0}
+      />
     </div>
   );
 }
@@ -1805,11 +1981,6 @@ function AsrAlignmentReportPanel({
   onSortModeChange,
   wrapAlignment,
   onWrapAlignmentChange,
-  excludedSampleIds,
-  onExcludedChange,
-  canRecalculate,
-  recalculating,
-  onRecalculate,
 }: {
   werReport: WerReport | undefined;
   cerReport: WerReport | undefined;
@@ -1820,11 +1991,6 @@ function AsrAlignmentReportPanel({
   onSortModeChange: (sortMode: ReportSortMode) => void;
   wrapAlignment: boolean;
   onWrapAlignmentChange: (wrapAlignment: boolean) => void;
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
-  canRecalculate: boolean;
-  recalculating: boolean;
-  onRecalculate: () => void;
 }) {
   const activeReport = activeMetric === "wer" ? werReport : cerReport;
   const activeLabel: "WER" | "CER" = activeMetric === "wer" ? "WER" : "CER";
@@ -1838,21 +2004,13 @@ function AsrAlignmentReportPanel({
     [activeReport?.utterances, cerReport, sortMode, werReport],
   );
   return (
-    <div className="panel report-panel">
+    <div className="panel report-panel asr-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>对齐报告</h2>
           <span>{sampleCount} 个样本</span>
         </div>
         <div className="report-controls">
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={!canRecalculate}
-            onClick={onRecalculate}
-          >
-            {recalculating ? "重算中..." : "重新计算评估指标"}
-          </button>
           <label className="wrap-control">
             <input
               type="checkbox"
@@ -1894,8 +2052,7 @@ function AsrAlignmentReportPanel({
               fallbackRate={result?.cer}
             />
           </div>
-          <SampleCountStrip result={result} fallbackCount={sampleCount} />
-          <PerformanceMetrics result={result} />
+          <CompactReportMeta result={result} fallbackCount={sampleCount} />
           <SqaSummaryMetrics summary={result?.sqa_summary} />
           <div className="alignment-metric-tabs" role="tablist" aria-label="对齐指标">
             <button
@@ -1926,10 +2083,6 @@ function AsrAlignmentReportPanel({
               >
                 <summary>
                   <span className="utterance-title">
-                    <ExcludeCheckbox
-                      checked={excludedSampleIds.has(utterance.id)}
-                      onChange={(checked) => onExcludedChange(utterance.id, checked)}
-                    />
                     <strong>#{utterance.index ?? "-"}</strong>
                     <span>{utterance.id || "-"}</span>
                   </span>
@@ -1962,36 +2115,18 @@ function AsrAlignmentReportPanel({
 
 function VadReportPanel({
   result,
-  excludedSampleIds,
-  onExcludedChange,
-  canRecalculate,
-  recalculating,
-  onRecalculate,
 }: {
   result: EvaluationResult | null;
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
-  canRecalculate: boolean;
-  recalculating: boolean;
-  onRecalculate: () => void;
 }) {
   const samples = result?.vad_report?.samples ?? [];
   return (
-    <div className="panel report-panel">
+    <div className="panel report-panel vad-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>VAD 报告</h2>
           <span>{formatNumber(result?.sample_count)} 个样本</span>
         </div>
         <div className="report-controls vad-report-controls">
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={!canRecalculate}
-            onClick={onRecalculate}
-          >
-            {recalculating ? "重算中..." : "重新计算评估指标"}
-          </button>
           <div className="vad-legend report-legend">
             <LegendItem className="hit" label="命中" />
             <LegendItem className="miss" label="漏检" />
@@ -2002,14 +2137,9 @@ function VadReportPanel({
       </div>
       {result ? (
         <>
-          <SampleCountStrip result={result} fallbackCount={samples.length} />
-          <PerformanceMetrics result={result} />
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
           <SqaSummaryMetrics summary={result.sqa_summary} />
-          <VadMaskReport
-            samples={samples}
-            excludedSampleIds={excludedSampleIds}
-            onExcludedChange={onExcludedChange}
-          />
+          <VadMaskReport samples={samples} />
         </>
       ) : (
         <div className="empty-state">评估完成后生成 VAD 指标</div>
@@ -2020,54 +2150,42 @@ function VadReportPanel({
 
 function LidReportPanel({
   result,
-  excludedSampleIds,
-  onExcludedChange,
-  canRecalculate,
-  recalculating,
-  onRecalculate,
 }: {
   result: EvaluationResult | null;
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
-  canRecalculate: boolean;
-  recalculating: boolean;
-  onRecalculate: () => void;
 }) {
   const samples = result?.lid_report?.samples ?? [];
   return (
-    <div className="panel report-panel">
+    <div className="panel report-panel lid-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>LID 报告</h2>
           <span>{formatNumber(result?.sample_count)} 个样本</span>
         </div>
-        <div className="report-controls">
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={!canRecalculate}
-            onClick={onRecalculate}
-          >
-            {recalculating ? "重算中..." : "重新计算评估指标"}
-          </button>
-        </div>
       </div>
       {result ? (
         <>
           <div className="report-summary lid-summary">
-            <Metric label="Accuracy" value={formatRate(result.accuracy)} />
-            <Metric label="Recall" value={formatRate(result.recall)} />
-            <Metric label="Correct" value={formatNumber(result.correct_count)} />
-            <Metric label="Samples" value={formatNumber(result.sample_count)} />
+            <Metric
+              label="已知语种准确率"
+              value={formatRate(result.known_accuracy ?? result.accuracy)}
+            />
+            <Metric
+              label="宏平均召回率"
+              value={formatRate(result.macro_recall ?? result.recall)}
+            />
+            <Metric
+              label="未知误接收"
+              value={formatNumber(result.unknown_false_accept_count)}
+            />
+            <Metric
+              label="已知被拒识"
+              value={formatNumber(result.known_reject_count)}
+            />
           </div>
-          <SampleCountStrip result={result} fallbackCount={samples.length} />
-          <PerformanceMetrics result={result} />
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
           <SqaSummaryMetrics summary={result.sqa_summary} />
-          <LidSampleList
-            samples={samples}
-            excludedSampleIds={excludedSampleIds}
-            onExcludedChange={onExcludedChange}
-          />
+          <LidMetricsDetails result={result} />
+          <LidSampleList samples={samples} />
         </>
       ) : (
         <div className="empty-state">评估完成后生成 LID 报告</div>
@@ -2076,38 +2194,102 @@ function LidReportPanel({
   );
 }
 
-function DenoiseReportPanel({
+function KeywordReportPanel({
   result,
-  excludedSampleIds,
-  onExcludedChange,
-  canRecalculate,
-  recalculating,
-  onRecalculate,
 }: {
   result: EvaluationResult | null;
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
-  canRecalculate: boolean;
-  recalculating: boolean;
-  onRecalculate: () => void;
+}) {
+  const samples = result?.keyword_report?.samples ?? [];
+  return (
+    <div className="panel report-panel keyword-report-panel compact-report-panel">
+      <div className="panel-heading compact-heading">
+        <div>
+          <h2>关键词报告</h2>
+          <span>{formatNumber(result?.sample_count)} 个样本</span>
+        </div>
+      </div>
+      {result ? (
+        <>
+          <div className="report-summary keyword-summary">
+            <Metric label="Accuracy" value={formatRate(result.accuracy)} />
+            <Metric label="Precision" value={formatRate(result.precision)} />
+            <Metric label="Recall" value={formatRate(result.recall)} />
+            <Metric label="F1" value={formatRate(result.f1)} />
+            <Metric label="Hit" value={formatNumber(result.hit_count)} />
+            <Metric label="Miss" value={formatNumber(result.miss_count)} />
+            <Metric
+              label="False Alarm"
+              value={formatNumber(result.false_alarm_count)}
+            />
+            <Metric
+              label="Correct Reject"
+              value={formatNumber(result.correct_reject_count)}
+            />
+          </div>
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
+          <SqaSummaryMetrics summary={result.sqa_summary} />
+          <KeywordSampleList samples={samples} />
+        </>
+      ) : (
+        <div className="empty-state">评估完成后生成关键词报告</div>
+      )}
+    </div>
+  );
+}
+
+function KeywordSampleList({ samples }: { samples: KeywordReportSample[] }) {
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成关键词结果</div>;
+  }
+
+  return (
+    <div className="keyword-sample-list">
+      {samples.map((sample) => (
+        <section
+          className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
+          key={sample.id}
+        >
+          <div className="keyword-sample-title">
+            <span className="keyword-sample-name">
+              <strong>#{sample.index ?? "-"}</strong>
+              <span title={sample.id}>{sample.id}</span>
+            </span>
+            <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
+              {sample.correct ? "正确" : "错误"}
+            </span>
+          </div>
+          <AudioPlayer
+            src={sample.audio_url}
+            durationSeconds={sample.duration_seconds}
+          />
+          <div className="keyword-sample-metrics">
+            <Metric label="Keyword" value={sample.keyword || "-"} />
+            <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
+            <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
+          </div>
+          <SqaScoreChips scores={sample.sqa_scores} />
+          <div className="keyword-transcript-grid">
+            <TextBlock label="Transcript" value={sample.transcript || "-"} />
+            <TextBlock label="Match Text" value={sample.match_text || "-"} />
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function DenoiseReportPanel({
+  result,
+}: {
+  result: EvaluationResult | null;
 }) {
   const samples = result?.denoise_report?.samples ?? [];
   return (
-    <div className="panel report-panel">
+    <div className="panel report-panel denoise-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>SE 报告</h2>
           <span>{formatNumber(result?.sample_count)} 个样本</span>
-        </div>
-        <div className="report-controls">
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={!canRecalculate}
-            onClick={onRecalculate}
-          >
-            {recalculating ? "重算中..." : "重新计算评估指标"}
-          </button>
         </div>
       </div>
       {result ? (
@@ -2120,13 +2302,8 @@ function DenoiseReportPanel({
             <Metric label="MOS Before" value={formatSqaScore(result.mean_original_mos)} />
             <Metric label="MOS After" value={formatSqaScore(result.mean_denoised_mos)} />
           </div>
-          <SampleCountStrip result={result} fallbackCount={samples.length} />
-          <PerformanceMetrics result={result} />
-          <DenoiseSampleList
-            samples={samples}
-            excludedSampleIds={excludedSampleIds}
-            onExcludedChange={onExcludedChange}
-          />
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
+          <DenoiseSampleList samples={samples} />
         </>
       ) : (
         <div className="empty-state">评估完成后生成 SE 报告</div>
@@ -2135,14 +2312,8 @@ function DenoiseReportPanel({
   );
 }
 
-function DenoiseSampleList({
-  samples,
-  excludedSampleIds,
-  onExcludedChange,
-}: {
+function DenoiseSampleList({ samples }: {
   samples: DenoiseReportSample[];
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
 }) {
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成 SE 结果</div>;
@@ -2157,10 +2328,6 @@ function DenoiseSampleList({
         >
           <div className="denoise-sample-title">
             <span className="denoise-sample-name">
-              <ExcludeCheckbox
-                checked={excludedSampleIds.has(sample.id)}
-                onChange={(checked) => onExcludedChange(sample.id, checked)}
-              />
               <strong>#{sample.index ?? "-"}</strong>
               <span title={sample.id}>{sample.id}</span>
             </span>
@@ -2240,14 +2407,189 @@ function DenoiseSampleMetrics({ sample }: { sample: DenoiseReportSample }) {
   );
 }
 
-function LidSampleList({
-  samples,
-  excludedSampleIds,
-  onExcludedChange,
-}: {
+function LidMetricsDetails({ result }: { result: EvaluationResult }) {
+  const recalls = getKnownLidLanguageRecalls(result);
+  const hasRecalls = recalls.length > 0;
+  const matrix = result.lid_confusion_matrix;
+  const hasMatrix =
+    (matrix?.rows ?? []).length > 0 && (matrix?.predicted_languages ?? []).length > 0;
+  const overallCorrect = result.overall_correct_count ?? result.correct_count;
+  const errorCount = getLidErrorCount(result);
+
+  if (!hasRecalls && !hasMatrix) {
+    return null;
+  }
+
+  return (
+    <details className="lid-metrics-details">
+      <summary>
+        <span>类别召回率与混淆矩阵</span>
+        <small>
+          {recalls.length} 类 / 正确 {formatNumber(overallCorrect)} / 错误{" "}
+          {formatNumber(errorCount)} / 未知误接收{" "}
+          {formatNumber(result.unknown_false_accept_count)}
+          {" / "}
+          已知拒识 {formatNumber(result.known_reject_count)}
+        </small>
+      </summary>
+      <div className="lid-metrics-scroll">
+        <LidMetricsTables result={result} />
+      </div>
+    </details>
+  );
+}
+
+function LidMetricsTables({ result }: { result: EvaluationResult }) {
+  const recalls = getKnownLidLanguageRecalls(result);
+  const matrix = result.lid_confusion_matrix;
+  const matrixRows = matrix?.rows ?? [];
+  const predictedLanguages = matrix?.predicted_languages ?? [];
+  const hasMatrix = matrixRows.length > 0 && predictedLanguages.length > 0;
+
+  if (!recalls.length && !hasMatrix) {
+    return null;
+  }
+
+  return (
+    <div className="lid-metrics-grid">
+      {recalls.length ? (
+        <section className="metric-table-section">
+          <div className="metric-table-heading">
+            <h3>类别召回率</h3>
+          </div>
+          <div className="table-wrap lid-recall-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>真实标签</th>
+                  <th>正确数</th>
+                  <th>真实总数</th>
+                  <th>召回率</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recalls.map((item) => (
+                  <tr
+                    className={item.recall < 0.9 ? "low-recall" : ""}
+                    key={item.language}
+                  >
+                    <td title={item.language}>{item.language || "-"}</td>
+                    <td>{formatNumber(item.correct_count)}</td>
+                    <td>{formatNumber(item.sample_count)}</td>
+                    <td>{formatRate(item.recall)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+      {hasMatrix ? (
+        <section className="metric-table-section">
+          <div className="metric-table-heading">
+            <h3>混淆矩阵</h3>
+          </div>
+          <div className="table-wrap lid-confusion-table">
+            <table>
+              <thead>
+                <tr>
+                  <th title="真实标签 / 预测标签">真实/预测</th>
+                  {predictedLanguages.map((language) => (
+                    <th key={language} title={language}>
+                      {language || "-"}
+                    </th>
+                  ))}
+                  <th>总数</th>
+                  <th>召回率</th>
+                </tr>
+              </thead>
+              <tbody>
+                {matrixRows.map((row) => (
+                  <tr key={row.reference_language}>
+                    <th title={row.reference_language}>{row.reference_language || "-"}</th>
+                    {predictedLanguages.map((language) => (
+                      <td
+                        className={lidConfusionCellClass(
+                          row.reference_language,
+                          language,
+                          row.counts[language] ?? 0,
+                          row.total,
+                        )}
+                        key={`${row.reference_language}:${language}`}
+                        title={`${row.reference_language || "-"} -> ${language || "-"}: ${formatNumber(row.counts[language] ?? 0)}`}
+                      >
+                        {formatNumber(row.counts[language] ?? 0)}
+                      </td>
+                    ))}
+                    <td>{formatNumber(row.total)}</td>
+                    <td>{formatRate(getLidMatrixRowRecall(result, row.reference_language))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function lidConfusionCellClass(
+  referenceLanguage: string,
+  predictedLanguage: string,
+  count: number,
+  total: number,
+): string {
+  const ratio = total > 0 ? count / total : 0;
+  const level = count > 0 ? Math.max(1, Math.min(5, Math.ceil(ratio * 5))) : 0;
+  const status = referenceLanguage === predictedLanguage ? "diagonal" : "error";
+  return `confusion-cell ${status} heat-${level}`;
+}
+
+function getLidErrorCount(result: EvaluationResult): number | undefined {
+  const sampleCount = toDisplayNumber(result.sample_count);
+  const correctCount = toDisplayNumber(result.overall_correct_count ?? result.correct_count);
+  if (sampleCount === undefined || correctCount === undefined) {
+    return undefined;
+  }
+  return Math.max(0, sampleCount - correctCount);
+}
+
+function getKnownLidLanguageRecalls(result: EvaluationResult) {
+  return (result.lid_language_recalls ?? []).filter(
+    (item) => item.language !== "<others>",
+  );
+}
+
+function getLidMatrixRowRecall(
+  result: EvaluationResult,
+  referenceLanguage: string,
+): number | undefined {
+  if (referenceLanguage === "<others>") {
+    return undefined;
+  }
+  const recall = result.lid_language_recalls?.find(
+    (item) => item.language === referenceLanguage,
+  )?.recall;
+  if (typeof recall === "number") {
+    return recall;
+  }
+  const row = result.lid_confusion_matrix?.rows.find(
+    (item) => item.reference_language === referenceLanguage,
+  );
+  if (!row || row.total <= 0) {
+    return undefined;
+  }
+  return (row.counts[referenceLanguage] ?? 0) / row.total;
+}
+
+function toDisplayNumber(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function LidSampleList({ samples }: {
   samples: LidReportSample[];
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
 }) {
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成 LID 结果</div>;
@@ -2262,10 +2604,6 @@ function LidSampleList({
         >
           <div className="lid-sample-title">
             <span className="lid-sample-name">
-              <ExcludeCheckbox
-                checked={excludedSampleIds.has(sample.id)}
-                onChange={(checked) => onExcludedChange(sample.id, checked)}
-              />
               <strong>#{sample.index ?? "-"}</strong>
               <span title={sample.id}>{sample.id}</span>
             </span>
@@ -2285,11 +2623,11 @@ function LidSampleList({
             </div>
             <SqaScoreChips scores={sample.sqa_scores} />
             <div className="lid-sample-actions">
+              <b>{sample.correct ? "正确" : "错误"}</b>
               <AudioPlayer
                 src={sample.audio_url}
                 durationSeconds={sample.duration_seconds}
               />
-              <b>{sample.correct ? "正确" : "错误"}</b>
             </div>
           </div>
         </section>
@@ -2323,14 +2661,8 @@ function AsrMetricSummaryCard({
   );
 }
 
-function VadMaskReport({
-  samples,
-  excludedSampleIds,
-  onExcludedChange,
-}: {
+function VadMaskReport({ samples }: {
   samples: VadReportSample[];
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
 }) {
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成 mask 对齐报告</div>;
@@ -2344,10 +2676,6 @@ function VadMaskReport({
           <details className="vad-sample" key={sample.id} open={index < 3}>
             <summary>
               <span>
-                <ExcludeCheckbox
-                  checked={excludedSampleIds.has(sample.id)}
-                  onChange={(checked) => onExcludedChange(sample.id, checked)}
-                />
                 #{sample.index ?? "-"} {sample.id}
               </span>
               <AudioPlayer
@@ -2784,6 +3112,9 @@ function evaluationTaskShortLabel(task: EvaluationTask): string {
   if (task === "lid") {
     return "LID";
   }
+  if (task === "keyword") {
+    return "Keyword";
+  }
   if (task === "denoise") {
     return "SE";
   }
@@ -2803,6 +3134,9 @@ function evaluationTaskTitle(task: EvaluationTask): string {
   }
   if (task === "lid") {
     return "LID 评估";
+  }
+  if (task === "keyword") {
+    return "关键词评估";
   }
   if (task === "denoise") {
     return "SE 评估";
@@ -2894,8 +3228,10 @@ function parseMarkdown(markdown: string): MarkdownBlock[] {
   let paragraph: string[] = [];
   let listItems: string[] = [];
   let codeLines: string[] = [];
+  let formulaLines: string[] = [];
   let codeLanguage = "";
   let inCode = false;
+  let inFormula = false;
 
   function flushParagraph() {
     if (paragraph.length) {
@@ -2911,14 +3247,36 @@ function parseMarkdown(markdown: string): MarkdownBlock[] {
     }
   }
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed === "$$") {
+      if (inFormula) {
+        blocks.push({ type: "formula", text: formulaLines.join("\n") });
+        formulaLines = [];
+        inFormula = false;
+      } else {
+        flushParagraph();
+        flushList();
+        inFormula = true;
+      }
+      continue;
+    }
+
+    if (inFormula) {
+      formulaLines.push(line);
+      continue;
+    }
+
     if (line.startsWith("```")) {
       if (inCode) {
-        blocks.push({
-          type: "code",
-          language: codeLanguage,
-          text: codeLines.join("\n"),
-        });
+        const text = codeLines.join("\n");
+        blocks.push(
+          codeLanguage === "math" || codeLanguage === "formula"
+            ? { type: "formula", text }
+            : { type: "code", language: codeLanguage, text },
+        );
         codeLines = [];
         codeLanguage = "";
         inCode = false;
@@ -2936,7 +3294,6 @@ function parseMarkdown(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    const trimmed = line.trim();
     if (!trimmed) {
       flushParagraph();
       flushList();
@@ -2947,11 +3304,22 @@ function parseMarkdown(markdown: string): MarkdownBlock[] {
     if (heading) {
       flushParagraph();
       flushList();
+      const text = heading[2];
       blocks.push({
         type: "heading",
         level: heading[1].length as 1 | 2 | 3,
-        text: heading[2],
+        text,
+        id: slugifyHeading(text),
       });
+      continue;
+    }
+
+    if (isMarkdownTableStart(lines, index)) {
+      flushParagraph();
+      flushList();
+      const parsedTable = parseMarkdownTable(lines, index);
+      blocks.push(parsedTable.block);
+      index = parsedTable.nextIndex - 1;
       continue;
     }
 
@@ -2966,11 +3334,94 @@ function parseMarkdown(markdown: string): MarkdownBlock[] {
   }
 
   if (inCode) {
-    blocks.push({ type: "code", language: codeLanguage, text: codeLines.join("\n") });
+    const text = codeLines.join("\n");
+    blocks.push(
+      codeLanguage === "math" || codeLanguage === "formula"
+        ? { type: "formula", text }
+        : { type: "code", language: codeLanguage, text },
+    );
+  }
+  if (inFormula) {
+    blocks.push({ type: "formula", text: formulaLines.join("\n") });
   }
   flushParagraph();
   flushList();
   return blocks;
+}
+
+function isMarkdownTableStart(lines: string[], index: number): boolean {
+  const current = lines[index]?.trim() ?? "";
+  const next = lines[index + 1]?.trim() ?? "";
+  return (
+    current.startsWith("|") &&
+    current.endsWith("|") &&
+    /^\|[\s:\-|]+\|$/.test(next)
+  );
+}
+
+function parseMarkdownTable(
+  lines: string[],
+  startIndex: number,
+): { block: MarkdownBlock; nextIndex: number } {
+  const headers = splitMarkdownTableRow(lines[startIndex]);
+  const rows: string[][] = [];
+  let index = startIndex + 2;
+  while (index < lines.length) {
+    const line = lines[index].trim();
+    if (!line.startsWith("|") || !line.endsWith("|")) {
+      break;
+    }
+    rows.push(splitMarkdownTableRow(line));
+    index += 1;
+  }
+  return { block: { type: "table", headers, rows }, nextIndex: index };
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  return line
+    .trim()
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /(`([^`]+)`|\[([^\]]+)\]\((#[^)]+)\)|\$([^$]+)\$)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    if (match[2]) {
+      nodes.push(<code key={`code-${match.index}`}>{match[2]}</code>);
+    } else if (match[3] && match[4]) {
+      nodes.push(
+        <a href={match[4]} key={`link-${match.index}`}>
+          {match[3]}
+        </a>,
+      );
+    } else if (match[5]) {
+      nodes.push(
+        <LatexFormula key={`math-${match.index}`} text={match[5]} />,
+      );
+    }
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
+}
+
+function slugifyHeading(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/`/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/[^\p{L}\p{N}\-_]/gu, "");
 }
 
 function getVadTimelineWidth(duration: number): number {

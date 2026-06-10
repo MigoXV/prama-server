@@ -3,7 +3,6 @@ import type {
   DatasetUploadResult,
   EvaluationProgress,
   EvaluationRequest,
-  EvaluationResult,
   EvaluationSnapshot,
   HelpDocument,
   ServerDirectoryListing,
@@ -106,23 +105,6 @@ export function subscribeEvaluationEvents(
   });
 
   return () => eventSource.close();
-}
-
-export async function recalculateEvaluationMetrics(
-  jobId: string,
-  excludedSampleIds: string[],
-): Promise<EvaluationResult> {
-  const response = await fetch(`/api/evaluations/${jobId}/metrics/recalculate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ excluded_sample_ids: excludedSampleIds }),
-  });
-
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-
-  return response.json() as Promise<EvaluationResult>;
 }
 
 export async function listServerDirectory(

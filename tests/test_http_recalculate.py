@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,315 +9,221 @@ import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
 
-from prama_server.evaluator.vad import evaluate_masks
 from prama_server.servicer.http import (
     EvaluationJob,
     EvaluationRequest,
     SqaAssessor,
+    _build_keyword_report,
     _build_denoise_report,
     _build_sqa_summary,
     _build_cer_report,
     _build_wer_report,
     _build_lid_report,
+    _keyword_matches,
+    _load_keyword_dataset,
+    _normalize_keyword_text,
+    _lid_predicted_language,
     app,
     jobs,
     jobs_lock,
+)
+from prama_server.inferencers.grpc_options import (
+    GRPC_CHANNEL_OPTIONS,
+    GRPC_MAX_MESSAGE_LENGTH_BYTES,
 )
 
 
 client = TestClient(app)
 
 
-class HttpRecalculateTest(unittest.TestCase):
-    def test_recalculate_asr_metrics_excludes_selected_sample(self) -> None:
-        job = EvaluationJob(
-            job_id="test-asr-recalculate",
-            request=EvaluationRequest(task="asr"),
-            status="completed",
+class HttpReportMetricsTest(unittest.TestCase):
+    def test_grpc_channel_options_allow_500mb_messages(self) -> None:
+        self.assertEqual(GRPC_MAX_MESSAGE_LENGTH_BYTES, 500 * 1024 * 1024)
+        self.assertIn(
+            ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH_BYTES),
+            GRPC_CHANNEL_OPTIONS,
         )
-        job.sample_records = {
-            "ok": {"id": "ok", "index": 1},
-            "bad": {"id": "bad", "index": 2},
+        self.assertIn(
+            ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH_BYTES),
+            GRPC_CHANNEL_OPTIONS,
+        )
+
+    def test_lid_metrics_use_open_set_metrics(self) -> None:
+        payload = _build_lid_report(
+            [
+                {
+                    "id": "en-ok",
+                    "index": 1,
+                    "duration_seconds": 1.0,
+                    "reference_language": "en",
+                    "predicted_language": "en",
+                    "raw_language": "en",
+                    "confidence": 0.9,
+                    "correct": True,
+                },
+                {
+                    "id": "en-reject",
+                    "index": 2,
+                    "duration_seconds": 1.0,
+                    "reference_language": "en",
+                    "predicted_language": "<others>",
+                    "raw_language": "en",
+                    "confidence": 0.2,
+                    "correct": False,
+                },
+                {
+                    "id": "cn-bad",
+                    "index": 3,
+                    "duration_seconds": 1.0,
+                    "reference_language": "cn",
+                    "predicted_language": "en",
+                    "raw_language": "en",
+                    "confidence": 0.8,
+                    "correct": False,
+                },
+                {
+                    "id": "unknown-ok",
+                    "index": 4,
+                    "duration_seconds": 1.0,
+                    "reference_language": "<others>",
+                    "predicted_language": "<others>",
+                    "raw_language": "<others>",
+                    "confidence": 0.9,
+                    "correct": True,
+                },
+                {
+                    "id": "unknown-false",
+                    "index": 5,
+                    "duration_seconds": 1.0,
+                    "reference_language": "<others>",
+                    "predicted_language": "cn",
+                    "raw_language": "cn",
+                    "confidence": 0.9,
+                    "correct": False,
+                },
+            ]
+        )
+
+        self.assertEqual(payload["accuracy"], 1 / 3)
+        self.assertEqual(payload["known_accuracy"], 1 / 3)
+        self.assertEqual(payload["recall"], 0.25)
+        self.assertEqual(payload["macro_recall"], 0.25)
+        self.assertEqual(payload["known_correct_count"], 1)
+        self.assertEqual(payload["known_sample_count"], 3)
+        self.assertEqual(payload["overall_correct_count"], 2)
+        self.assertEqual(payload["unknown_false_accept_count"], 1)
+        self.assertEqual(payload["known_reject_count"], 1)
+        self.assertEqual(
+            {
+                item["language"]: (item["correct_count"], item["sample_count"], item["recall"])
+                for item in payload["lid_language_recalls"]
+            },
+            {"cn": (0, 1, 0.0), "en": (1, 2, 0.5)},
+        )
+        confusion_rows = {
+            row["reference_language"]: row["counts"]
+            for row in payload["lid_confusion_matrix"]["rows"]
         }
-        job.asr_inference_rows = [
-            {
-                "id": "ok",
-                "index": 1,
-                "reference": "hello world",
-                "hypothesis": "hello world",
-                "duration_seconds": 12.5,
-                "sqa_scores": [
-                    {
-                        "engine_name": "MOS",
-                        "target": "127.0.0.1:50111",
-                        "score": 4.0,
-                        "error": None,
-                    }
-                ],
-            },
-            {
-                "id": "bad",
-                "index": 2,
-                "reference": "hello world",
-                "hypothesis": "bad world",
-                "duration_seconds": 7.5,
-                "sqa_scores": [
-                    {
-                        "engine_name": "MOS",
-                        "target": "127.0.0.1:50111",
-                        "score": 1.0,
-                        "error": None,
-                    }
-                ],
-            },
-        ]
-        job.result = {"processing_elapsed_seconds": 5.0}
-        _put_job(job)
+        self.assertEqual(confusion_rows["en"]["en"], 1)
+        self.assertEqual(confusion_rows["en"]["<others>"], 1)
+        self.assertEqual(confusion_rows["cn"]["en"], 1)
+        self.assertEqual(confusion_rows["<others>"]["<others>"], 1)
+        self.assertEqual(confusion_rows["<others>"]["cn"], 1)
 
-        response = client.post(
-            f"/api/evaluations/{job.job_id}/metrics/recalculate",
-            json={"excluded_sample_ids": ["bad"]},
+    def test_keyword_matching_normalizes_case_punctuation_and_word_boundaries(self) -> None:
+        self.assertEqual(
+            _normalize_keyword_text("Austrian, Seven!"),
+            "austrian seven",
+        )
+        self.assertTrue(_keyword_matches("Austrian, seven papa", "AUSTRIAN"))
+        self.assertTrue(_keyword_matches("Austrian seven papa", "AUSTRIAN SEVEN"))
+        self.assertFalse(_keyword_matches("catch tower", "CAT"))
+        self.assertTrue(_keyword_matches("我们刚刚上一段会议", "刚刚"))
+
+    def test_keyword_report_counts_hits_misses_false_alarms_and_rejects(self) -> None:
+        report = _build_keyword_report(
+            [
+                {"expected_hit": True, "predicted_hit": True},
+                {"expected_hit": True, "predicted_hit": False},
+                {"expected_hit": False, "predicted_hit": True},
+                {"expected_hit": False, "predicted_hit": False},
+            ]
         )
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["wer"], 0.0)
-        self.assertEqual(payload["cer"], 0.0)
-        self.assertEqual(payload["included_sample_count"], 1)
-        self.assertEqual(payload["excluded_sample_count"], 1)
-        self.assertEqual(payload["excluded_sample_ids"], ["bad"])
-        self.assertEqual(payload["audio_duration_seconds"], 12.5)
-        self.assertEqual(payload["processing_elapsed_seconds"], 5.0)
-        self.assertEqual(payload["realtime_factor"], 2.5)
-        self.assertEqual(
-            [item["id"] for item in payload["wer_report"]["utterances"]],
-            ["ok"],
-        )
-        self.assertEqual(
-            [item["id"] for item in payload["cer_report"]["utterances"]],
-            ["ok"],
-        )
-        self.assertEqual(payload["sqa_summary"][0]["mean_score"], 4.0)
-        self.assertEqual(
-            payload["wer_report"]["utterances"][0]["sqa_scores"][0]["score"],
-            4.0,
-        )
+        self.assertEqual(report["hit_count"], 1)
+        self.assertEqual(report["miss_count"], 1)
+        self.assertEqual(report["false_alarm_count"], 1)
+        self.assertEqual(report["correct_reject_count"], 1)
+        self.assertEqual(report["positive_sample_count"], 2)
+        self.assertEqual(report["negative_sample_count"], 2)
+        self.assertEqual(report["accuracy"], 0.5)
+        self.assertEqual(report["precision"], 0.5)
+        self.assertEqual(report["recall"], 0.5)
+        self.assertEqual(report["f1"], 0.5)
 
-    def test_recalculate_vad_metrics_excludes_selected_sample(self) -> None:
-        hit = asdict(
-            evaluate_masks(
-                np.array([False, True, True, False], dtype=bool),
-                np.array([False, True, True, False], dtype=bool),
+    def test_keyword_report_handles_empty_positive_and_negative_sets(self) -> None:
+        self.assertEqual(_build_keyword_report([])["accuracy"], 0.0)
+
+        positive_only = _build_keyword_report(
+            [{"expected_hit": True, "predicted_hit": True}]
+        )
+        self.assertEqual(positive_only["precision"], 1.0)
+        self.assertEqual(positive_only["recall"], 1.0)
+        self.assertEqual(positive_only["negative_sample_count"], 0)
+
+        negative_only = _build_keyword_report(
+            [{"expected_hit": False, "predicted_hit": False}]
+        )
+        self.assertEqual(negative_only["accuracy"], 1.0)
+        self.assertEqual(negative_only["precision"], 0.0)
+        self.assertEqual(negative_only["recall"], 0.0)
+        self.assertEqual(negative_only["positive_sample_count"], 0)
+
+    def test_keyword_request_is_valid_and_sqa_target_validation_still_applies(self) -> None:
+        request = EvaluationRequest(task="keyword")
+        self.assertEqual(request.task, "keyword")
+
+        with self.assertRaises(ValueError):
+            EvaluationRequest(task="keyword", enable_mos=True, mos_target="")
+
+    def test_keyword_dataset_requires_keyword_expected_hit_and_single_keyword(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_dir = root / "keyword"
+            test_dir = dataset_dir / "test"
+            test_dir.mkdir(parents=True)
+            sf.write(test_dir / "sample.wav", np.zeros(160, dtype=np.float32), 16000)
+            metadata_path = test_dir / "metadata.jsonl"
+
+            metadata_path.write_text(
+                '{"file_name":"sample.wav","id":"missing","keyword":"AUSTRIAN"}\n',
+                encoding="utf-8",
             )
-        )
-        miss = asdict(
-            evaluate_masks(
-                np.array([False, True, True, False], dtype=bool),
-                np.array([False, False, False, False], dtype=bool),
+            with self.assertRaisesRegex(ValueError, "expected_hit"):
+                _load_keyword_dataset(
+                    dataset_dir,
+                    split="test",
+                    limit=None,
+                    sample_rate=16000,
+                )
+
+            metadata_path.write_text(
+                "\n".join(
+                    [
+                        '{"file_name":"sample.wav","id":"first","keyword":"AUSTRIAN","expected_hit":true}',
+                        '{"file_name":"sample.wav","id":"second","keyword":"SPEED","expected_hit":false}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
             )
-        )
-        job = EvaluationJob(
-            job_id="test-vad-recalculate",
-            request=EvaluationRequest(task="vad"),
-            status="completed",
-        )
-        job.sample_records = {
-            "hit": {"id": "hit", "index": 1},
-            "miss": {"id": "miss", "index": 2},
-        }
-        job.vad_metric_rows = [{"id": "hit", **hit}, {"id": "miss", **miss}]
-        job.vad_report_samples = [
-            {"id": "hit", "duration_seconds": 8.0},
-            {"id": "miss", "duration_seconds": 12.0},
-        ]
-        job.result = {"processing_elapsed_seconds": 4.0}
-        _put_job(job)
-
-        response = client.post(
-            f"/api/evaluations/{job.job_id}/metrics/recalculate",
-            json={"excluded_sample_ids": ["miss"]},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["sample_count"], 1)
-        self.assertEqual(payload["frame"]["frame_f1"], 1.0)
-        self.assertEqual(payload["included_sample_count"], 1)
-        self.assertEqual(payload["excluded_sample_count"], 1)
-        self.assertEqual(payload["audio_duration_seconds"], 8.0)
-        self.assertEqual(payload["processing_elapsed_seconds"], 4.0)
-        self.assertEqual(payload["realtime_factor"], 2.0)
-        self.assertEqual(
-            payload["vad_report"]["samples"],
-            [{"id": "hit", "duration_seconds": 8.0}],
-        )
-
-    def test_recalculate_lid_metrics_excludes_selected_sample(self) -> None:
-        job = EvaluationJob(
-            job_id="test-lid-recalculate",
-            request=EvaluationRequest(task="lid"),
-            status="completed",
-        )
-        job.sample_records = {
-            "ok": {"id": "ok", "index": 1},
-            "bad": {"id": "bad", "index": 2},
-        }
-        job.lid_report_samples = [
-            {
-                "id": "ok",
-                "index": 1,
-                "duration_seconds": 3.0,
-                "reference_language": "en",
-                "predicted_language": "en",
-                "raw_language": "en",
-                "confidence": 0.9,
-                "correct": True,
-            },
-            {
-                "id": "bad",
-                "index": 2,
-                "duration_seconds": 2.0,
-                "reference_language": "zh",
-                "predicted_language": "en",
-                "raw_language": "en",
-                "confidence": 0.7,
-                "correct": False,
-            },
-        ]
-        job.result = {"processing_elapsed_seconds": 2.5}
-        _put_job(job)
-
-        response = client.post(
-            f"/api/evaluations/{job.job_id}/metrics/recalculate",
-            json={"excluded_sample_ids": ["bad"]},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["accuracy"], 1.0)
-        self.assertEqual(payload["recall"], 1.0)
-        self.assertEqual(payload["correct_count"], 1)
-        self.assertEqual(payload["sample_count"], 1)
-        self.assertEqual(payload["audio_duration_seconds"], 3.0)
-        self.assertEqual(payload["processing_elapsed_seconds"], 2.5)
-        self.assertEqual(payload["realtime_factor"], 1.2)
-        self.assertEqual(
-            [item["id"] for item in payload["lid_report"]["samples"]],
-            ["ok"],
-        )
-
-    def test_recalculate_denoise_metrics_excludes_selected_sample(self) -> None:
-        job = EvaluationJob(
-            job_id="test-denoise-recalculate",
-            request=EvaluationRequest(
-                task="denoise",
-                enable_mos=True,
-                mos_target="mos:50111",
-            ),
-            status="completed",
-        )
-        job.sample_records = {
-            "ok": {"id": "ok", "index": 1},
-            "bad": {"id": "bad", "index": 2},
-        }
-        job.denoise_report_samples = [
-            {
-                "id": "ok",
-                "index": 1,
-                "duration_seconds": 3.0,
-                "original_snr": 10.0,
-                "denoised_snr": 12.0,
-                "snr_delta": 2.0,
-                "original_mos": 3.0,
-                "denoised_mos": 3.5,
-                "mos_delta": 0.5,
-            },
-            {
-                "id": "bad",
-                "index": 2,
-                "duration_seconds": 5.0,
-                "original_snr": 9.0,
-                "denoised_snr": 8.0,
-                "snr_delta": -1.0,
-                "original_mos": 2.0,
-                "denoised_mos": 1.5,
-                "mos_delta": -0.5,
-            },
-        ]
-        job.result = {"processing_elapsed_seconds": 2.0}
-        _put_job(job)
-
-        response = client.post(
-            f"/api/evaluations/{job.job_id}/metrics/recalculate",
-            json={"excluded_sample_ids": ["bad"]},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["mean_snr_delta"], 2.0)
-        self.assertEqual(payload["mean_mos_delta"], 0.5)
-        self.assertEqual(payload["included_sample_count"], 1)
-        self.assertEqual(payload["excluded_sample_ids"], ["bad"])
-        self.assertEqual(payload["audio_duration_seconds"], 3.0)
-        self.assertEqual(
-            [item["id"] for item in payload["denoise_report"]["samples"]],
-            ["ok"],
-        )
-
-    def test_recalculate_lid_metrics_uses_macro_recall_by_reference_language(self) -> None:
-        job = EvaluationJob(
-            job_id="test-lid-macro-recall",
-            request=EvaluationRequest(task="lid"),
-            status="completed",
-        )
-        job.sample_records = {
-            "en-ok": {"id": "en-ok", "index": 1},
-            "en-bad": {"id": "en-bad", "index": 2},
-            "zh-ok": {"id": "zh-ok", "index": 3},
-        }
-        job.lid_report_samples = [
-            {
-                "id": "en-ok",
-                "index": 1,
-                "duration_seconds": 1.0,
-                "reference_language": "en",
-                "predicted_language": "en",
-                "raw_language": "en",
-                "confidence": 0.9,
-                "correct": True,
-            },
-            {
-                "id": "en-bad",
-                "index": 2,
-                "duration_seconds": 1.0,
-                "reference_language": "en",
-                "predicted_language": "zh",
-                "raw_language": "zh",
-                "confidence": 0.8,
-                "correct": False,
-            },
-            {
-                "id": "zh-ok",
-                "index": 3,
-                "duration_seconds": 1.0,
-                "reference_language": "zh",
-                "predicted_language": "zh",
-                "raw_language": "zh",
-                "confidence": 0.9,
-                "correct": True,
-            },
-        ]
-        _put_job(job)
-
-        response = client.post(
-            f"/api/evaluations/{job.job_id}/metrics/recalculate",
-            json={"excluded_sample_ids": []},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["accuracy"], 2 / 3)
-        self.assertEqual(payload["recall"], 0.75)
+            with self.assertRaisesRegex(ValueError, "单关键词"):
+                _load_keyword_dataset(
+                    dataset_dir,
+                    split="test",
+                    limit=None,
+                    sample_rate=16000,
+                )
 
     def test_lid_metrics_use_strict_language_labels(self) -> None:
         report = _build_lid_report(
@@ -347,6 +252,10 @@ class HttpRecalculateTest(unittest.TestCase):
             report["lid_report"]["samples"][0]["predicted_language"],
             "zh",
         )
+
+    def test_lid_prediction_uses_confidence_threshold_for_unknown_reject(self) -> None:
+        self.assertEqual(_lid_predicted_language("en", 0.89, 0.9), "<others>")
+        self.assertEqual(_lid_predicted_language("en", 0.9, 0.9), "en")
 
     def test_sqa_request_requires_target_when_enabled(self) -> None:
         with self.assertRaises(ValueError):
@@ -520,7 +429,7 @@ class HttpRecalculateTest(unittest.TestCase):
             return channel
 
         with (
-            patch("prama_server.servicer.http.grpc.insecure_channel", fake_channel),
+            patch("prama_server.servicer.http.create_insecure_channel", fake_channel),
             patch("prama_server.servicer.http.grpc.channel_ready_future", fake_ready_future),
         ):
             ok_response = client.post(
@@ -542,42 +451,15 @@ class HttpRecalculateTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["title"], "数据集格式说明")
+        self.assertEqual(payload["title"], "数据集与评估指标说明")
         self.assertIn("```jsonl", payload["markdown"])
+        self.assertIn("## 目录", payload["markdown"])
         self.assertIn("ASR 数据集", payload["markdown"])
         self.assertIn("VAD 数据集", payload["markdown"])
         self.assertIn("LID 数据集", payload["markdown"])
         self.assertIn("SE 评估数据集", payload["markdown"])
-
-    def test_recalculate_with_all_samples_excluded_returns_empty_report(self) -> None:
-        job = EvaluationJob(
-            job_id="test-recalculate-empty",
-            request=EvaluationRequest(task="asr"),
-            status="completed",
-        )
-        job.sample_records = {"only": {"id": "only", "index": 1}}
-        job.asr_inference_rows = [
-            {
-                "id": "only",
-                "index": 1,
-                "reference": "hello",
-                "hypothesis": "world",
-            }
-        ]
-        _put_job(job)
-
-        response = client.post(
-            f"/api/evaluations/{job.job_id}/metrics/recalculate",
-            json={"excluded_sample_ids": ["only"]},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["wer"], 0.0)
-        self.assertEqual(payload["cer"], 0.0)
-        self.assertEqual(payload["wer_report"]["utterances"], [])
-        self.assertEqual(payload["cer_report"]["utterances"], [])
-        self.assertEqual(payload["included_sample_count"], 0)
+        self.assertIn("## 评估指标定义", payload["markdown"])
+        self.assertIn("\\mathrm{Accuracy}_{\\mathrm{known}}", payload["markdown"])
 
     def test_asr_alignment_reports_include_word_and_character_tokens(self) -> None:
         rows = [

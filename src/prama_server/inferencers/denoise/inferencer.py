@@ -5,6 +5,7 @@ import logging
 import grpc
 import numpy as np
 
+from prama_server.inferencers.grpc_options import create_insecure_channel
 from prama_server.protos.denoise import ux_denoise_pb2, ux_denoise_pb2_grpc
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ class DenoiseGrpcInferencer:
         self.target = target
         self.sample_rate = sample_rate
         self.request_timeout_seconds = request_timeout_seconds
-        self.channel = grpc.insecure_channel(target)
+        self.channel = create_insecure_channel(target)
         if connect_timeout_seconds is not None:
             grpc.channel_ready_future(self.channel).result(
                 timeout=connect_timeout_seconds

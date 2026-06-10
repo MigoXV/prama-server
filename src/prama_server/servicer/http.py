@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import tempfile
@@ -36,6 +37,7 @@ from prama_server.evaluator import (
 from prama_server.evaluator.vad import VadEvaluator
 from prama_server.inferencers.asr import AsrGrpcInferencer
 from prama_server.inferencers.denoise import DenoiseGrpcInferencer
+from prama_server.inferencers.grpc_options import create_insecure_channel
 from prama_server.inferencers.lid import LidGrpcInferencer
 from prama_server.inferencers.sqa import SqaGrpcInferencer
 from prama_server.inferencers.vad import VadGrpcInferencer
@@ -45,7 +47,8 @@ from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, Messa
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "completed", "failed"]
-EvaluationTask = Literal["asr", "vad", "lid", "denoise"]
+EvaluationTask = Literal["asr", "vad", "lid", "denoise", "keyword"]
+LID_UNKNOWN_LANGUAGE = "<others>"
 
 
 class EvaluationRequest(BaseModel):
@@ -112,13 +115,6 @@ class EvaluationRequest(BaseModel):
 class EvaluationCreated(BaseModel):
     job_id: str
     status: JobStatus
-
-
-class RecalculateMetricsRequest(BaseModel):
-    excluded_sample_ids: list[str] = Field(
-        default_factory=list,
-        description="不参与指标重算的样本 ID",
-    )
 
 
 class EngineConnectivityRequest(BaseModel):
@@ -272,6 +268,7 @@ class EvaluationJob:
     sample_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     asr_inference_rows: list[dict[str, Any]] = field(default_factory=list)
     denoise_report_samples: list[dict[str, Any]] = field(default_factory=list)
+    keyword_report_samples: list[dict[str, Any]] = field(default_factory=list)
     lid_report_samples: list[dict[str, Any]] = field(default_factory=list)
     vad_metric_rows: list[dict[str, Any]] = field(default_factory=list)
     vad_report_samples: list[dict[str, Any]] = field(default_factory=list)
@@ -320,7 +317,7 @@ def get_help_document() -> HelpDocument:
     if not help_path.exists():
         raise HTTPException(status_code=404, detail="帮助文档不存在")
     return HelpDocument(
-        title="数据集格式说明",
+        title="数据集与评估指标说明",
         markdown=help_path.read_text(encoding="utf-8"),
     )
 
@@ -435,7 +432,7 @@ def test_engine_connectivity(
     target = request.target.strip()
     if not target:
         raise HTTPException(status_code=400, detail="引擎地址不能为空")
-    channel = grpc.insecure_channel(target)
+    channel = create_insecure_channel(target)
     try:
         grpc.channel_ready_future(channel).result(timeout=request.timeout_seconds)
     except Exception as exc:  # noqa: BLE001 - 返回连通性错误详情给前端
@@ -490,41 +487,6 @@ def get_sample_denoised_audio(job_id: str, sample_id: str) -> FileResponse:
         media_type=_audio_media_type(audio_path),
         filename=audio_path.name,
     )
-
-
-@app.post("/api/evaluations/{job_id}/metrics/recalculate")
-def recalculate_evaluation_metrics(
-    job_id: str,
-    request: RecalculateMetricsRequest,
-) -> dict[str, Any]:
-    job = _get_job(job_id)
-    with job.lock:
-        if job.status != "completed":
-            raise HTTPException(status_code=409, detail="只能在评估完成后重新计算指标")
-        excluded_sample_ids = set(request.excluded_sample_ids)
-        unknown_ids = sorted(excluded_sample_ids - set(job.sample_records))
-        if unknown_ids:
-            raise HTTPException(
-                status_code=404,
-                detail=f"样本不存在: {', '.join(unknown_ids)}",
-            )
-
-        if job.request.task == "vad":
-            result = _recalculate_vad_result(job, excluded_sample_ids)
-        elif job.request.task == "lid":
-            result = _recalculate_lid_result(job, excluded_sample_ids)
-        elif job.request.task == "denoise":
-            result = _recalculate_denoise_result(job, excluded_sample_ids)
-        else:
-            result = _recalculate_asr_result(job, excluded_sample_ids)
-        job.result = result
-
-    logger.info(
-        "评估指标已重算: job_id=%s excluded=%s",
-        job_id,
-        len(excluded_sample_ids),
-    )
-    return result
 
 
 @app.get("/api/evaluations/{job_id}/events")
@@ -694,6 +656,9 @@ def _run_evaluation(job: EvaluationJob) -> None:
         if request.task == "denoise":
             _run_denoise_evaluation(job)
             return
+        if request.task == "keyword":
+            _run_keyword_evaluation(job)
+            return
 
         sqa_assessor = SqaAssessor(request)
         inferencer = AsrGrpcInferencer(
@@ -826,7 +791,6 @@ def _run_evaluation(job: EvaluationJob) -> None:
             ),
             **_sample_count_payload(
                 included_count=len(inference_rows),
-                excluded_sample_ids=set(),
                 total_count=len(inference_rows),
             ),
             **_sqa_summary_payload(inference_rows),
@@ -852,6 +816,139 @@ def _run_evaluation(job: EvaluationJob) -> None:
         if request.task == "asr" and "sqa_assessor" in locals():
             sqa_assessor.close()
         message_manager.close_job(job.job_id)
+
+
+def _run_keyword_evaluation(job: EvaluationJob) -> None:
+    request = job.request
+    sqa_assessor = SqaAssessor(request)
+    inferencer = AsrGrpcInferencer(
+        target=request.target,
+        sample_rate=request.sample_rate,
+        language_code=request.language_code,
+        hotwords=request.hotwords,
+        hotword_bias=request.hotword_bias,
+        request_timeout_seconds=request.request_timeout_seconds,
+        connect_timeout_seconds=request.connect_timeout_seconds,
+        interim_results=request.interim_results,
+    )
+    dataset = _load_keyword_dataset(
+        Path(request.dataset_path),
+        split=request.split,
+        limit=request.limit,
+        sample_rate=request.sample_rate,
+    )
+    total = len(dataset)
+    report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
+
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        keyword = str(sample["keyword"]).strip()
+        expected_hit = _as_bool(sample["expected_hit"])
+        audio_array, audio_sample_rate = _decode_sample_audio(sample["audio"])
+        if audio_sample_rate != request.sample_rate:
+            raise ValueError(
+                f"样本采样率与关键词评估配置不一致: id={sample_id} "
+                f"audio_sample_rate={audio_sample_rate} sample_rate={request.sample_rate}"
+            )
+        audio_array = _prepare_audio_for_export(audio_array)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=audio_sample_rate,
+        )
+        transcript = _infer_final_transcript(inferencer, audio_array)
+        match_text = _normalize_keyword_text(transcript)
+        predicted_hit = _keyword_matches(transcript, keyword)
+        correct = predicted_hit == expected_hit
+        report_sample = {
+            "id": sample_id,
+            "index": index,
+            "audio_url": sample_record.get("audio_url"),
+            "duration_seconds": sample_record.get("duration_seconds"),
+            "keyword": keyword,
+            "expected_hit": expected_hit,
+            "predicted_hit": predicted_hit,
+            "correct": correct,
+            "transcript": transcript,
+            "match_text": match_text,
+            "sqa_scores": sqa_assessor.assess(audio_array),
+        }
+        return {
+            "report_sample": report_sample,
+            "payload": {
+                "status": "running",
+                "tag": job.job_id,
+                "total": total,
+                "id": sample_id,
+                "current_id": sample_id,
+                "reference": f"{keyword}: {'hit' if expected_hit else 'no hit'}",
+                "hypothesis": "hit" if predicted_hit else "no hit",
+                "is_final": True,
+                "result": report_sample,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": report_sample.get("sqa_scores", []),
+            },
+        }
+
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        inference_concurrency = _task_inference_concurrency(request, "keyword")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        with job.lock:
+            job.status = "completed"
+            job.keyword_report_samples = report_samples
+            job.result = {
+                **_build_keyword_report(report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
+                **_sample_count_payload(
+                    included_count=len(report_samples),
+                    total_count=len(report_samples),
+                ),
+                **_sqa_summary_payload(report_samples),
+            }
+        logger.info("关键词评估任务完成: job_id=%s", job.job_id)
+    finally:
+        sqa_assessor.close()
+        inferencer.close()
 
 
 def _load_evaluation_dataset(
@@ -889,6 +986,111 @@ def _load_evaluation_dataset(
 
     logger.info("数据集已加载: size=%s", len(dataset))
     return dataset
+
+
+def _load_keyword_dataset(
+    dataset_path: Path,
+    *,
+    split: str,
+    limit: int | None,
+    sample_rate: int,
+) -> Dataset:
+    logger.info("加载关键词数据集: path=%s split=%s", dataset_path, split)
+    if _is_audiofolder_dataset_dir(dataset_path):
+        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
+    elif dataset_path.exists() and dataset_path.is_dir():
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            if split not in loaded:
+                available_splits = ", ".join(loaded.keys())
+                raise ValueError(
+                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
+                )
+            dataset = loaded[split]
+        else:
+            dataset = loaded
+    else:
+        dataset = load_dataset(str(dataset_path), split=split)
+
+    missing = sorted({"audio", "keyword", "expected_hit"} - set(dataset.column_names))
+    if missing:
+        raise ValueError(f"关键词数据集缺少必要字段: {', '.join(missing)}")
+
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+    if limit is not None:
+        dataset = dataset.select(range(min(limit, len(dataset))))
+
+    normalized_keywords = {
+        _normalize_keyword_text(str(sample["keyword"]))
+        for sample in dataset
+        if str(sample["keyword"]).strip()
+    }
+    if not normalized_keywords:
+        raise ValueError("关键词数据集必须提供非空 keyword")
+    if len(normalized_keywords) != 1:
+        raise ValueError("关键词数据集 v1 只支持单关键词")
+    for sample in dataset:
+        _as_bool(sample["expected_hit"])
+
+    logger.info("关键词数据集已加载: size=%s", len(dataset))
+    return dataset
+
+
+def _infer_final_transcript(
+    inferencer: AsrGrpcInferencer,
+    audio_array: np.ndarray,
+) -> str:
+    latest_transcript = ""
+    final_transcript = ""
+    for transcript, is_final in inferencer.infer(audio_array):
+        latest_transcript = transcript
+        if is_final:
+            final_transcript = transcript
+    return final_transcript or latest_transcript
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        if int(value) in (0, 1):
+            return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "hit"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "miss", "none"}:
+            return False
+    raise ValueError(f"expected_hit 必须是布尔值: {value!r}")
+
+
+def _normalize_keyword_text(text: str) -> str:
+    normalized = "".join(
+        " " if unicodedata.category(char).startswith("P") else char.lower()
+        for char in text
+    )
+    return " ".join(normalized.split())
+
+
+def _keyword_matches(transcript: str, keyword: str) -> bool:
+    normalized_transcript = _normalize_keyword_text(transcript)
+    normalized_keyword = _normalize_keyword_text(keyword)
+    if not normalized_keyword:
+        return False
+    if _is_word_keyword(normalized_keyword):
+        transcript_tokens = normalized_transcript.split()
+        keyword_tokens = normalized_keyword.split()
+        if not keyword_tokens or len(keyword_tokens) > len(transcript_tokens):
+            return False
+        return any(
+            transcript_tokens[index:index + len(keyword_tokens)] == keyword_tokens
+            for index in range(len(transcript_tokens) - len(keyword_tokens) + 1)
+        )
+    return normalized_keyword in normalized_transcript
+
+
+def _is_word_keyword(normalized_keyword: str) -> bool:
+    return re.fullmatch(r"[a-z0-9]+(?: [a-z0-9]+)*", normalized_keyword) is not None
 
 
 def remove_punctuation(text: str) -> str:
@@ -1200,7 +1402,6 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
                 ),
                 **_sample_count_payload(
                     included_count=len(rows),
-                    excluded_sample_ids=set(),
                     total_count=len(rows),
                 ),
                 **_sqa_summary_payload(report_samples),
@@ -1243,7 +1444,11 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
             sample_rate=request.sample_rate,
         )
         prediction = inferencer.infer(audio_array)
-        predicted_language = str(prediction.lang)
+        predicted_language = _lid_predicted_language(
+            prediction.lang,
+            prediction.score,
+            request.lid_confidence_threshold,
+        )
         correct = predicted_language == reference_language
         report_sample = {
             "id": sample_id,
@@ -1266,7 +1471,7 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
                 "id": sample_id,
                 "current_id": sample_id,
                 "reference": reference_language,
-                "hypothesis": f"{prediction.lang} ({prediction.score:.4f})",
+                "hypothesis": f"{predicted_language} ({prediction.score:.4f})",
                 "is_final": True,
                 "result": report_sample,
                 "audio_url": sample_record.get("audio_url"),
@@ -1321,7 +1526,6 @@ def _run_lid_evaluation(job: EvaluationJob) -> None:
                 ),
                 **_sample_count_payload(
                     included_count=len(report_samples),
-                    excluded_sample_ids=set(),
                     total_count=len(report_samples),
                 ),
                 **_sqa_summary_payload(report_samples),
@@ -1459,7 +1663,6 @@ def _run_denoise_evaluation(job: EvaluationJob) -> None:
                 ),
                 **_sample_count_payload(
                     included_count=len(report_samples),
-                    excluded_sample_ids=set(),
                     total_count=len(report_samples),
                 ),
             }
@@ -1729,26 +1932,162 @@ def _build_vad_report(
 
 
 def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    correct_count = sum(1 for sample in samples if sample.get("correct") is True)
     sample_count = len(samples)
     language_totals: dict[str, int] = {}
     language_hits: dict[str, int] = {}
+    confusion_counts: dict[str, dict[str, int]] = {}
+    known_correct_count = 0
+    known_sample_count = 0
+    overall_correct_count = 0
+    unknown_false_accept_count = 0
+    known_reject_count = 0
+
     for sample in samples:
         reference_language = str(sample.get("reference_language") or "")
+        predicted_language = str(sample.get("predicted_language") or "")
+        correct = predicted_language == reference_language
+        known_reference = reference_language != LID_UNKNOWN_LANGUAGE
+
         language_totals[reference_language] = language_totals.get(reference_language, 0) + 1
-        if sample.get("predicted_language") == reference_language:
+        confusion_counts.setdefault(reference_language, {})
+        confusion_counts[reference_language][predicted_language] = (
+            confusion_counts[reference_language].get(predicted_language, 0) + 1
+        )
+        if correct:
             language_hits[reference_language] = language_hits.get(reference_language, 0) + 1
-    recalls = [
-        _safe_divide_float(language_hits.get(language, 0), total)
-        for language, total in language_totals.items()
+            overall_correct_count += 1
+        if known_reference:
+            known_sample_count += 1
+            if correct:
+                known_correct_count += 1
+            if predicted_language == LID_UNKNOWN_LANGUAGE:
+                known_reject_count += 1
+        elif predicted_language != LID_UNKNOWN_LANGUAGE:
+            unknown_false_accept_count += 1
+
+    reference_languages = _sort_lid_languages(language_totals)
+    predicted_languages = _sort_lid_languages(
+        {
+            predicted_language: 1
+            for predictions in confusion_counts.values()
+            for predicted_language in predictions
+        }
+    )
+    all_language_recalls = [
+        {
+            "language": language,
+            "correct_count": language_hits.get(language, 0),
+            "sample_count": language_totals[language],
+            "recall": _safe_divide_float(
+                language_hits.get(language, 0),
+                language_totals[language],
+            ),
+        }
+        for language in reference_languages
     ]
+    known_language_recalls = [
+        item
+        for item in all_language_recalls
+        if item["language"] != LID_UNKNOWN_LANGUAGE
+    ]
+    macro_recall = (
+        sum(item["recall"] for item in known_language_recalls)
+        / len(known_language_recalls)
+        if known_language_recalls
+        else 0.0
+    )
+    known_accuracy = _safe_divide_float(known_correct_count, known_sample_count)
     return {
-        "accuracy": _safe_divide_float(correct_count, sample_count),
-        "recall": sum(recalls) / len(recalls) if recalls else 0.0,
-        "correct_count": correct_count,
+        "accuracy": known_accuracy,
+        "recall": macro_recall,
+        "known_accuracy": known_accuracy,
+        "macro_recall": macro_recall,
+        "known_correct_count": known_correct_count,
+        "known_sample_count": known_sample_count,
+        "overall_correct_count": overall_correct_count,
+        "unknown_false_accept_count": unknown_false_accept_count,
+        "known_reject_count": known_reject_count,
+        "lid_language_recalls": known_language_recalls,
+        "lid_confusion_matrix": {
+            "reference_languages": reference_languages,
+            "predicted_languages": predicted_languages,
+            "rows": [
+                {
+                    "reference_language": reference_language,
+                    "total": language_totals[reference_language],
+                    "counts": {
+                        predicted_language: confusion_counts.get(
+                            reference_language,
+                            {},
+                        ).get(predicted_language, 0)
+                        for predicted_language in predicted_languages
+                    },
+                }
+                for reference_language in reference_languages
+            ],
+        },
+        "correct_count": overall_correct_count,
         "sample_count": sample_count,
         "lid_report": {"samples": samples},
     }
+
+
+def _build_keyword_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    hit_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is True and sample.get("predicted_hit") is True
+    )
+    miss_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is True and sample.get("predicted_hit") is False
+    )
+    false_alarm_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is False and sample.get("predicted_hit") is True
+    )
+    correct_reject_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is False and sample.get("predicted_hit") is False
+    )
+    positive_sample_count = hit_count + miss_count
+    negative_sample_count = false_alarm_count + correct_reject_count
+    correct_count = hit_count + correct_reject_count
+    precision = _safe_divide_float(hit_count, hit_count + false_alarm_count)
+    recall = _safe_divide_float(hit_count, positive_sample_count)
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall > 0
+        else 0.0
+    )
+    sample_count = len(samples)
+    return {
+        "accuracy": _safe_divide_float(correct_count, sample_count),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "hit_count": hit_count,
+        "miss_count": miss_count,
+        "false_alarm_count": false_alarm_count,
+        "correct_reject_count": correct_reject_count,
+        "positive_sample_count": positive_sample_count,
+        "negative_sample_count": negative_sample_count,
+        "correct_count": correct_count,
+        "sample_count": sample_count,
+        "keyword_report": {"samples": samples},
+    }
+
+
+def _sort_lid_languages(language_counts: dict[str, int]) -> list[str]:
+    languages = sorted(language for language in language_counts if language)
+    if LID_UNKNOWN_LANGUAGE in languages:
+        languages = [
+            language for language in languages if language != LID_UNKNOWN_LANGUAGE
+        ] + [LID_UNKNOWN_LANGUAGE]
+    return languages
 
 
 def _build_denoise_sample_payload(
@@ -1806,54 +2145,6 @@ def _build_denoise_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _recalculate_asr_result(
-    job: EvaluationJob,
-    excluded_sample_ids: set[str],
-) -> dict[str, Any]:
-    rows = [
-        _with_sample_audio_payload(job, row)
-        for row in job.asr_inference_rows
-        if str(row["id"]) not in excluded_sample_ids
-    ]
-    metrics = _build_asr_metrics(rows)
-    wer_report = _build_wer_report(rows)
-    cer_report = _build_cer_report(rows)
-    return {
-        **metrics,
-        "wer_report": wer_report,
-        "cer_report": cer_report,
-        **_recalculated_performance_payload(
-            job=job,
-            audio_duration_seconds=_sum_row_duration(rows),
-        ),
-        **_sample_count_payload(
-            included_count=len(rows),
-            excluded_sample_ids=excluded_sample_ids,
-            total_count=len(job.asr_inference_rows),
-        ),
-        **_sqa_summary_payload(rows),
-    }
-
-
-def _with_sample_audio_payload(
-    job: EvaluationJob,
-    row: dict[str, Any],
-) -> dict[str, Any]:
-    record = _get_sample_record_for_result(
-        job,
-        sample_id=str(row["id"]),
-        index=int(row.get("index") or 0),
-    )
-    if not record:
-        return row
-    return {
-        **row,
-        "audio_url": row.get("audio_url") or record.get("audio_url"),
-        "duration_seconds": row.get("duration_seconds")
-        or record.get("duration_seconds"),
-    }
-
-
 def _build_asr_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     if not rows:
         return {"wer": 0.0, "cer": 0.0}
@@ -1873,92 +2164,13 @@ def _build_asr_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
-def _recalculate_vad_result(
-    job: EvaluationJob,
-    excluded_sample_ids: set[str],
-) -> dict[str, Any]:
-    rows = [
-        row
-        for row in job.vad_metric_rows
-        if str(row["id"]) not in excluded_sample_ids
-    ]
-    samples = [
-        sample
-        for sample in job.vad_report_samples
-        if str(sample["id"]) not in excluded_sample_ids
-    ]
-    return {
-        **_build_vad_report(rows, samples=samples),
-        **_recalculated_performance_payload(
-            job=job,
-            audio_duration_seconds=_sum_sample_duration(samples),
-        ),
-        **_sample_count_payload(
-            included_count=len(rows),
-            excluded_sample_ids=excluded_sample_ids,
-            total_count=len(job.vad_metric_rows),
-        ),
-        **_sqa_summary_payload(samples),
-    }
-
-
-def _recalculate_lid_result(
-    job: EvaluationJob,
-    excluded_sample_ids: set[str],
-) -> dict[str, Any]:
-    samples = [
-        sample
-        for sample in job.lid_report_samples
-        if str(sample["id"]) not in excluded_sample_ids
-    ]
-    return {
-        **_build_lid_report(samples),
-        **_recalculated_performance_payload(
-            job=job,
-            audio_duration_seconds=_sum_sample_duration(samples),
-        ),
-        **_sample_count_payload(
-            included_count=len(samples),
-            excluded_sample_ids=excluded_sample_ids,
-            total_count=len(job.lid_report_samples),
-        ),
-        **_sqa_summary_payload(samples),
-    }
-
-
-def _recalculate_denoise_result(
-    job: EvaluationJob,
-    excluded_sample_ids: set[str],
-) -> dict[str, Any]:
-    samples = [
-        sample
-        for sample in job.denoise_report_samples
-        if str(sample["id"]) not in excluded_sample_ids
-    ]
-    return {
-        **_build_denoise_report(samples),
-        **_recalculated_performance_payload(
-            job=job,
-            audio_duration_seconds=_sum_sample_duration(samples),
-        ),
-        **_sample_count_payload(
-            included_count=len(samples),
-            excluded_sample_ids=excluded_sample_ids,
-            total_count=len(job.denoise_report_samples),
-        ),
-    }
-
-
 def _sample_count_payload(
     *,
     included_count: int,
-    excluded_sample_ids: set[str],
     total_count: int,
 ) -> dict[str, Any]:
     return {
         "included_sample_count": included_count,
-        "excluded_sample_count": len(excluded_sample_ids),
-        "excluded_sample_ids": sorted(excluded_sample_ids),
         "total_sample_count": total_count,
     }
 
@@ -1977,24 +2189,6 @@ def _performance_payload(
         "processing_elapsed_seconds": processing_elapsed_seconds,
         "realtime_factor": realtime_factor,
     }
-
-
-def _recalculated_performance_payload(
-    *,
-    job: EvaluationJob,
-    audio_duration_seconds: float,
-) -> dict[str, float]:
-    result = job.result or {}
-    elapsed = _as_float(result.get("processing_elapsed_seconds"))
-    if elapsed is None:
-        return _performance_payload(
-            audio_duration_seconds=audio_duration_seconds,
-            processing_elapsed_seconds=0.0,
-        )
-    return _performance_payload(
-        audio_duration_seconds=audio_duration_seconds,
-        processing_elapsed_seconds=elapsed,
-    )
 
 
 def _sum_row_duration(rows: list[dict[str, Any]]) -> float:
@@ -2115,7 +2309,8 @@ def _lid_predicted_language(
     confidence: float,
     threshold: float,
 ) -> str:
-    del confidence, threshold
+    if confidence < threshold:
+        return LID_UNKNOWN_LANGUAGE
     return str(raw_language)
 
 def _task_inference_concurrency(
@@ -2123,6 +2318,8 @@ def _task_inference_concurrency(
     task: EvaluationTask,
 ) -> int:
     if task == "asr":
+        return request.asr_inference_concurrency or request.inference_concurrency
+    if task == "keyword":
         return request.asr_inference_concurrency or request.inference_concurrency
     if task == "vad":
         return request.vad_inference_concurrency or request.inference_concurrency

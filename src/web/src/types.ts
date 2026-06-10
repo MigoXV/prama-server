@@ -1,7 +1,7 @@
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 
 export type ThemeMode = "system" | "light" | "dark";
-export type EvaluationTask = "asr" | "vad" | "lid" | "denoise";
+export type EvaluationTask = "asr" | "vad" | "lid" | "denoise" | "keyword";
 
 export interface HelpDocument {
   title: string;
@@ -91,6 +91,8 @@ export interface EvaluationResult {
   cer?: number;
   accuracy?: number;
   recall?: number;
+  known_accuracy?: number;
+  macro_recall?: number;
   frame?: VadFrameMetrics;
   segment?: VadSegmentMetrics;
   frame_accuracy?: number;
@@ -103,10 +105,23 @@ export interface EvaluationResult {
   prediction_segment_count?: number;
   sample_count?: number;
   included_sample_count?: number;
-  excluded_sample_count?: number;
-  excluded_sample_ids?: string[];
   total_sample_count?: number;
   correct_count?: number;
+  known_correct_count?: number;
+  known_sample_count?: number;
+  overall_correct_count?: number;
+  unknown_false_accept_count?: number;
+  known_reject_count?: number;
+  precision?: number;
+  f1?: number;
+  hit_count?: number;
+  miss_count?: number;
+  false_alarm_count?: number;
+  correct_reject_count?: number;
+  positive_sample_count?: number;
+  negative_sample_count?: number;
+  lid_language_recalls?: LidLanguageRecall[];
+  lid_confusion_matrix?: LidConfusionMatrix;
   audio_duration_seconds?: number;
   processing_elapsed_seconds?: number;
   realtime_factor?: number;
@@ -115,8 +130,27 @@ export interface EvaluationResult {
   vad_report?: VadReport;
   lid_report?: LidReport;
   denoise_report?: DenoiseReport;
+  keyword_report?: KeywordReport;
   sqa_summary?: SqaSummary[];
   [key: string]: unknown;
+}
+
+export interface KeywordReport {
+  samples: KeywordReportSample[];
+}
+
+export interface KeywordReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  keyword: string;
+  expected_hit: boolean;
+  predicted_hit: boolean;
+  correct: boolean;
+  transcript: string;
+  match_text: string;
+  sqa_scores?: SqaScore[];
 }
 
 export interface DenoiseReport {
@@ -138,11 +172,29 @@ export interface DenoiseReportSample {
   denoised_mos?: number | null;
   mos_delta?: number | null;
   error?: string | null;
-  excluded?: boolean;
 }
 
 export interface LidReport {
   samples: LidReportSample[];
+}
+
+export interface LidLanguageRecall {
+  language: string;
+  correct_count: number;
+  sample_count: number;
+  recall: number;
+}
+
+export interface LidConfusionMatrix {
+  reference_languages: string[];
+  predicted_languages: string[];
+  rows: LidConfusionMatrixRow[];
+}
+
+export interface LidConfusionMatrixRow {
+  reference_language: string;
+  total: number;
+  counts: Record<string, number>;
 }
 
 export interface LidReportSample {
@@ -155,7 +207,6 @@ export interface LidReportSample {
   raw_language: string;
   confidence: number;
   correct: boolean;
-  excluded?: boolean;
   sqa_scores?: SqaScore[];
 }
 
@@ -202,7 +253,6 @@ export interface VadReportSample {
   duration_seconds: number;
   frame_seconds: number;
   audio_url?: string;
-  excluded?: boolean;
   metrics?: EvaluationResult;
   sqa_scores?: SqaScore[];
   reference_segments: VadReportSegment[];
@@ -254,7 +304,6 @@ export interface WerUtterance {
   index?: number;
   audio_url?: string;
   duration_seconds?: number;
-  excluded?: boolean;
   sqa_scores?: SqaScore[];
   summary?: WerSummary;
   tokens: WerToken[];
@@ -275,7 +324,6 @@ export interface InferenceRow {
   hypothesis: string;
   audioUrl?: string;
   durationSeconds?: number;
-  excluded?: boolean;
 }
 
 export interface EvaluationFormState {

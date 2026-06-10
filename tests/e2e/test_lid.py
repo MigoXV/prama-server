@@ -4,9 +4,10 @@ import logging
 import wave
 from pathlib import Path
 
-import grpc
 from google.protobuf.json_format import MessageToJson
 
+import grpc
+from prama_server.inferencers.grpc_options import create_insecure_channel
 from prama_server.protos.lid import lid_pb2, lid_pb2_grpc
 
 logging.basicConfig(
@@ -36,7 +37,7 @@ def main() -> None:
         len(pcm),
     )
 
-    with grpc.insecure_channel(TARGET) as channel:
+    with create_insecure_channel(TARGET) as channel:
         grpc.channel_ready_future(channel).result(timeout=REQUEST_TIMEOUT_SECONDS)
         stub = lid_pb2_grpc.LidServiceStub(channel)
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import grpc
 import numpy as np
 
+from prama_server.inferencers.grpc_options import create_insecure_channel
 from prama_server.protos.lid import lid_pb2, lid_pb2_grpc
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ class LidGrpcInferencer:
         self.request_timeout_seconds = request_timeout_seconds
         self.max_retries = max_retries
         self.retry_delay_seconds = retry_delay_seconds
-        self.channel = grpc.insecure_channel(target)
+        self.channel = create_insecure_channel(target)
         if connect_timeout_seconds is not None:
             grpc.channel_ready_future(self.channel).result(
                 timeout=connect_timeout_seconds
