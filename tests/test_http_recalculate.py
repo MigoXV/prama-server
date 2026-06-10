@@ -186,7 +186,7 @@ class HttpReportMetricsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             EvaluationRequest(task="keyword", enable_mos=True, mos_target="")
 
-    def test_keyword_dataset_requires_keyword_expected_hit_and_single_keyword(self) -> None:
+    def test_keyword_dataset_requires_keyword_expected_hit_and_allows_multiple_keywords(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             dataset_dir = root / "keyword"
@@ -217,13 +217,13 @@ class HttpReportMetricsTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "单关键词"):
-                _load_keyword_dataset(
-                    dataset_dir,
-                    split="test",
-                    limit=None,
-                    sample_rate=16000,
-                )
+            dataset = _load_keyword_dataset(
+                dataset_dir,
+                split="test",
+                limit=None,
+                sample_rate=16000,
+            )
+            self.assertEqual(len(dataset), 2)
 
     def test_lid_metrics_use_strict_language_labels(self) -> None:
         report = _build_lid_report(

@@ -1027,12 +1027,14 @@ def _load_keyword_dataset(
     }
     if not normalized_keywords:
         raise ValueError("关键词数据集必须提供非空 keyword")
-    if len(normalized_keywords) != 1:
-        raise ValueError("关键词数据集 v1 只支持单关键词")
     for sample in dataset:
         _as_bool(sample["expected_hit"])
 
-    logger.info("关键词数据集已加载: size=%s", len(dataset))
+    logger.info(
+        "关键词数据集已加载: size=%s keyword_count=%s",
+        len(dataset),
+        len(normalized_keywords),
+    )
     return dataset
 
 
