@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from prama_server.utils.trim_vad_data import trim_vad_dataset
+from prama_server.utils.trim import trim_vad_dataset
 
 
 class TrimVadDatasetTest(unittest.TestCase):

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import typer
 
-from prama_server.utils.trim_vad_data.core import trim_vad_dataset
+from prama_server.utils.trim.core import trim_vad_dataset
 
 logging.basicConfig(
     level=logging.INFO,
