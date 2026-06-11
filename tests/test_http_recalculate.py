@@ -105,7 +105,9 @@ class HttpReportMetricsTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["accuracy"], 1 / 3)
+        self.assertEqual(payload["precision"], 0.25)
         self.assertEqual(payload["known_accuracy"], 1 / 3)
+        self.assertEqual(payload["macro_precision"], 0.25)
         self.assertEqual(payload["recall"], 0.25)
         self.assertEqual(payload["macro_recall"], 0.25)
         self.assertEqual(payload["known_correct_count"], 1)
@@ -115,10 +117,16 @@ class HttpReportMetricsTest(unittest.TestCase):
         self.assertEqual(payload["known_reject_count"], 1)
         self.assertEqual(
             {
-                item["language"]: (item["correct_count"], item["sample_count"], item["recall"])
+                item["language"]: (
+                    item["correct_count"],
+                    item["sample_count"],
+                    item["predicted_count"],
+                    item["precision"],
+                    item["recall"],
+                )
                 for item in payload["lid_language_recalls"]
             },
-            {"cn": (0, 1, 0.0), "en": (1, 2, 0.5)},
+            {"cn": (0, 1, 1, 0.0, 0.0), "en": (1, 2, 2, 0.5, 0.5)},
         )
         confusion_rows = {
             row["reference_language"]: row["counts"]
@@ -246,6 +254,7 @@ class HttpReportMetricsTest(unittest.TestCase):
         )
 
         self.assertEqual(report["accuracy"], 0.5)
+        self.assertEqual(report["precision"], 0.5)
         self.assertEqual(report["recall"], 0.5)
         self.assertFalse(report["lid_report"]["samples"][0]["correct"])
         self.assertEqual(
@@ -459,7 +468,7 @@ class HttpReportMetricsTest(unittest.TestCase):
         self.assertIn("LID 数据集", payload["markdown"])
         self.assertIn("SE 评估数据集", payload["markdown"])
         self.assertIn("## 评估指标定义", payload["markdown"])
-        self.assertIn("\\mathrm{Accuracy}_{\\mathrm{known}}", payload["markdown"])
+        self.assertIn("\\mathrm{Precision}_{\\mathrm{macro}}", payload["markdown"])
 
     def test_asr_alignment_reports_include_word_and_character_tokens(self) -> None:
         rows = [

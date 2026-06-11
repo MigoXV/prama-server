@@ -1855,10 +1855,8 @@ function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
 
   return (
     <div className="metric-strip lid-overview-metrics">
-      <Metric label="已知语种准确率" value={formatRate(result.known_accuracy ?? result.accuracy)} />
-      <Metric label="宏平均召回率" value={formatRate(result.macro_recall ?? result.recall)} />
-      <Metric label="未知误接收" value={formatNumber(result.unknown_false_accept_count)} />
-      <Metric label="已知被拒识" value={formatNumber(result.known_reject_count)} />
+      <Metric label="精确率" value={formatRate(result.macro_precision ?? result.precision)} />
+      <Metric label="召回率" value={formatRate(result.macro_recall ?? result.recall)} />
     </div>
   );
 }
@@ -2166,20 +2164,12 @@ function LidReportPanel({
         <>
           <div className="report-summary lid-summary">
             <Metric
-              label="已知语种准确率"
-              value={formatRate(result.known_accuracy ?? result.accuracy)}
+              label="精确率"
+              value={formatRate(result.macro_precision ?? result.precision)}
             />
             <Metric
-              label="宏平均召回率"
+              label="召回率"
               value={formatRate(result.macro_recall ?? result.recall)}
-            />
-            <Metric
-              label="未知误接收"
-              value={formatNumber(result.unknown_false_accept_count)}
-            />
-            <Metric
-              label="已知被拒识"
-              value={formatNumber(result.known_reject_count)}
             />
           </div>
           <CompactReportMeta result={result} fallbackCount={samples.length} />
@@ -2423,13 +2413,10 @@ function LidMetricsDetails({ result }: { result: EvaluationResult }) {
   return (
     <details className="lid-metrics-details">
       <summary>
-        <span>类别召回率与混淆矩阵</span>
+        <span>类别指标与混淆矩阵</span>
         <small>
           {recalls.length} 类 / 正确 {formatNumber(overallCorrect)} / 错误{" "}
-          {formatNumber(errorCount)} / 未知误接收{" "}
-          {formatNumber(result.unknown_false_accept_count)}
-          {" / "}
-          已知拒识 {formatNumber(result.known_reject_count)}
+          {formatNumber(errorCount)}
         </small>
       </summary>
       <div className="lid-metrics-scroll">
@@ -2455,7 +2442,7 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
       {recalls.length ? (
         <section className="metric-table-section">
           <div className="metric-table-heading">
-            <h3>类别召回率</h3>
+            <h3>类别指标</h3>
           </div>
           <div className="table-wrap lid-recall-table">
             <table>
@@ -2464,6 +2451,8 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
                   <th>真实标签</th>
                   <th>正确数</th>
                   <th>真实总数</th>
+                  <th>预测总数</th>
+                  <th>精确率</th>
                   <th>召回率</th>
                 </tr>
               </thead>
@@ -2476,6 +2465,8 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
                     <td title={item.language}>{item.language || "-"}</td>
                     <td>{formatNumber(item.correct_count)}</td>
                     <td>{formatNumber(item.sample_count)}</td>
+                    <td>{formatNumber(item.predicted_count)}</td>
+                    <td>{formatRate(item.precision)}</td>
                     <td>{formatRate(item.recall)}</td>
                   </tr>
                 ))}

@@ -208,14 +208,13 @@ LID 按开放集识别计算。真实标签为 `<others>` 的样本是未知语�
 
 | 指标 | 定义 | 分母 |
 | --- | --- | --- |
-| 已知语种准确率 | 真实标签不是 `<others>` 且预测正确的样本比例 | 真实已知语种样本数 |
+| 类别精确率 | 某个有效已知语种预测标签下预测正确的样本比例；真实 `<others>` 被预测为该语种时会进入分母 | 预测为该有效类别的样本数 |
+| 精确率 | 仅对有效已知语种的类别精确率取算术平均 | 真实已知语种类别数 |
 | 类别召回率 | 某个有效已知语种真实标签下预测正确的样本比例；`<others>` 不计算召回率 | 该有效类别真实样本数 |
-| 宏平均召回率 | 仅对真实标签不是 `<others>` 的有效类别召回率取算术平均 | 真实已知语种类别数 |
-| 未知误接收 | 真实 `<others>` 干扰样本被预测为已知语种的样本数 | 不做比例化 |
-| 已知被拒识 | 真实已知语种被预测为 `<others>` 的样本数 | 不做比例化 |
+| 召回率 | 仅对有效已知语种的类别召回率取算术平均 | 真实已知语种类别数 |
 
 $$
-\mathrm{Accuracy}_{\mathrm{known}} = \frac{\mathrm{Correct}_{\mathrm{known}}}{\mathrm{Total}_{\mathrm{known}}}
+\mathrm{Precision}_{\mathrm{label}} = \frac{\mathrm{Correct}_{\mathrm{label}}}{\mathrm{Predicted}_{\mathrm{label}}}
 $$
 
 $$
@@ -223,10 +222,14 @@ $$
 $$
 
 $$
+\mathrm{Precision}_{\mathrm{macro}} = \frac{\sum_{\ell \in \mathcal{K}} \mathrm{Precision}_{\ell}}{|\mathcal{K}|}, \quad \mathcal{K}=\{\ell \mid \ell \ne \langle others \rangle\}
+$$
+
+$$
 \mathrm{Recall}_{\mathrm{macro}} = \frac{\sum_{\ell \in \mathcal{K}} \mathrm{Recall}_{\ell}}{|\mathcal{K}|}, \quad \mathcal{K}=\{\ell \mid \ell \ne \langle others \rangle\}
 $$
 
-`<others>` 是干扰集，不计算类别召回率，也不进入宏平均召回率。它仍保留在混淆矩阵中：`<others>` 行表示干扰样本是否被正确拒识；`<others>` 列表示已知语种是否被错误拒识。
+`<others>` 是干扰集，不作为有效类别进入宏平均精确率和召回率。它仍保留在混淆矩阵中：`<others>` 行表示干扰样本是否被正确拒识；`<others>` 列表示已知语种是否被错误拒识。
 
 ### SE 指标
 

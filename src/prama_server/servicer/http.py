@@ -1937,6 +1937,7 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
     sample_count = len(samples)
     language_totals: dict[str, int] = {}
     language_hits: dict[str, int] = {}
+    predicted_totals: dict[str, int] = {}
     confusion_counts: dict[str, dict[str, int]] = {}
     known_correct_count = 0
     known_sample_count = 0
@@ -1951,6 +1952,7 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
         known_reference = reference_language != LID_UNKNOWN_LANGUAGE
 
         language_totals[reference_language] = language_totals.get(reference_language, 0) + 1
+        predicted_totals[predicted_language] = predicted_totals.get(predicted_language, 0) + 1
         confusion_counts.setdefault(reference_language, {})
         confusion_counts[reference_language][predicted_language] = (
             confusion_counts[reference_language].get(predicted_language, 0) + 1
@@ -1980,6 +1982,11 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "language": language,
             "correct_count": language_hits.get(language, 0),
             "sample_count": language_totals[language],
+            "predicted_count": predicted_totals.get(language, 0),
+            "precision": _safe_divide_float(
+                language_hits.get(language, 0),
+                predicted_totals.get(language, 0),
+            ),
             "recall": _safe_divide_float(
                 language_hits.get(language, 0),
                 language_totals[language],
@@ -1998,11 +2005,19 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
         if known_language_recalls
         else 0.0
     )
+    macro_precision = (
+        sum(item["precision"] for item in known_language_recalls)
+        / len(known_language_recalls)
+        if known_language_recalls
+        else 0.0
+    )
     known_accuracy = _safe_divide_float(known_correct_count, known_sample_count)
     return {
         "accuracy": known_accuracy,
+        "precision": macro_precision,
         "recall": macro_recall,
         "known_accuracy": known_accuracy,
+        "macro_precision": macro_precision,
         "macro_recall": macro_recall,
         "known_correct_count": known_correct_count,
         "known_sample_count": known_sample_count,

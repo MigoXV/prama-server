@@ -90,6 +90,7 @@ export interface EvaluationResult {
   wer?: number;
   cer?: number;
   accuracy?: number;
+  macro_precision?: number;
   recall?: number;
   known_accuracy?: number;
   macro_recall?: number;
@@ -182,6 +183,8 @@ export interface LidLanguageRecall {
   language: string;
   correct_count: number;
   sample_count: number;
+  predicted_count?: number;
+  precision?: number;
   recall: number;
 }
 
