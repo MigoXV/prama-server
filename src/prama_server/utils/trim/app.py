@@ -37,6 +37,18 @@ def main(
         help="输出 VAD audiofolder 数据集根目录；默认使用输入目录旁边的 <name>-audiofolder",
         envvar="PRAMA_TRIM_VAD_OUTPUT",
     ),
+    chunk_seconds: float = typer.Option(
+        ...,
+        "--chunk-seconds",
+        help="固定剪辑时长，单位秒",
+        envvar="PRAMA_TRIM_VAD_CHUNK_SECONDS",
+    ),
+    overlap_seconds: float = typer.Option(
+        0.0,
+        "--overlap-seconds",
+        help="相邻剪辑重叠时长，单位秒",
+        envvar="PRAMA_TRIM_VAD_OVERLAP_SECONDS",
+    ),
     sample_rate: int = typer.Option(
         16000,
         "--sample-rate",
@@ -54,6 +66,8 @@ def main(
         dataset_path=dataset_path,
         split=split,
         output=output,
+        chunk_seconds=chunk_seconds,
+        overlap_seconds=overlap_seconds,
         sample_rate=sample_rate,
         overwrite=overwrite,
     )

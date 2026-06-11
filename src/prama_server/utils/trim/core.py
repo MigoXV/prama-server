@@ -11,7 +11,11 @@ import numpy as np
 import soundfile as sf
 from tqdm import tqdm
 
-from prama_server.utils.audition_formatter import au_path_to_mask, mask_to_seconds
+from prama_server.utils.audition_formatter import (
+    au_path_to_mask,
+    mask_to_au_df,
+    mask_to_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +34,21 @@ def trim_vad_dataset(
     dataset_path: Path,
     split: str,
     output: Path | None = None,
+    chunk_seconds: float,
+    overlap_seconds: float = 0.0,
     sample_rate: int = 16000,
     overwrite: bool = False,
     show_progress: bool = True,
 ) -> TrimVadResult:
+    if chunk_seconds <= 0:
+        raise ValueError(f"chunk_seconds 必须大于 0: {chunk_seconds}")
+    if overlap_seconds < 0:
+        raise ValueError(f"overlap_seconds 必须大于等于 0: {overlap_seconds}")
+    if overlap_seconds >= chunk_seconds:
+        raise ValueError(
+            "overlap_seconds 必须小于 chunk_seconds: "
+            f"{overlap_seconds} >= {chunk_seconds}"
+        )
     if sample_rate <= 0:
         raise ValueError(f"sample_rate 必须大于 0: {sample_rate}")
 
@@ -59,6 +74,8 @@ def trim_vad_dataset(
         raise FileNotFoundError(f"输入目录中没有找到 wav 文件: {dataset_path}")
 
     used_ids: set[str] = set()
+    chunk_size = max(1, int(round(chunk_seconds * sample_rate)))
+    step_size = max(1, int(round((chunk_seconds - overlap_seconds) * sample_rate)))
     output_count = 0
 
     with output_metadata_path.open("w", encoding="utf-8") as metadata_file:
@@ -82,30 +99,41 @@ def trim_vad_dataset(
                     length=len(audio_array),
                     sr=sample_rate,
                 )
-                starts, durations = mask_to_seconds(reference_mask, sample_rate)
             else:
-                starts = np.asarray([], dtype=np.float64)
-                durations = np.asarray([], dtype=np.float64)
+                reference_mask = np.zeros(len(audio_array), dtype=bool)
 
-            audio_name = f"{sample_id}.wav"
-            sf.write(output_audio_dir / audio_name, audio_array, sample_rate)
-            if csv_path.exists():
-                shutil.copy2(csv_path, output_audio_dir / f"{sample_id}.csv")
-            metadata_file.write(
-                json.dumps(
-                    {
-                        "file_name": f"audio/{audio_name}",
-                        "id": sample_id,
-                        "seconds": {
-                            "starts": _float_list(starts),
-                            "durations": _float_list(durations),
+            for part_index, start in enumerate(range(0, len(audio_array), step_size), start=1):
+                end = min(len(audio_array), start + chunk_size)
+                if end <= start:
+                    continue
+                chunk_audio = audio_array[start:end]
+                chunk_mask = reference_mask[start:end]
+                starts, durations = mask_to_seconds(chunk_mask, sample_rate)
+                part_id = f"{sample_id}__part_{part_index:04d}"
+                audio_name = f"{part_id}.wav"
+                sf.write(output_audio_dir / audio_name, chunk_audio, sample_rate)
+                if csv_path.exists():
+                    csv_name = f"{part_id}.csv"
+                    mask_to_au_df(chunk_mask, sample_rate).to_csv(
+                        output_audio_dir / csv_name,
+                        sep="\t",
+                        index=False,
+                    )
+                metadata_file.write(
+                    json.dumps(
+                        {
+                            "file_name": f"audio/{audio_name}",
+                            "id": part_id,
+                            "seconds": {
+                                "starts": _float_list(starts),
+                                "durations": _float_list(durations),
+                            },
                         },
-                    },
-                    ensure_ascii=False,
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            output_count += 1
+                output_count += 1
 
     logger.info(
         "VAD 扁平目录已转换为 audiofolder: input=%s output=%s rows=%s",
