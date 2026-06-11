@@ -9,6 +9,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 import soundfile as sf
+from tqdm import tqdm
 
 from prama_server.utils.audition_formatter import au_path_to_mask, mask_to_seconds
 
@@ -31,6 +32,7 @@ def trim_vad_dataset(
     output: Path | None = None,
     sample_rate: int = 16000,
     overwrite: bool = False,
+    show_progress: bool = True,
 ) -> TrimVadResult:
     if sample_rate <= 0:
         raise ValueError(f"sample_rate 必须大于 0: {sample_rate}")
@@ -60,7 +62,14 @@ def trim_vad_dataset(
     output_count = 0
 
     with output_metadata_path.open("w", encoding="utf-8") as metadata_file:
-        for input_index, audio_path in enumerate(audio_paths, start=1):
+        progress = tqdm(
+            audio_paths,
+            desc="转换 VAD 样本",
+            unit="file",
+            disable=not show_progress,
+        )
+        for input_index, audio_path in enumerate(progress, start=1):
+            progress.set_postfix_str(audio_path.name, refresh=False)
             sample_id = _unique_id(_safe_stem(audio_path.stem), used_ids)
             used_ids.add(sample_id)
             audio_array = _load_mono_audio(audio_path, sample_rate=sample_rate)

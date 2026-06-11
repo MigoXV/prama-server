@@ -48,6 +48,7 @@ class TrimVadDatasetTest(unittest.TestCase):
                 output=None,
                 sample_rate=output_sample_rate,
                 overwrite=False,
+                show_progress=False,
             )
 
             self.assertEqual(result.output, root / "test01-audiofolder")
