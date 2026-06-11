@@ -89,6 +89,8 @@ def trim_vad_dataset(
 
             audio_name = f"{sample_id}.wav"
             sf.write(output_audio_dir / audio_name, audio_array, sample_rate)
+            if csv_path.exists():
+                shutil.copy2(csv_path, output_audio_dir / f"{sample_id}.csv")
             metadata_file.write(
                 json.dumps(
                     {

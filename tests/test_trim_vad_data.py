@@ -70,6 +70,15 @@ class TrimVadDatasetTest(unittest.TestCase):
             self.assertEqual(metadata_rows[0]["seconds"]["starts"], [0.2])
             self.assertEqual(metadata_rows[0]["seconds"]["durations"], [0.5])
             self.assertEqual(metadata_rows[1]["seconds"], {"starts": [], "durations": []})
+            self.assertTrue(
+                (
+                    result.metadata_path.parent
+                    / "audio/valid_0001_41.365_42.207_聊天呢.csv"
+                ).exists()
+            )
+            self.assertFalse(
+                (result.metadata_path.parent / "audio/valid_0002_no_csv.csv").exists()
+            )
 
             first_audio, first_sample_rate = sf.read(
                 result.metadata_path.parent / metadata_rows[0]["file_name"]
