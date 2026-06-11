@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = typer.Typer(help="切割 VAD audiofolder 测试数据。")
+app = typer.Typer(help="把扁平 WAV/CSV 目录转换为 VAD audiofolder 数据。")
 
 
 @app.command()
@@ -21,7 +21,7 @@ def main(
     dataset_path: Path = typer.Option(
         ...,
         "--dataset-path",
-        help="输入 VAD audiofolder 数据集根目录",
+        help="输入扁平 WAV/CSV 目录",
         envvar="PRAMA_TRIM_VAD_DATASET_PATH",
     ),
     split: str = typer.Option(
@@ -30,24 +30,12 @@ def main(
         help="输入数据集 split",
         envvar="PRAMA_TRIM_VAD_SPLIT",
     ),
-    output: Path = typer.Option(
-        ...,
+    output: Path | None = typer.Option(
+        None,
         "--output",
         "-o",
-        help="输出 VAD audiofolder 数据集根目录",
+        help="输出 VAD audiofolder 数据集根目录；默认使用输入目录旁边的 <name>-audiofolder",
         envvar="PRAMA_TRIM_VAD_OUTPUT",
-    ),
-    chunk_seconds: float = typer.Option(
-        ...,
-        "--chunk-seconds",
-        help="固定切片时长，单位秒",
-        envvar="PRAMA_TRIM_VAD_CHUNK_SECONDS",
-    ),
-    overlap_seconds: float = typer.Option(
-        0.0,
-        "--overlap-seconds",
-        help="相邻切片重叠时长，单位秒",
-        envvar="PRAMA_TRIM_VAD_OVERLAP_SECONDS",
     ),
     sample_rate: int = typer.Option(
         16000,
@@ -66,8 +54,6 @@ def main(
         dataset_path=dataset_path,
         split=split,
         output=output,
-        chunk_seconds=chunk_seconds,
-        overlap_seconds=overlap_seconds,
         sample_rate=sample_rate,
         overwrite=overwrite,
     )
