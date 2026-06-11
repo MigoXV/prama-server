@@ -55,18 +55,17 @@ class TrimVadDatasetTest(unittest.TestCase):
 
             self.assertEqual(result.output, root / "test01-audiofolder")
             self.assertEqual(result.input_sample_count, 2)
-            self.assertEqual(result.output_sample_count, 3)
+            self.assertEqual(result.output_sample_count, 2)
             metadata_rows = [
                 json.loads(line)
                 for line in result.metadata_path.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(metadata_rows), 3)
+            self.assertEqual(len(metadata_rows), 2)
             self.assertEqual(
                 [row["file_name"] for row in metadata_rows],
                 [
                     "audio/valid_0001_41.365_42.207_聊天呢__part_0001.wav",
                     "audio/valid_0001_41.365_42.207_聊天呢__part_0002.wav",
-                    "audio/valid_0002_no_csv__part_0001.wav",
                 ],
             )
             self.assertEqual(
@@ -77,7 +76,6 @@ class TrimVadDatasetTest(unittest.TestCase):
             self.assertEqual(metadata_rows[0]["seconds"]["durations"], [0.3])
             self.assertEqual(metadata_rows[1]["seconds"]["starts"], [0.0])
             self.assertEqual(metadata_rows[1]["seconds"]["durations"], [0.2])
-            self.assertEqual(metadata_rows[2]["seconds"], {"starts": [], "durations": []})
             self.assertTrue(
                 (
                     result.metadata_path.parent
@@ -93,7 +91,7 @@ class TrimVadDatasetTest(unittest.TestCase):
             self.assertFalse(
                 (
                     result.metadata_path.parent
-                    / "audio/valid_0002_no_csv__part_0001.csv"
+                    / "audio/valid_0002_no_csv__part_0001.wav"
                 ).exists()
             )
 
@@ -105,7 +103,7 @@ class TrimVadDatasetTest(unittest.TestCase):
             self.assertEqual(len(first_audio), output_sample_rate // 2)
 
             dataset = load_dataset("audiofolder", data_dir=str(result.output), split="test")
-            self.assertEqual(len(dataset), 3)
+            self.assertEqual(len(dataset), 2)
             self.assertIn("audio", dataset.column_names)
             self.assertIn("seconds", dataset.column_names)
 

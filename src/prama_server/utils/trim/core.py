@@ -72,6 +72,14 @@ def trim_vad_dataset(
     audio_paths = sorted(dataset_path.glob("*.wav"))
     if not audio_paths:
         raise FileNotFoundError(f"输入目录中没有找到 wav 文件: {dataset_path}")
+    labeled_audio_paths = [
+        audio_path
+        for audio_path in audio_paths
+        if audio_path.with_suffix(".csv").exists()
+    ]
+    skipped_count = len(audio_paths) - len(labeled_audio_paths)
+    if not labeled_audio_paths:
+        raise FileNotFoundError(f"输入目录中没有找到带同名 csv 标注的 wav 文件: {dataset_path}")
 
     used_ids: set[str] = set()
     chunk_size = max(1, int(round(chunk_seconds * sample_rate)))
@@ -80,7 +88,7 @@ def trim_vad_dataset(
 
     with output_metadata_path.open("w", encoding="utf-8") as metadata_file:
         progress = tqdm(
-            audio_paths,
+            labeled_audio_paths,
             desc="转换 VAD 样本",
             unit="file",
             disable=not show_progress,
@@ -93,14 +101,11 @@ def trim_vad_dataset(
             if audio_array.size == 0:
                 raise ValueError(f"音频为空: id={sample_id} path={audio_path}")
             csv_path = audio_path.with_suffix(".csv")
-            if csv_path.exists():
-                reference_mask = au_path_to_mask(
-                    csv_path,
-                    length=len(audio_array),
-                    sr=sample_rate,
-                )
-            else:
-                reference_mask = np.zeros(len(audio_array), dtype=bool)
+            reference_mask = au_path_to_mask(
+                csv_path,
+                length=len(audio_array),
+                sr=sample_rate,
+            )
 
             for part_index, start in enumerate(range(0, len(audio_array), step_size), start=1):
                 end = min(len(audio_array), start + chunk_size)
@@ -112,13 +117,12 @@ def trim_vad_dataset(
                 part_id = f"{sample_id}__part_{part_index:04d}"
                 audio_name = f"{part_id}.wav"
                 sf.write(output_audio_dir / audio_name, chunk_audio, sample_rate)
-                if csv_path.exists():
-                    csv_name = f"{part_id}.csv"
-                    mask_to_au_df(chunk_mask, sample_rate).to_csv(
-                        output_audio_dir / csv_name,
-                        sep="\t",
-                        index=False,
-                    )
+                csv_name = f"{part_id}.csv"
+                mask_to_au_df(chunk_mask, sample_rate).to_csv(
+                    output_audio_dir / csv_name,
+                    sep="\t",
+                    index=False,
+                )
                 metadata_file.write(
                     json.dumps(
                         {
@@ -136,8 +140,9 @@ def trim_vad_dataset(
                 output_count += 1
 
     logger.info(
-        "VAD 扁平目录已转换为 audiofolder: input=%s output=%s rows=%s",
+        "VAD 扁平目录已转换为 audiofolder: input=%s skipped_without_csv=%s output=%s rows=%s",
         len(audio_paths),
+        skipped_count,
         output,
         output_count,
     )
