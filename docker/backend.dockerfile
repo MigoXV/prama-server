@@ -29,4 +29,4 @@ RUN poetry install
 EXPOSE 50051
 
 # 默认入口
-CMD ["poetry", "run", "python", "-m", "prama_server.commands.app"]
+CMD ["poetry", "run", "python", "-m", "prama_server.commands.app", "serve_http"]
