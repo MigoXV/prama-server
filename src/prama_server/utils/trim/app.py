@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = typer.Typer(help="把扁平 WAV/CSV 目录转换为 VAD audiofolder 数据。")
+app = typer.Typer(help="把 JSONL 或扁平 WAV/CSV 目录转换为 VAD audiofolder 数据。")
 
 
 @app.command()
@@ -21,7 +21,7 @@ def main(
     dataset_path: Path = typer.Option(
         ...,
         "--dataset-path",
-        help="输入扁平 WAV/CSV 目录",
+        help="输入目录或 JSONL 文件；若输入目录顶层存在 JSONL 文件则优先按 JSONL 处理，否则按扁平 WAV/CSV 处理",
         envvar="PRAMA_TRIM_VAD_DATASET_PATH",
     ),
     split: str = typer.Option(

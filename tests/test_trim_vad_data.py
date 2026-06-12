@@ -107,6 +107,82 @@ class TrimVadDatasetTest(unittest.TestCase):
             self.assertIn("audio", dataset.column_names)
             self.assertIn("seconds", dataset.column_names)
 
+    def test_jsonl_takes_priority_over_csv_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "test01"
+            audio_dir = source / "audio"
+            audio_dir.mkdir(parents=True)
+            sample_rate = 16000
+
+            sf.write(
+                audio_dir / "from_jsonl.wav",
+                np.zeros(sample_rate, dtype=np.float32),
+                sample_rate,
+            )
+            sf.write(
+                source / "from_csv.wav",
+                np.zeros(sample_rate, dtype=np.float32),
+                sample_rate,
+            )
+            (source / "from_csv.csv").write_text(
+                "\n".join(
+                    [
+                        "Name\tStart\tDuration\tTime Format\tType\tDescription",
+                        "0\t0:00.100\t0:00.200\tdecimal\tCue\t",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (source / "metadata.jsonl").write_text(
+                json.dumps(
+                    {
+                        "file_name": "audio/from_jsonl.wav",
+                        "id": "jsonl_sample",
+                        "seconds": {
+                            "starts": [0.25],
+                            "durations": [0.25],
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = trim_vad_dataset(
+                dataset_path=source,
+                split="test",
+                output=None,
+                chunk_seconds=0.5,
+                overlap_seconds=0.0,
+                sample_rate=sample_rate,
+                overwrite=False,
+                show_progress=False,
+            )
+
+            self.assertEqual(result.input_sample_count, 1)
+            self.assertEqual(result.output_sample_count, 2)
+            metadata_rows = [
+                json.loads(line)
+                for line in result.metadata_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [row["file_name"] for row in metadata_rows],
+                [
+                    "audio/jsonl_sample__part_0001.wav",
+                    "audio/jsonl_sample__part_0002.wav",
+                ],
+            )
+            self.assertEqual(metadata_rows[0]["seconds"]["starts"], [0.25])
+            self.assertEqual(metadata_rows[0]["seconds"]["durations"], [0.25])
+            self.assertEqual(metadata_rows[1]["seconds"]["starts"], [])
+            self.assertEqual(metadata_rows[1]["seconds"]["durations"], [])
+            self.assertFalse(
+                (result.metadata_path.parent / "audio/from_csv__part_0001.wav").exists()
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import librosa
 import numpy as np
@@ -15,6 +16,7 @@ from prama_server.utils.audition_formatter import (
     au_path_to_mask,
     mask_to_au_df,
     mask_to_seconds,
+    seconds_to_mask,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,14 @@ class TrimVadResult:
     input_sample_count: int
     output_sample_count: int
     metadata_path: Path
+
+
+@dataclass(frozen=True)
+class _VadSample:
+    sample_id: str
+    audio_path: Path
+    starts: np.ndarray | None
+    durations: np.ndarray | None
 
 
 def trim_vad_dataset(
@@ -53,9 +63,16 @@ def trim_vad_dataset(
         raise ValueError(f"sample_rate 必须大于 0: {sample_rate}")
 
     dataset_path = dataset_path.resolve()
-    if not dataset_path.exists() or not dataset_path.is_dir():
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"输入路径不存在: {dataset_path}")
+    if not dataset_path.is_dir() and dataset_path.suffix.lower() != ".jsonl":
         raise NotADirectoryError(f"输入目录不存在: {dataset_path}")
-    output = (output or dataset_path.with_name(f"{dataset_path.name}-audiofolder")).resolve()
+    default_output_name = (
+        f"{dataset_path.stem}-audiofolder"
+        if dataset_path.is_file()
+        else f"{dataset_path.name}-audiofolder"
+    )
+    output = (output or dataset_path.with_name(default_output_name)).resolve()
     if dataset_path == output:
         raise ValueError("输出目录不能与输入数据集目录相同")
 
@@ -69,17 +86,14 @@ def trim_vad_dataset(
         shutil.rmtree(output)
     output_audio_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_paths = sorted(dataset_path.glob("*.wav"))
-    if not audio_paths:
-        raise FileNotFoundError(f"输入目录中没有找到 wav 文件: {dataset_path}")
-    labeled_audio_paths = [
-        audio_path
-        for audio_path in audio_paths
-        if audio_path.with_suffix(".csv").exists()
-    ]
-    skipped_count = len(audio_paths) - len(labeled_audio_paths)
-    if not labeled_audio_paths:
-        raise FileNotFoundError(f"输入目录中没有找到带同名 csv 标注的 wav 文件: {dataset_path}")
+    jsonl_path = _find_jsonl_path(dataset_path)
+    if jsonl_path is not None:
+        input_samples = _load_jsonl_samples(jsonl_path)
+        skipped_count = 0
+        source_description = f"jsonl={jsonl_path}"
+    else:
+        input_samples, skipped_count = _load_csv_samples(dataset_path)
+        source_description = f"flat_wav_csv={dataset_path}"
 
     used_ids: set[str] = set()
     chunk_size = max(1, int(round(chunk_seconds * sample_rate)))
@@ -88,24 +102,33 @@ def trim_vad_dataset(
 
     with output_metadata_path.open("w", encoding="utf-8") as metadata_file:
         progress = tqdm(
-            labeled_audio_paths,
+            input_samples,
             desc="转换 VAD 样本",
             unit="file",
             disable=not show_progress,
         )
-        for input_index, audio_path in enumerate(progress, start=1):
+        for input_index, sample in enumerate(progress, start=1):
+            audio_path = sample.audio_path
             progress.set_postfix_str(audio_path.name, refresh=False)
-            sample_id = _unique_id(_safe_stem(audio_path.stem), used_ids)
+            sample_id = _unique_id(_safe_stem(sample.sample_id), used_ids)
             used_ids.add(sample_id)
             audio_array = _load_mono_audio(audio_path, sample_rate=sample_rate)
             if audio_array.size == 0:
                 raise ValueError(f"音频为空: id={sample_id} path={audio_path}")
-            csv_path = audio_path.with_suffix(".csv")
-            reference_mask = au_path_to_mask(
-                csv_path,
-                length=len(audio_array),
-                sr=sample_rate,
-            )
+            if sample.starts is None or sample.durations is None:
+                csv_path = audio_path.with_suffix(".csv")
+                reference_mask = au_path_to_mask(
+                    csv_path,
+                    length=len(audio_array),
+                    sr=sample_rate,
+                )
+            else:
+                reference_mask = seconds_to_mask(
+                    sample.starts,
+                    sample.durations,
+                    length=len(audio_array),
+                    sr=sample_rate,
+                )
 
             for part_index, start in enumerate(range(0, len(audio_array), step_size), start=1):
                 end = min(len(audio_array), start + chunk_size)
@@ -140,8 +163,9 @@ def trim_vad_dataset(
                 output_count += 1
 
     logger.info(
-        "VAD 扁平目录已转换为 audiofolder: input=%s skipped_without_csv=%s output=%s rows=%s",
-        len(audio_paths),
+        "VAD 数据已转换为 audiofolder: source=%s input=%s skipped_without_csv=%s output=%s rows=%s",
+        source_description,
+        len(input_samples) + skipped_count,
         skipped_count,
         output,
         output_count,
@@ -149,10 +173,119 @@ def trim_vad_dataset(
     return TrimVadResult(
         output=output,
         split=split,
-        input_sample_count=len(audio_paths),
+        input_sample_count=len(input_samples) + skipped_count,
         output_sample_count=output_count,
         metadata_path=output_metadata_path,
     )
+
+
+def _find_jsonl_path(dataset_path: Path) -> Path | None:
+    if dataset_path.is_file() and dataset_path.suffix.lower() == ".jsonl":
+        return dataset_path
+    jsonl_paths = sorted(dataset_path.glob("*.jsonl"))
+    if not jsonl_paths:
+        return None
+    metadata_path = dataset_path / "metadata.jsonl"
+    if metadata_path in jsonl_paths:
+        return metadata_path
+    return jsonl_paths[0]
+
+
+def _load_jsonl_samples(jsonl_path: Path) -> list[_VadSample]:
+    samples: list[_VadSample] = []
+    with jsonl_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"JSONL 解析失败: path={jsonl_path} line={line_number}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"JSONL 每行必须是对象: path={jsonl_path} line={line_number}")
+
+            audio_path = _resolve_jsonl_audio_path(row, jsonl_path=jsonl_path, line_number=line_number)
+            seconds = row.get("seconds")
+            if not isinstance(seconds, dict):
+                raise ValueError(
+                    f"JSONL 缺少 seconds 对象: path={jsonl_path} line={line_number}"
+                )
+            starts = _seconds_array(seconds, "starts", jsonl_path=jsonl_path, line_number=line_number)
+            durations = _seconds_array(
+                seconds,
+                "durations",
+                jsonl_path=jsonl_path,
+                line_number=line_number,
+            )
+            if starts.shape != durations.shape:
+                raise ValueError(
+                    "JSONL seconds.starts 与 seconds.durations 长度不一致: "
+                    f"path={jsonl_path} line={line_number} "
+                    f"{starts.shape} != {durations.shape}"
+                )
+            sample_id = str(row.get("id") or audio_path.stem)
+            samples.append(
+                _VadSample(
+                    sample_id=sample_id,
+                    audio_path=audio_path,
+                    starts=starts,
+                    durations=durations,
+                )
+            )
+    if not samples:
+        raise FileNotFoundError(f"JSONL 文件中没有可处理样本: {jsonl_path}")
+    return samples
+
+
+def _load_csv_samples(dataset_path: Path) -> tuple[list[_VadSample], int]:
+    audio_paths = sorted(dataset_path.glob("*.wav"))
+    if not audio_paths:
+        raise FileNotFoundError(f"输入目录中没有找到 wav 文件: {dataset_path}")
+    samples = [
+        _VadSample(
+            sample_id=audio_path.stem,
+            audio_path=audio_path,
+            starts=None,
+            durations=None,
+        )
+        for audio_path in audio_paths
+        if audio_path.with_suffix(".csv").exists()
+    ]
+    skipped_count = len(audio_paths) - len(samples)
+    if not samples:
+        raise FileNotFoundError(f"输入目录中没有找到带同名 csv 标注的 wav 文件: {dataset_path}")
+    return samples, skipped_count
+
+
+def _resolve_jsonl_audio_path(row: dict[str, Any], *, jsonl_path: Path, line_number: int) -> Path:
+    path_value = row.get("file_name") or row.get("path")
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError(f"JSONL 缺少 file_name/path: path={jsonl_path} line={line_number}")
+    audio_path = Path(path_value)
+    if not audio_path.is_absolute():
+        audio_path = jsonl_path.parent / audio_path
+    return audio_path
+
+
+def _seconds_array(
+    seconds: dict[str, Any],
+    key: str,
+    *,
+    jsonl_path: Path,
+    line_number: int,
+) -> np.ndarray:
+    value = seconds.get(key, [])
+    if not isinstance(value, list):
+        raise ValueError(
+            f"JSONL seconds.{key} 必须是数组: path={jsonl_path} line={line_number}"
+        )
+    try:
+        return np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"JSONL seconds.{key} 包含非数字值: path={jsonl_path} line={line_number}"
+        ) from exc
 
 
 def _load_mono_audio(audio_path: Path, *, sample_rate: int) -> np.ndarray:
