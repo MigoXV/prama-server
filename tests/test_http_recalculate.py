@@ -26,6 +26,7 @@ from prama_server.servicer.http import (
     _keyword_matches,
     _load_keyword_dataset,
     _normalize_keyword_text,
+    _run_keyword_evaluation,
     _lid_predicted_language,
     app,
     jobs,
@@ -403,6 +404,131 @@ class HttpReportMetricsTest(unittest.TestCase):
                 sample_rate=16000,
             )
             self.assertEqual(len(dataset), 2)
+
+    def test_keyword_evaluation_reuses_asr_for_same_audio_keywords(self) -> None:
+        class FakeAsrInferencer:
+            calls: list[np.ndarray] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def infer(self, audio: np.ndarray):
+                self.calls.append(audio)
+                yield ("LEVEL SPEED", True)
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_dir = root / "keyword"
+            test_dir = dataset_dir / "test"
+            test_dir.mkdir(parents=True)
+            sf.write(test_dir / "sample.wav", np.zeros(160, dtype=np.float32), 16000)
+            (test_dir / "metadata.jsonl").write_text(
+                "\n".join(
+                    [
+                        '{"file_name":"sample.wav","id":"sample__kw_level","keyword":"LEVEL","expected_hit":true}',
+                        '{"file_name":"sample.wav","id":"sample__kw_altitude","keyword":"ALTITUDE","expected_hit":false}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            job = EvaluationJob(
+                job_id="keyword-group-test",
+                request=EvaluationRequest(
+                    task="keyword",
+                    dataset_path=str(dataset_dir),
+                    split="test",
+                    sample_rate=16000,
+                ),
+            )
+
+            with patch(
+                "prama_server.servicer.http.AsrGrpcInferencer",
+                FakeAsrInferencer,
+            ):
+                _run_keyword_evaluation(job)
+
+            self.assertEqual(len(FakeAsrInferencer.calls), 1)
+            self.assertEqual(job.status, "completed")
+            self.assertIsNotNone(job.result)
+            assert job.result is not None
+            keyword_samples = job.result["keyword_report"]["samples"]
+            audio_samples = job.result["keyword_audio_report"]["samples"]
+            self.assertEqual(len(keyword_samples), 2)
+            self.assertEqual(len(audio_samples), 1)
+            self.assertEqual(job.result["sample_count"], 2)
+            self.assertEqual(job.result["audio_sample_count"], 1)
+            self.assertEqual(job.result["audio_duration_seconds"], 0.01)
+            self.assertEqual(audio_samples[0]["id"], "sample")
+            self.assertEqual(len(audio_samples[0]["keywords"]), 2)
+            self.assertEqual(
+                [sample["audio_id"] for sample in keyword_samples],
+                ["sample", "sample"],
+            )
+            self.assertEqual(
+                [sample["predicted_hit"] for sample in keyword_samples],
+                [True, False],
+            )
+
+    def test_keyword_evaluation_keeps_different_audio_files_separate(self) -> None:
+        class FakeAsrInferencer:
+            calls: list[np.ndarray] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def infer(self, audio: np.ndarray):
+                self.calls.append(audio)
+                yield ("LEVEL", True)
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_dir = root / "keyword"
+            test_dir = dataset_dir / "test"
+            test_dir.mkdir(parents=True)
+            sf.write(test_dir / "first.wav", np.zeros(160, dtype=np.float32), 16000)
+            sf.write(test_dir / "second.wav", np.ones(160, dtype=np.float32), 16000)
+            (test_dir / "metadata.jsonl").write_text(
+                "\n".join(
+                    [
+                        '{"file_name":"first.wav","id":"first__kw_level","keyword":"LEVEL","expected_hit":true}',
+                        '{"file_name":"second.wav","id":"second__kw_level","keyword":"LEVEL","expected_hit":true}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            job = EvaluationJob(
+                job_id="keyword-separate-audio-test",
+                request=EvaluationRequest(
+                    task="keyword",
+                    dataset_path=str(dataset_dir),
+                    split="test",
+                    sample_rate=16000,
+                ),
+            )
+
+            with patch(
+                "prama_server.servicer.http.AsrGrpcInferencer",
+                FakeAsrInferencer,
+            ):
+                _run_keyword_evaluation(job)
+
+            self.assertEqual(len(FakeAsrInferencer.calls), 2)
+            self.assertIsNotNone(job.result)
+            assert job.result is not None
+            self.assertEqual(job.result["sample_count"], 2)
+            self.assertEqual(job.result["audio_sample_count"], 2)
+            self.assertEqual(
+                [sample["id"] for sample in job.result["keyword_audio_report"]["samples"]],
+                ["first", "second"],
+            )
 
     def test_lid_metrics_use_strict_language_labels(self) -> None:
         report = _build_lid_report(

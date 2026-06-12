@@ -47,6 +47,8 @@ ASR 评估每条样本必须包含：
 
 关键词评估复用 ASR 引擎：系统先对音频做 ASR，再从 ASR 输出文本里查找关键词。每条样本都可以提供自己的 `keyword`，因此同一个数据集可以包含多个关键词。
 
+如果同一条语音需要评估多个关键词，可以在 `metadata.jsonl` 中写多行并指向同一个 `file_name`。评估时系统会按音频路径去重，同一条语音只执行一次解码、ASR 和语音质量评估，然后复用转写结果完成该语音关联的所有关键词匹配；指标仍按每个关键词判断样本统计。
+
 每条样本必须包含：
 
 - `audio`: 音频文件或可解码音频对象。
@@ -58,6 +60,7 @@ ASR 评估每条样本必须包含：
 
 ```jsonl
 {"file_name":"keyword_demo_hit_01.wav","id":"keyword_hit_001","keyword":"AUSTRIAN","expected_hit":true}
+{"file_name":"keyword_demo_hit_01.wav","id":"keyword_hit_001_kw_speed","keyword":"SPEED","expected_hit":false}
 {"file_name":"keyword_demo_negative_silence.wav","id":"keyword_neg_001","keyword":"AUSTRIAN","expected_hit":false}
 ```
 

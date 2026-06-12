@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -839,112 +840,160 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
         sample_rate=request.sample_rate,
     )
     total = len(dataset)
+    audio_groups = _group_keyword_samples_by_audio(dataset)
     report_samples: list[dict[str, Any]] = []
+    audio_report_samples: list[dict[str, Any]] = []
     evaluation_start_time = time.perf_counter()
 
-    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
-        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
-        keyword = str(sample["keyword"]).strip()
-        expected_hit = _as_bool(sample["expected_hit"])
-        audio_array, audio_sample_rate = _decode_sample_audio(sample["audio"])
+    def evaluate_audio_group(group: dict[str, Any]) -> dict[str, Any]:
+        entries = group["entries"]
+        first_entry = entries[0]
+        audio_index = first_entry["index"]
+        audio_sample = first_entry["sample"]
+        audio_sample_id = group["audio_id"]
+        audio_array, audio_sample_rate = _decode_sample_audio(audio_sample["audio"])
         if audio_sample_rate != request.sample_rate:
             raise ValueError(
-                f"样本采样率与关键词评估配置不一致: id={sample_id} "
+                f"样本采样率与关键词评估配置不一致: id={audio_sample_id} "
                 f"audio_sample_rate={audio_sample_rate} sample_rate={request.sample_rate}"
             )
         audio_array = _prepare_audio_for_export(audio_array)
         sample_record = _register_sample_record(
             job=job,
-            sample=sample,
-            sample_id=sample_id,
-            index=index,
+            sample=audio_sample,
+            sample_id=audio_sample_id,
+            index=audio_index,
             audio_array=audio_array,
             sample_rate=audio_sample_rate,
         )
         transcript = _infer_final_transcript(inferencer, audio_array)
         match_text = _normalize_keyword_text(transcript)
-        predicted_hit = _keyword_matches(transcript, keyword)
-        correct = predicted_hit == expected_hit
-        report_sample = {
-            "id": sample_id,
-            "index": index,
-            "audio_url": sample_record.get("audio_url"),
-            "duration_seconds": sample_record.get("duration_seconds"),
-            "keyword": keyword,
-            "expected_hit": expected_hit,
-            "predicted_hit": predicted_hit,
-            "correct": correct,
-            "transcript": transcript,
-            "match_text": match_text,
-            "sqa_scores": sqa_assessor.assess(audio_array),
-        }
-        return {
-            "report_sample": report_sample,
-            "payload": {
-                "status": "running",
-                "tag": job.job_id,
-                "total": total,
+        sqa_scores = sqa_assessor.assess(audio_array)
+        keyword_results = []
+        keyword_report_samples = []
+        payloads = []
+
+        for entry in entries:
+            index = entry["index"]
+            sample = entry["sample"]
+            sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+            keyword = str(sample["keyword"]).strip()
+            expected_hit = _as_bool(sample["expected_hit"])
+            predicted_hit = _keyword_matches(transcript, keyword)
+            correct = predicted_hit == expected_hit
+            keyword_result = {
                 "id": sample_id,
-                "current_id": sample_id,
-                "reference": f"{keyword}: {'hit' if expected_hit else 'no hit'}",
-                "hypothesis": "hit" if predicted_hit else "no hit",
-                "is_final": True,
-                "result": report_sample,
+                "index": index,
+                "keyword": keyword,
+                "expected_hit": expected_hit,
+                "predicted_hit": predicted_hit,
+                "correct": correct,
+            }
+            report_sample = {
+                **keyword_result,
+                "audio_id": audio_sample_id,
+                "audio_index": audio_index,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
-                "sqa_scores": report_sample.get("sqa_scores", []),
-            },
+                "transcript": transcript,
+                "match_text": match_text,
+                "sqa_scores": sqa_scores,
+            }
+            keyword_results.append(keyword_result)
+            keyword_report_samples.append(report_sample)
+            payloads.append(
+                {
+                    "status": "running",
+                    "tag": job.job_id,
+                    "total": total,
+                    "id": sample_id,
+                    "current_id": sample_id,
+                    "reference": f"{keyword}: {'hit' if expected_hit else 'no hit'}",
+                    "hypothesis": "hit" if predicted_hit else "no hit",
+                    "is_final": True,
+                    "result": report_sample,
+                    "audio_url": sample_record.get("audio_url"),
+                    "duration_seconds": sample_record.get("duration_seconds"),
+                    "sqa_scores": report_sample.get("sqa_scores", []),
+                }
+            )
+
+        audio_report_sample = {
+            "id": audio_sample_id,
+            "index": audio_index,
+            "audio_url": sample_record.get("audio_url"),
+            "duration_seconds": sample_record.get("duration_seconds"),
+            "transcript": transcript,
+            "match_text": match_text,
+            "sqa_scores": sqa_scores,
+            "keywords": keyword_results,
+        }
+        return {
+            "audio_report_sample": audio_report_sample,
+            "report_samples": keyword_report_samples,
+            "payloads": payloads,
         }
 
-    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
-        report_samples.append(item["report_sample"])
-        payload = {
-            **item["payload"],
-            "processed": processed,
-            "evaluated": processed,
-        }
-        with job.lock:
-            job.latest_progress = payload
-        message_manager.put(
-            ManagedMessage(
-                job_id=job.job_id,
-                event_name="inference_result",
-                payload=payload,
+    def publish_group_result(item: dict[str, Any], processed: int) -> int:
+        audio_report_samples.append(item["audio_report_sample"])
+        for report_sample, payload in zip(
+            item["report_samples"],
+            item["payloads"],
+            strict=True,
+        ):
+            processed += 1
+            report_samples.append(report_sample)
+            progress_payload = {
+                **payload,
+                "processed": processed,
+                "evaluated": processed,
+            }
+            with job.lock:
+                job.latest_progress = progress_payload
+            message_manager.put(
+                ManagedMessage(
+                    job_id=job.job_id,
+                    event_name="inference_result",
+                    payload=progress_payload,
+                )
             )
-        )
+        return processed
 
     try:
-        samples = list(enumerate(dataset, start=1))
         inference_concurrency = _task_inference_concurrency(request, "keyword")
-        if inference_concurrency > 0 and samples:
-            max_workers = min(inference_concurrency, len(samples))
+        processed = 0
+        if inference_concurrency > 0 and audio_groups:
+            max_workers = min(inference_concurrency, len(audio_groups))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
-                    executor.submit(evaluate_sample, index, sample)
-                    for index, sample in samples
+                    executor.submit(evaluate_audio_group, group)
+                    for group in audio_groups
                 ]
-                for processed, future in enumerate(as_completed(futures), start=1):
-                    publish_sample_result(future.result(), processed)
+                for future in as_completed(futures):
+                    processed = publish_group_result(future.result(), processed)
         else:
-            for index, sample in samples:
-                publish_sample_result(evaluate_sample(index, sample), index)
+            for group in audio_groups:
+                processed = publish_group_result(evaluate_audio_group(group), processed)
 
         processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
         report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        audio_report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
         with job.lock:
             job.status = "completed"
             job.keyword_report_samples = report_samples
             job.result = {
                 **_build_keyword_report(report_samples),
+                "keyword_audio_report": {"samples": audio_report_samples},
+                "audio_sample_count": len(audio_report_samples),
                 **_performance_payload(
-                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    audio_duration_seconds=_sum_sample_duration(audio_report_samples),
                     processing_elapsed_seconds=processing_elapsed_seconds,
                 ),
                 **_sample_count_payload(
                     included_count=len(report_samples),
                     total_count=len(report_samples),
                 ),
-                **_sqa_summary_payload(report_samples),
+                **_sqa_summary_payload(audio_report_samples),
             }
         logger.info("关键词评估任务完成: job_id=%s", job.job_id)
     finally:
@@ -997,7 +1046,9 @@ def _load_keyword_dataset(
     sample_rate: int,
 ) -> Dataset:
     logger.info("加载关键词数据集: path=%s split=%s", dataset_path, split)
+    audio_file_names: list[str] | None = None
     if _is_audiofolder_dataset_dir(dataset_path):
+        audio_file_names = _read_keyword_audio_file_names(dataset_path, split=split)
         dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
     else:
         dataset = load_dataset(str(dataset_path), split=split)
@@ -1005,6 +1056,16 @@ def _load_keyword_dataset(
     missing = sorted({"audio", "keyword", "expected_hit"} - set(dataset.column_names))
     if missing:
         raise ValueError(f"关键词数据集缺少必要字段: {', '.join(missing)}")
+
+    if audio_file_names is not None and len(audio_file_names) == len(dataset):
+        dataset = dataset.add_column("_keyword_audio_file_name", audio_file_names)
+    elif audio_file_names is not None:
+        logger.warning(
+            "关键词 audiofolder 元数据行数与数据集行数不一致，跳过音频路径分组字段: "
+            "metadata=%s dataset=%s",
+            len(audio_file_names),
+            len(dataset),
+        )
 
     dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
     if limit is not None:
@@ -1026,6 +1087,88 @@ def _load_keyword_dataset(
         len(normalized_keywords),
     )
     return dataset
+
+
+def _read_keyword_audio_file_names(dataset_path: Path, *, split: str) -> list[str] | None:
+    metadata_candidates = [
+        dataset_path / split / "metadata.jsonl",
+        dataset_path / "metadata.jsonl",
+    ]
+    metadata_path = next(
+        (path for path in metadata_candidates if path.exists() and path.is_file()),
+        None,
+    )
+    if metadata_path is None:
+        return None
+
+    audio_file_names: list[str] = []
+    with metadata_path.open("r", encoding="utf-8") as file_obj:
+        for line in file_obj:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            file_name = payload.get("file_name")
+            audio_file_names.append(str(file_name) if file_name else "")
+    return audio_file_names
+
+
+def _group_keyword_samples_by_audio(dataset: Dataset) -> list[dict[str, Any]]:
+    groups_by_key: dict[str, dict[str, Any]] = {}
+    groups: list[dict[str, Any]] = []
+    for index, sample in enumerate(dataset, start=1):
+        group_key = _keyword_audio_group_key(sample, fallback_index=index)
+        group = groups_by_key.get(group_key)
+        if group is None:
+            group = {"key": group_key, "entries": []}
+            groups_by_key[group_key] = group
+            groups.append(group)
+        group["entries"].append({"index": index, "sample": sample})
+    used_audio_ids: set[str] = set()
+    for group in groups:
+        first_entry = group["entries"][0]
+        audio_id = _keyword_audio_sample_id(
+            first_entry["sample"],
+            first_entry["index"],
+        )
+        if audio_id in used_audio_ids:
+            key_digest = hashlib.sha1(group["key"].encode("utf-8")).hexdigest()[:8]
+            audio_id = f"{audio_id}-{key_digest}"
+        used_audio_ids.add(audio_id)
+        group["audio_id"] = audio_id
+    return groups
+
+
+def _keyword_audio_group_key(sample: dict[str, Any], *, fallback_index: int) -> str:
+    audio_file_name = sample.get("_keyword_audio_file_name")
+    if isinstance(audio_file_name, str) and audio_file_name:
+        return f"file_name:{audio_file_name}"
+
+    audio = sample.get("audio")
+    if isinstance(audio, dict):
+        audio_path = audio.get("path")
+        if isinstance(audio_path, str) and audio_path:
+            return f"path:{Path(audio_path).expanduser().resolve()}"
+
+    for key in ("file_name", "path"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return f"{key}:{value}"
+    return f"row:{fallback_index}"
+
+
+def _keyword_audio_sample_id(sample: dict[str, Any], index: int) -> str:
+    for key in ("_keyword_audio_file_name", "file_name", "path"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return Path(value).stem or str(index)
+
+    audio = sample.get("audio")
+    if isinstance(audio, dict):
+        audio_path = audio.get("path")
+        if isinstance(audio_path, str) and audio_path:
+            return Path(audio_path).stem or str(index)
+
+    return str(sample.get("id") or sample.get("utt_id") or index)
 
 
 def _infer_final_transcript(

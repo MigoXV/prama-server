@@ -132,6 +132,8 @@ export interface EvaluationResult {
   lid_report?: LidReport;
   denoise_report?: DenoiseReport;
   keyword_report?: KeywordReport;
+  keyword_audio_report?: KeywordAudioReport;
+  audio_sample_count?: number;
   sqa_summary?: SqaSummary[];
   [key: string]: unknown;
 }
@@ -143,6 +145,8 @@ export interface KeywordReport {
 export interface KeywordReportSample {
   id: string;
   index?: number;
+  audio_id?: string;
+  audio_index?: number;
   audio_url?: string;
   duration_seconds?: number;
   keyword: string;
@@ -152,6 +156,30 @@ export interface KeywordReportSample {
   transcript: string;
   match_text: string;
   sqa_scores?: SqaScore[];
+}
+
+export interface KeywordAudioReport {
+  samples: KeywordAudioReportSample[];
+}
+
+export interface KeywordAudioReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  transcript: string;
+  match_text: string;
+  sqa_scores?: SqaScore[];
+  keywords: KeywordAudioKeywordResult[];
+}
+
+export interface KeywordAudioKeywordResult {
+  id: string;
+  index?: number;
+  keyword: string;
+  expected_hit: boolean;
+  predicted_hit: boolean;
+  correct: boolean;
 }
 
 export interface DenoiseReport {

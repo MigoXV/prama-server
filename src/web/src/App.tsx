@@ -54,6 +54,7 @@ import type {
   DenoiseReportSample,
   HelpDocument,
   JobStatus,
+  KeywordAudioReportSample,
   KeywordReportSample,
   LidReportSample,
   SqaScore,
@@ -2190,12 +2191,17 @@ function KeywordReportPanel({
   result: EvaluationResult | null;
 }) {
   const samples = result?.keyword_report?.samples ?? [];
+  const audioSamples = result?.keyword_audio_report?.samples ?? [];
+  const [viewMode, setViewMode] = useState<"keyword" | "audio">("keyword");
   return (
     <div className="panel report-panel keyword-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>关键词报告</h2>
-          <span>{formatNumber(result?.sample_count)} 个样本</span>
+          <span>
+            {formatNumber(result?.sample_count)} 个关键词 /{" "}
+            {formatNumber(result?.audio_sample_count ?? audioSamples.length)} 条语音
+          </span>
         </div>
       </div>
       {result ? (
@@ -2218,11 +2224,78 @@ function KeywordReportPanel({
           </div>
           <CompactReportMeta result={result} fallbackCount={samples.length} />
           <SqaSummaryMetrics summary={result.sqa_summary} />
-          <KeywordSampleList samples={samples} />
+          <div className="keyword-view-tabs" role="tablist" aria-label="关键词报告视图">
+            <button
+              type="button"
+              className={viewMode === "keyword" ? "active" : ""}
+              onClick={() => setViewMode("keyword")}
+            >
+              按关键词
+            </button>
+            <button
+              type="button"
+              className={viewMode === "audio" ? "active" : ""}
+              onClick={() => setViewMode("audio")}
+            >
+              按语音
+            </button>
+          </div>
+          {viewMode === "keyword" ? (
+            <KeywordSampleList samples={samples} />
+          ) : (
+            <KeywordAudioSampleList samples={audioSamples} />
+          )}
         </>
       ) : (
         <div className="empty-state">评估完成后生成关键词报告</div>
       )}
+    </div>
+  );
+}
+
+function KeywordAudioSampleList({ samples }: { samples: KeywordAudioReportSample[] }) {
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成语音聚合结果</div>;
+  }
+
+  return (
+    <div className="keyword-sample-list">
+      {samples.map((sample) => (
+        <section className="keyword-sample keyword-audio-sample" key={sample.id}>
+          <div className="keyword-sample-title">
+            <span className="keyword-sample-name">
+              <strong>#{sample.index ?? "-"}</strong>
+              <span title={sample.id}>{sample.id}</span>
+            </span>
+            <span className="keyword-status">
+              {formatNumber(sample.keywords.length)} 个关键词
+            </span>
+          </div>
+          <AudioPlayer
+            src={sample.audio_url}
+            durationSeconds={sample.duration_seconds}
+          />
+          <SqaScoreChips scores={sample.sqa_scores} />
+          <div className="keyword-token-list">
+            {sample.keywords.map((keyword) => (
+              <div
+                className={`keyword-token ${keyword.correct ? "correct" : "incorrect"}`}
+                key={`${keyword.id}-${keyword.keyword}`}
+              >
+                <span title={keyword.id}>{keyword.keyword}</span>
+                <small>
+                  {keyword.expected_hit ? "Expected Hit" : "Expected No Hit"} /{" "}
+                  {keyword.predicted_hit ? "Predicted Hit" : "Predicted No Hit"}
+                </small>
+              </div>
+            ))}
+          </div>
+          <div className="keyword-transcript-grid">
+            <TextBlock label="Transcript" value={sample.transcript || "-"} />
+            <TextBlock label="Match Text" value={sample.match_text || "-"} />
+          </div>
+        </section>
+      ))}
     </div>
   );
 }
