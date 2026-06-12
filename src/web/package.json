@@ -1,7 +1,7 @@
 {
   "name": "prama-web",
   "private": true,
-  "version": "0.8.0a2",
+  "version": "0.8.1-gz03",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "scripts": {
