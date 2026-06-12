@@ -100,6 +100,8 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   hit_threshold: "0.9",
   streaming: false,
 };
+const KEYWORD_REPORT_INITIAL_VISIBLE = 100;
+const KEYWORD_REPORT_LOAD_STEP = 100;
 
 const APP_VERSION = packageJson.version;
 
@@ -2254,90 +2256,177 @@ function KeywordReportPanel({
 }
 
 function KeywordAudioSampleList({ samples }: { samples: KeywordAudioReportSample[] }) {
+  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
+  useEffect(() => {
+    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
+  }, [samples]);
+
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成语音聚合结果</div>;
   }
 
+  const visibleSamples = samples.slice(0, visibleCount);
+  const hasMore = visibleCount < samples.length;
+
   return (
-    <div className="keyword-sample-list">
-      {samples.map((sample) => (
-        <section className="keyword-sample keyword-audio-sample" key={sample.id}>
-          <div className="keyword-sample-title">
-            <span className="keyword-sample-name">
-              <strong>#{sample.index ?? "-"}</strong>
-              <span title={sample.id}>{sample.id}</span>
-            </span>
-            <span className="keyword-status">
-              {formatNumber(sample.keywords.length)} 个关键词
-            </span>
-          </div>
-          <AudioPlayer
-            src={sample.audio_url}
-            durationSeconds={sample.duration_seconds}
+    <>
+      <KeywordListToolbar
+        total={samples.length}
+        visible={visibleSamples.length}
+        onCollapse={
+          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
+            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
+            : undefined
+        }
+      />
+      <div className="keyword-sample-list">
+        {visibleSamples.map((sample) => (
+          <section className="keyword-sample keyword-audio-sample" key={sample.id}>
+            <div className="keyword-sample-title">
+              <span className="keyword-sample-name">
+                <strong>#{sample.index ?? "-"}</strong>
+                <span title={sample.id}>{sample.id}</span>
+              </span>
+              <span className="keyword-status">
+                {formatNumber(sample.keywords.length)} 个关键词
+              </span>
+            </div>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="keyword-token-list">
+              {sample.keywords.map((keyword) => (
+                <div
+                  className={`keyword-token ${keyword.correct ? "correct" : "incorrect"}`}
+                  key={`${keyword.id}-${keyword.keyword}`}
+                >
+                  <span title={keyword.id}>{keyword.keyword}</span>
+                  <small>
+                    {keyword.expected_hit ? "Expected Hit" : "Expected No Hit"} /{" "}
+                    {keyword.predicted_hit ? "Predicted Hit" : "Predicted No Hit"}
+                  </small>
+                </div>
+              ))}
+            </div>
+            <div className="keyword-transcript-grid">
+              <TextBlock label="Transcript" value={sample.transcript || "-"} />
+              <TextBlock label="Match Text" value={sample.match_text || "-"} />
+            </div>
+          </section>
+        ))}
+        {hasMore ? (
+          <KeywordLoadMoreButton
+            onClick={() =>
+              setVisibleCount((current) =>
+                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
+              )
+            }
           />
-          <SqaScoreChips scores={sample.sqa_scores} />
-          <div className="keyword-token-list">
-            {sample.keywords.map((keyword) => (
-              <div
-                className={`keyword-token ${keyword.correct ? "correct" : "incorrect"}`}
-                key={`${keyword.id}-${keyword.keyword}`}
-              >
-                <span title={keyword.id}>{keyword.keyword}</span>
-                <small>
-                  {keyword.expected_hit ? "Expected Hit" : "Expected No Hit"} /{" "}
-                  {keyword.predicted_hit ? "Predicted Hit" : "Predicted No Hit"}
-                </small>
-              </div>
-            ))}
-          </div>
-          <div className="keyword-transcript-grid">
-            <TextBlock label="Transcript" value={sample.transcript || "-"} />
-            <TextBlock label="Match Text" value={sample.match_text || "-"} />
-          </div>
-        </section>
-      ))}
-    </div>
+        ) : null}
+      </div>
+    </>
   );
 }
 
 function KeywordSampleList({ samples }: { samples: KeywordReportSample[] }) {
+  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
+  useEffect(() => {
+    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
+  }, [samples]);
+
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成关键词结果</div>;
   }
 
+  const visibleSamples = samples.slice(0, visibleCount);
+  const hasMore = visibleCount < samples.length;
+
   return (
-    <div className="keyword-sample-list">
-      {samples.map((sample) => (
-        <section
-          className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
-          key={sample.id}
-        >
-          <div className="keyword-sample-title">
-            <span className="keyword-sample-name">
-              <strong>#{sample.index ?? "-"}</strong>
-              <span title={sample.id}>{sample.id}</span>
-            </span>
-            <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
-              {sample.correct ? "正确" : "错误"}
-            </span>
-          </div>
-          <AudioPlayer
-            src={sample.audio_url}
-            durationSeconds={sample.duration_seconds}
+    <>
+      <KeywordListToolbar
+        total={samples.length}
+        visible={visibleSamples.length}
+        onCollapse={
+          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
+            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
+            : undefined
+        }
+      />
+      <div className="keyword-sample-list">
+        {visibleSamples.map((sample) => (
+          <section
+            className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
+            key={sample.id}
+          >
+            <div className="keyword-sample-title">
+              <span className="keyword-sample-name">
+                <strong>#{sample.index ?? "-"}</strong>
+                <span title={sample.id}>{sample.id}</span>
+              </span>
+              <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
+                {sample.correct ? "正确" : "错误"}
+              </span>
+            </div>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <div className="keyword-sample-metrics">
+              <Metric label="Keyword" value={sample.keyword || "-"} />
+              <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
+              <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
+            </div>
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="keyword-transcript-grid">
+              <TextBlock label="Transcript" value={sample.transcript || "-"} />
+              <TextBlock label="Match Text" value={sample.match_text || "-"} />
+            </div>
+          </section>
+        ))}
+        {hasMore ? (
+          <KeywordLoadMoreButton
+            onClick={() =>
+              setVisibleCount((current) =>
+                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
+              )
+            }
           />
-          <div className="keyword-sample-metrics">
-            <Metric label="Keyword" value={sample.keyword || "-"} />
-            <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
-            <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
-          </div>
-          <SqaScoreChips scores={sample.sqa_scores} />
-          <div className="keyword-transcript-grid">
-            <TextBlock label="Transcript" value={sample.transcript || "-"} />
-            <TextBlock label="Match Text" value={sample.match_text || "-"} />
-          </div>
-        </section>
-      ))}
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+function KeywordListToolbar({
+  total,
+  visible,
+  onCollapse,
+}: {
+  total: number;
+  visible: number;
+  onCollapse?: () => void;
+}) {
+  return (
+    <div className="keyword-list-toolbar">
+      <span>
+        已显示 {formatNumber(visible)} / {formatNumber(total)}
+      </span>
+      {onCollapse ? (
+        <button type="button" onClick={onCollapse}>
+          收起
+        </button>
+      ) : null}
     </div>
+  );
+}
+
+function KeywordLoadMoreButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" className="keyword-load-more" onClick={onClick}>
+      加载更多
+    </button>
   );
 }
 
