@@ -90,6 +90,7 @@ export interface EvaluationResult {
   wer?: number;
   cer?: number;
   accuracy?: number;
+  word_accuracy?: number;
   macro_precision?: number;
   recall?: number;
   known_accuracy?: number;

@@ -782,8 +782,13 @@ def _run_evaluation(job: EvaluationJob) -> None:
 
         wer_report = _build_wer_report(inference_rows)
         cer_report = _build_cer_report(inference_rows)
+        word_accuracy = _asr_accuracy_from_report(wer_report)
+        character_accuracy = _asr_accuracy_from_report(cer_report)
         result = {
             **metrics,
+            "accuracy": word_accuracy,
+            "word_accuracy": word_accuracy,
+            "character_accuracy": character_accuracy,
             "wer_report": wer_report,
             "cer_report": cer_report,
             **_performance_payload(
@@ -2757,6 +2762,12 @@ def _region_to_payload(
 
 def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return _build_asr_alignment_report(rows, metric_fn=get_wer)
+
+
+def _asr_accuracy_from_report(report: dict[str, Any]) -> float:
+    summary = report.get("summary") if isinstance(report, dict) else None
+    accuracy = summary.get("accuracy") if isinstance(summary, dict) else None
+    return float(accuracy) if isinstance(accuracy, int | float) else 0.0
 
 
 def _build_cer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:

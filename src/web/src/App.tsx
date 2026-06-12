@@ -1824,10 +1824,15 @@ function AsrOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   if (!result) {
     return null;
   }
+  const wordAccuracy =
+    result.word_accuracy ??
+    result.accuracy ??
+    result.wer_report?.summary?.accuracy;
 
   return (
     <div className="panel asr-overview-panel">
       <div className="metric-strip asr-overview-metrics">
+        <Metric label="Accuracy" value={formatRate(wordAccuracy)} />
         <Metric label="WER" value={formatRate(result.wer)} />
         <Metric label="CER" value={formatRate(result.cer)} />
       </div>
@@ -2046,6 +2051,7 @@ function AsrAlignmentReportPanel({
               label="WER"
               summary={werReport?.summary}
               fallbackRate={result?.wer}
+              accuracy={result?.word_accuracy ?? result?.accuracy}
             />
             <AsrMetricSummaryCard
               label="CER"
@@ -2793,10 +2799,12 @@ function AsrMetricSummaryCard({
   label,
   summary,
   fallbackRate,
+  accuracy,
 }: {
   label: "WER" | "CER";
   summary?: WerSummary;
   fallbackRate?: number;
+  accuracy?: number;
 }) {
   return (
     <section className="asr-summary-card">
@@ -2805,6 +2813,9 @@ function AsrMetricSummaryCard({
         <strong>{formatRate(summary?.wer ?? fallbackRate)}</strong>
       </div>
       <div className="report-summary">
+        {label === "WER" ? (
+          <Metric label="Accuracy" value={formatRate(summary?.accuracy ?? accuracy)} />
+        ) : null}
         <Metric label="Correct" value={formatNumber(summary?.correct)} />
         <Metric label="Sub" value={formatNumber(summary?.substitutions)} />
         <Metric label="Del" value={formatNumber(summary?.deletions)} />
