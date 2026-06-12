@@ -15,7 +15,7 @@ from prama_server.servicer.http import (
     EvaluationJob,
     EvaluationRequest,
     SqaAssessor,
-    _asr_word_accuracy_from_report,
+    _asr_accuracy_from_report,
     _build_keyword_report,
     _build_denoise_report,
     _build_sqa_summary,
@@ -787,8 +787,18 @@ class HttpReportMetricsTest(unittest.TestCase):
         self.assertEqual(cer_report["utterances"][0]["tokens"][0]["ref"], "我")
         self.assertLess(cer_report["summary"]["wer"], wer_report["summary"]["wer"])
 
-    def test_asr_word_accuracy_uses_prama_summary_accuracy(self) -> None:
+    def test_asr_accuracy_uses_prama_summary_accuracy(self) -> None:
         wer_report = _build_wer_report(
+            [
+                {
+                    "id": "utt1",
+                    "index": 1,
+                    "reference": "hello world",
+                    "hypothesis": "hello word",
+                }
+            ]
+        )
+        cer_report = _build_cer_report(
             [
                 {
                     "id": "utt1",
@@ -800,8 +810,12 @@ class HttpReportMetricsTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            _asr_word_accuracy_from_report(wer_report),
+            _asr_accuracy_from_report(wer_report),
             wer_report["summary"]["accuracy"],
+        )
+        self.assertEqual(
+            _asr_accuracy_from_report(cer_report),
+            cer_report["summary"]["accuracy"],
         )
 
     def test_sample_audio_endpoint_only_serves_registered_sample(self) -> None:

@@ -1828,11 +1828,15 @@ function AsrOverviewMetrics({ result }: { result: EvaluationResult | null }) {
     result.word_accuracy ??
     result.accuracy ??
     result.wer_report?.summary?.accuracy;
+  const characterAccuracy =
+    result.character_accuracy ??
+    result.cer_report?.summary?.accuracy;
 
   return (
     <div className="panel asr-overview-panel">
       <div className="metric-strip asr-overview-metrics">
-        <Metric label="Accuracy" value={formatRate(wordAccuracy)} />
+        <Metric label="词正确率" value={formatRate(wordAccuracy)} />
+        <Metric label="字正确率" value={formatRate(characterAccuracy)} />
         <Metric label="WER" value={formatRate(result.wer)} />
         <Metric label="CER" value={formatRate(result.cer)} />
       </div>
@@ -2052,11 +2056,14 @@ function AsrAlignmentReportPanel({
               summary={werReport?.summary}
               fallbackRate={result?.wer}
               accuracy={result?.word_accuracy ?? result?.accuracy}
+              accuracyLabel="词正确率"
             />
             <AsrMetricSummaryCard
               label="CER"
               summary={cerReport?.summary}
               fallbackRate={result?.cer}
+              accuracy={result?.character_accuracy}
+              accuracyLabel="字正确率"
             />
           </div>
           <CompactReportMeta result={result} fallbackCount={sampleCount} />
@@ -2800,11 +2807,13 @@ function AsrMetricSummaryCard({
   summary,
   fallbackRate,
   accuracy,
+  accuracyLabel,
 }: {
   label: "WER" | "CER";
   summary?: WerSummary;
   fallbackRate?: number;
   accuracy?: number;
+  accuracyLabel?: string;
 }) {
   return (
     <section className="asr-summary-card">
@@ -2813,9 +2822,10 @@ function AsrMetricSummaryCard({
         <strong>{formatRate(summary?.wer ?? fallbackRate)}</strong>
       </div>
       <div className="report-summary">
-        {label === "WER" ? (
-          <Metric label="Accuracy" value={formatRate(summary?.accuracy ?? accuracy)} />
-        ) : null}
+        <Metric
+          label={accuracyLabel ?? "Accuracy"}
+          value={formatRate(summary?.accuracy ?? accuracy)}
+        />
         <Metric label="Correct" value={formatNumber(summary?.correct)} />
         <Metric label="Sub" value={formatNumber(summary?.substitutions)} />
         <Metric label="Del" value={formatNumber(summary?.deletions)} />

@@ -91,6 +91,7 @@ export interface EvaluationResult {
   cer?: number;
   accuracy?: number;
   word_accuracy?: number;
+  character_accuracy?: number;
   macro_precision?: number;
   recall?: number;
   known_accuracy?: number;
