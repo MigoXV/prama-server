@@ -426,11 +426,12 @@ class HttpReportMetricsTest(unittest.TestCase):
             test_dir.mkdir(parents=True)
             sf.write(test_dir / "sample.wav", np.zeros(160, dtype=np.float32), 16000)
             (test_dir / "metadata.jsonl").write_text(
-                "\n".join(
-                    [
-                        '{"file_name":"sample.wav","id":"sample__kw_level","keyword":"LEVEL","expected_hit":true}',
-                        '{"file_name":"sample.wav","id":"sample__kw_altitude","keyword":"ALTITUDE","expected_hit":false}',
-                    ]
+                (
+                    '{"file_name":"sample.wav","id":"sample",'
+                    '"keywords":['
+                    '{"keyword":"LEVEL","expected_hit":true},'
+                    '{"keyword":"ALTITUDE","expected_hit":false}'
+                    "]}"
                 )
                 + "\n",
                 encoding="utf-8",
@@ -497,8 +498,8 @@ class HttpReportMetricsTest(unittest.TestCase):
             (test_dir / "metadata.jsonl").write_text(
                 "\n".join(
                     [
-                        '{"file_name":"first.wav","id":"first__kw_level","keyword":"LEVEL","expected_hit":true}',
-                        '{"file_name":"second.wav","id":"second__kw_level","keyword":"LEVEL","expected_hit":true}',
+                        '{"file_name":"first.wav","id":"first","keywords":[{"keyword":"LEVEL","expected_hit":true}]}',
+                        '{"file_name":"second.wav","id":"second","keywords":[{"keyword":"LEVEL","expected_hit":true}]}',
                     ]
                 )
                 + "\n",

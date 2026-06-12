@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -839,19 +838,19 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
         limit=request.limit,
         sample_rate=request.sample_rate,
     )
-    total = len(dataset)
-    audio_groups = _group_keyword_samples_by_audio(dataset)
+    total = _keyword_dataset_entry_count(dataset)
     report_samples: list[dict[str, Any]] = []
     audio_report_samples: list[dict[str, Any]] = []
     evaluation_start_time = time.perf_counter()
 
-    def evaluate_audio_group(group: dict[str, Any]) -> dict[str, Any]:
-        entries = group["entries"]
-        first_entry = entries[0]
-        audio_index = first_entry["index"]
-        audio_sample = first_entry["sample"]
-        audio_sample_id = group["audio_id"]
-        audio_array, audio_sample_rate = _decode_sample_audio(audio_sample["audio"])
+    def evaluate_audio_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        audio_sample_id = _keyword_audio_sample_id(sample, index)
+        keyword_entries = _keyword_entries_for_sample(
+            sample,
+            index=index,
+            audio_sample_id=audio_sample_id,
+        )
+        audio_array, audio_sample_rate = _decode_sample_audio(sample["audio"])
         if audio_sample_rate != request.sample_rate:
             raise ValueError(
                 f"样本采样率与关键词评估配置不一致: id={audio_sample_id} "
@@ -860,9 +859,9 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
         audio_array = _prepare_audio_for_export(audio_array)
         sample_record = _register_sample_record(
             job=job,
-            sample=audio_sample,
+            sample=sample,
             sample_id=audio_sample_id,
-            index=audio_index,
+            index=index,
             audio_array=audio_array,
             sample_rate=audio_sample_rate,
         )
@@ -873,17 +872,15 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
         keyword_report_samples = []
         payloads = []
 
-        for entry in entries:
-            index = entry["index"]
-            sample = entry["sample"]
-            sample_id = str(sample.get("id") or sample.get("utt_id") or index)
-            keyword = str(sample["keyword"]).strip()
-            expected_hit = _as_bool(sample["expected_hit"])
+        for entry in keyword_entries:
+            sample_id = entry["id"]
+            keyword = entry["keyword"]
+            expected_hit = entry["expected_hit"]
             predicted_hit = _keyword_matches(transcript, keyword)
             correct = predicted_hit == expected_hit
             keyword_result = {
                 "id": sample_id,
-                "index": index,
+                "index": entry["index"],
                 "keyword": keyword,
                 "expected_hit": expected_hit,
                 "predicted_hit": predicted_hit,
@@ -892,7 +889,7 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
             report_sample = {
                 **keyword_result,
                 "audio_id": audio_sample_id,
-                "audio_index": audio_index,
+                "audio_index": index,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
                 "transcript": transcript,
@@ -920,7 +917,7 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
 
         audio_report_sample = {
             "id": audio_sample_id,
-            "index": audio_index,
+            "index": index,
             "audio_url": sample_record.get("audio_url"),
             "duration_seconds": sample_record.get("duration_seconds"),
             "transcript": transcript,
@@ -934,7 +931,7 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
             "payloads": payloads,
         }
 
-    def publish_group_result(item: dict[str, Any], processed: int) -> int:
+    def publish_sample_result(item: dict[str, Any], processed: int) -> int:
         audio_report_samples.append(item["audio_report_sample"])
         for report_sample, payload in zip(
             item["report_samples"],
@@ -962,18 +959,22 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
     try:
         inference_concurrency = _task_inference_concurrency(request, "keyword")
         processed = 0
-        if inference_concurrency > 0 and audio_groups:
-            max_workers = min(inference_concurrency, len(audio_groups))
+        if inference_concurrency > 0 and len(dataset) > 0:
+            samples = list(enumerate(dataset, start=1))
+            max_workers = min(inference_concurrency, len(samples))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
-                    executor.submit(evaluate_audio_group, group)
-                    for group in audio_groups
+                    executor.submit(evaluate_audio_sample, index, sample)
+                    for index, sample in samples
                 ]
                 for future in as_completed(futures):
-                    processed = publish_group_result(future.result(), processed)
+                    processed = publish_sample_result(future.result(), processed)
         else:
-            for group in audio_groups:
-                processed = publish_group_result(evaluate_audio_group(group), processed)
+            for index, sample in enumerate(dataset, start=1):
+                processed = publish_sample_result(
+                    evaluate_audio_sample(index, sample),
+                    processed,
+                )
 
         processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
         report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
@@ -1053,9 +1054,12 @@ def _load_keyword_dataset(
     else:
         dataset = load_dataset(str(dataset_path), split=split)
 
-    missing = sorted({"audio", "keyword", "expected_hit"} - set(dataset.column_names))
+    column_names = set(dataset.column_names)
+    missing = sorted({"audio"} - column_names)
     if missing:
         raise ValueError(f"关键词数据集缺少必要字段: {', '.join(missing)}")
+    if "keywords" not in column_names and not {"keyword", "expected_hit"} <= column_names:
+        raise ValueError("关键词数据集缺少必要字段: keywords 或 keyword, expected_hit")
 
     if audio_file_names is not None and len(audio_file_names) == len(dataset):
         dataset = dataset.add_column("_keyword_audio_file_name", audio_file_names)
@@ -1071,15 +1075,9 @@ def _load_keyword_dataset(
     if limit is not None:
         dataset = dataset.select(range(min(limit, len(dataset))))
 
-    normalized_keywords = {
-        _normalize_keyword_text(str(sample["keyword"]))
-        for sample in dataset
-        if str(sample["keyword"]).strip()
-    }
+    normalized_keywords = _keyword_dataset_normalized_keywords(dataset)
     if not normalized_keywords:
         raise ValueError("关键词数据集必须提供非空 keyword")
-    for sample in dataset:
-        _as_bool(sample["expected_hit"])
 
     logger.info(
         "关键词数据集已加载: size=%s keyword_count=%s",
@@ -1112,48 +1110,107 @@ def _read_keyword_audio_file_names(dataset_path: Path, *, split: str) -> list[st
     return audio_file_names
 
 
-def _group_keyword_samples_by_audio(dataset: Dataset) -> list[dict[str, Any]]:
-    groups_by_key: dict[str, dict[str, Any]] = {}
-    groups: list[dict[str, Any]] = []
-    for index, sample in enumerate(dataset, start=1):
-        group_key = _keyword_audio_group_key(sample, fallback_index=index)
-        group = groups_by_key.get(group_key)
-        if group is None:
-            group = {"key": group_key, "entries": []}
-            groups_by_key[group_key] = group
-            groups.append(group)
-        group["entries"].append({"index": index, "sample": sample})
-    used_audio_ids: set[str] = set()
-    for group in groups:
-        first_entry = group["entries"][0]
-        audio_id = _keyword_audio_sample_id(
-            first_entry["sample"],
-            first_entry["index"],
+def _keyword_dataset_normalized_keywords(dataset: Dataset) -> set[str]:
+    normalized_keywords: set[str] = set()
+    if "keywords" in dataset.column_names:
+        ids = dataset["id"] if "id" in dataset.column_names else [None] * len(dataset)
+        for index, (sample_id, keyword_entries) in enumerate(
+            zip(ids, dataset["keywords"], strict=True),
+            start=1,
+        ):
+            entries = _keyword_entries_for_sample(
+                {"id": sample_id, "keywords": keyword_entries},
+                index=index,
+                audio_sample_id=str(sample_id or index),
+            )
+            normalized_keywords.update(
+                _normalize_keyword_text(entry["keyword"])
+                for entry in entries
+                if entry["keyword"]
+            )
+        return normalized_keywords
+
+    for keyword, expected_hit in zip(
+        dataset["keyword"],
+        dataset["expected_hit"],
+        strict=True,
+    ):
+        keyword_text = str(keyword).strip()
+        _as_bool(expected_hit)
+        if keyword_text:
+            normalized_keywords.add(_normalize_keyword_text(keyword_text))
+    return normalized_keywords
+
+
+def _keyword_dataset_entry_count(dataset: Dataset) -> int:
+    if "keywords" in dataset.column_names:
+        return sum(
+            len(
+                _keyword_entries_for_sample(
+                    {"keywords": keyword_entries},
+                    index=index,
+                    audio_sample_id=str(index),
+                )
+            )
+            for index, keyword_entries in enumerate(dataset["keywords"], start=1)
         )
-        if audio_id in used_audio_ids:
-            key_digest = hashlib.sha1(group["key"].encode("utf-8")).hexdigest()[:8]
-            audio_id = f"{audio_id}-{key_digest}"
-        used_audio_ids.add(audio_id)
-        group["audio_id"] = audio_id
-    return groups
+    return len(dataset)
 
 
-def _keyword_audio_group_key(sample: dict[str, Any], *, fallback_index: int) -> str:
-    audio_file_name = sample.get("_keyword_audio_file_name")
-    if isinstance(audio_file_name, str) and audio_file_name:
-        return f"file_name:{audio_file_name}"
+def _keyword_entries_for_sample(
+    sample: dict[str, Any],
+    *,
+    index: int,
+    audio_sample_id: str,
+) -> list[dict[str, Any]]:
+    if "keywords" in sample and sample["keywords"] is not None:
+        raw_entries = sample["keywords"]
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"keywords 必须是列表: id={audio_sample_id}")
+        if not raw_entries:
+            raise ValueError(f"keywords 不能为空: id={audio_sample_id}")
 
-    audio = sample.get("audio")
-    if isinstance(audio, dict):
-        audio_path = audio.get("path")
-        if isinstance(audio_path, str) and audio_path:
-            return f"path:{Path(audio_path).expanduser().resolve()}"
+        entries = []
+        for keyword_index, raw_entry in enumerate(raw_entries, start=1):
+            if not isinstance(raw_entry, dict):
+                raise ValueError(f"keywords 条目必须是对象: id={audio_sample_id}")
+            keyword = str(raw_entry.get("keyword") or "").strip()
+            if not keyword:
+                raise ValueError(f"keyword 不能为空: id={audio_sample_id}")
+            expected_hit = _as_bool(raw_entry.get("expected_hit"))
+            entry_id = str(
+                raw_entry.get("id")
+                or f"{audio_sample_id}__kw_{_keyword_slug(keyword, keyword_index)}"
+            )
+            entries.append(
+                {
+                    "id": entry_id,
+                    "index": index,
+                    "keyword": keyword,
+                    "expected_hit": expected_hit,
+                }
+            )
+        return entries
 
-    for key in ("file_name", "path"):
-        value = sample.get(key)
-        if isinstance(value, str) and value:
-            return f"{key}:{value}"
-    return f"row:{fallback_index}"
+    if "keyword" not in sample or "expected_hit" not in sample:
+        raise ValueError(f"关键词样本缺少 keywords 或 keyword, expected_hit: id={audio_sample_id}")
+    keyword = str(sample["keyword"]).strip()
+    if not keyword:
+        raise ValueError(f"keyword 不能为空: id={audio_sample_id}")
+    return [
+        {
+            "id": str(sample.get("id") or sample.get("utt_id") or index),
+            "index": index,
+            "keyword": keyword,
+            "expected_hit": _as_bool(sample["expected_hit"]),
+        }
+    ]
+
+
+def _keyword_slug(keyword: str, index: int) -> str:
+    normalized = _normalize_keyword_text(keyword)
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return slug or str(index)
 
 
 def _keyword_audio_sample_id(sample: dict[str, Any], index: int) -> str:
