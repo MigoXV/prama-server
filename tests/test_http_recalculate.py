@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import soundfile as sf
 from fastapi.testclient import TestClient
 
@@ -16,9 +18,11 @@ from prama_server.servicer.http import (
     _build_keyword_report,
     _build_denoise_report,
     _build_sqa_summary,
+    _build_vad_report,
     _build_cer_report,
     _build_wer_report,
     _build_lid_report,
+    _load_vad_dataset,
     _keyword_matches,
     _load_keyword_dataset,
     _normalize_keyword_text,
@@ -47,6 +51,137 @@ class HttpReportMetricsTest(unittest.TestCase):
             ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH_BYTES),
             GRPC_CHANNEL_OPTIONS,
         )
+
+    def test_vad_dataset_loads_local_parquet_split_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            audio_bytes = io.BytesIO()
+            sf.write(audio_bytes, np.zeros(160, dtype=np.float32), 16000, format="WAV")
+            pd.DataFrame(
+                [
+                    {
+                        "audio": {"bytes": audio_bytes.getvalue(), "path": None},
+                        "id": "sample-1",
+                        "seconds": {"starts": [0.0], "durations": [0.01]},
+                    }
+                ]
+            ).to_parquet(dataset_dir / "test-00000-of-00001.parquet")
+
+            dataset = _load_vad_dataset(
+                dataset_dir,
+                split="test",
+                limit=None,
+                sample_rate=16000,
+            )
+
+        self.assertEqual(len(dataset), 1)
+        self.assertEqual(dataset[0]["id"], "sample-1")
+        self.assertIn("audio", dataset.column_names)
+        self.assertEqual(dataset[0]["seconds"]["starts"][0], 0.0)
+
+    def test_vad_report_weights_recall_by_reference_and_precision_by_prediction(
+        self,
+    ) -> None:
+        eps = 1e-9
+        rows = [
+            self._vad_metric_row(
+                frame_recall=0.8,
+                frame_precision=0.5,
+                frame_miss_rate=0.2,
+                frame_false_alarm_rate=0.5,
+                segment_recall=0.5,
+                segment_precision=0.25,
+                segment_miss_rate=0.5,
+                segment_false_alarm_rate=0.75,
+                reference_segment_count=2,
+                prediction_segment_count=4,
+                segment_hit_count=1,
+                segment_miss_count=1,
+                segment_false_alarm_count=3,
+            ),
+            self._vad_metric_row(
+                frame_recall=0.0,
+                frame_precision=0.1,
+                frame_miss_rate=1.0,
+                frame_false_alarm_rate=0.9,
+                segment_recall=0.0,
+                segment_precision=0.2,
+                segment_miss_rate=0.0,
+                segment_false_alarm_rate=0.8,
+                reference_segment_count=0,
+                prediction_segment_count=10,
+                segment_hit_count=0,
+                segment_miss_count=0,
+                segment_false_alarm_count=8,
+            ),
+            self._vad_metric_row(
+                frame_recall=0.25,
+                frame_precision=0.0,
+                frame_miss_rate=0.75,
+                frame_false_alarm_rate=0.0,
+                segment_recall=0.25,
+                segment_precision=0.0,
+                segment_miss_rate=0.75,
+                segment_false_alarm_rate=0.0,
+                reference_segment_count=8,
+                prediction_segment_count=0,
+                segment_hit_count=2,
+                segment_miss_count=6,
+                segment_false_alarm_count=0,
+            ),
+        ]
+
+        report = _build_vad_report(rows, samples=[])
+
+        reference_weights = [2 + eps, eps, 8 + eps]
+        prediction_weights = [4 + eps, 10 + eps, eps]
+        expected_frame_recall = self._weighted(
+            [0.8, 0.0, 0.25],
+            reference_weights,
+        )
+        expected_frame_precision = self._weighted(
+            [0.5, 0.1, 0.0],
+            prediction_weights,
+        )
+        expected_segment_recall = self._weighted(
+            [0.5, 0.0, 0.25],
+            reference_weights,
+        )
+        expected_segment_precision = self._weighted(
+            [0.25, 0.2, 0.0],
+            prediction_weights,
+        )
+        expected_segment_f1 = (
+            2
+            * expected_segment_precision
+            * expected_segment_recall
+            / (expected_segment_precision + expected_segment_recall)
+        )
+
+        self.assertAlmostEqual(report["frame_recall"], expected_frame_recall)
+        self.assertAlmostEqual(report["frame"]["frame_recall"], expected_frame_recall)
+        self.assertAlmostEqual(report["frame_precision"], expected_frame_precision)
+        self.assertAlmostEqual(
+            report["frame"]["frame_precision"],
+            expected_frame_precision,
+        )
+        self.assertAlmostEqual(report["segment_recall"], expected_segment_recall)
+        self.assertAlmostEqual(
+            report["segment"]["segment_recall"],
+            expected_segment_recall,
+        )
+        self.assertAlmostEqual(report["segment_precision"], expected_segment_precision)
+        self.assertAlmostEqual(
+            report["segment"]["segment_precision"],
+            expected_segment_precision,
+        )
+        self.assertAlmostEqual(report["segment_f1"], expected_segment_f1)
+        self.assertAlmostEqual(report["segment"]["segment_f1"], expected_segment_f1)
+        self.assertEqual(report["reference_segment_count"], 10)
+        self.assertEqual(report["prediction_segment_count"], 14)
+        self.assertEqual(report["segment_hit_count"], 3)
+        self.assertEqual(report["segment_miss_count"], 7)
+        self.assertEqual(report["segment_false_alarm_count"], 11)
 
     def test_lid_metrics_use_open_set_metrics(self) -> None:
         payload = _build_lid_report(
@@ -137,6 +272,42 @@ class HttpReportMetricsTest(unittest.TestCase):
         self.assertEqual(confusion_rows["cn"]["en"], 1)
         self.assertEqual(confusion_rows["<others>"]["<others>"], 1)
         self.assertEqual(confusion_rows["<others>"]["cn"], 1)
+
+    def _vad_metric_row(self, **overrides: object) -> dict[str, object]:
+        row: dict[str, object] = {
+            "frame_accuracy": 0.0,
+            "frame_recall": 0.0,
+            "frame_precision": 0.0,
+            "frame_f1": 0.0,
+            "frame_specificity": 0.0,
+            "frame_false_alarm_rate": 0.0,
+            "frame_miss_rate": 0.0,
+            "frame_balanced_accuracy": 0.0,
+            "frame_total": 0,
+            "frame_speech": 0,
+            "frame_non_speech": 0,
+            "frame_true_positive": 0,
+            "frame_true_negative": 0,
+            "frame_false_positive": 0,
+            "frame_false_negative": 0,
+            "segment_recall": 0.0,
+            "segment_precision": 0.0,
+            "segment_f1": 0.0,
+            "segment_miss_rate": 0.0,
+            "segment_false_alarm_rate": 0.0,
+            "reference_segment_count": 0,
+            "prediction_segment_count": 0,
+            "segment_hit_count": 0,
+            "segment_miss_count": 0,
+            "segment_false_alarm_count": 0,
+        }
+        row.update(overrides)
+        return row
+
+    def _weighted(self, values: list[float], weights: list[float]) -> float:
+        return sum(value * weight for value, weight in zip(values, weights)) / sum(
+            weights
+        )
 
     def test_keyword_matching_normalizes_case_punctuation_and_word_boundaries(self) -> None:
         self.assertEqual(

@@ -23,7 +23,7 @@ import grpc
 import numpy as np
 import pandas as pd
 import soundfile as sf
-from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import Audio, Dataset, load_dataset
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 JobStatus = Literal["queued", "running", "completed", "failed"]
 EvaluationTask = Literal["asr", "vad", "lid", "denoise", "keyword"]
 LID_UNKNOWN_LANGUAGE = "<others>"
+VAD_REPORT_WEIGHT_EPS = 1e-9
 
 
 class EvaluationRequest(BaseModel):
@@ -998,17 +999,6 @@ def _load_keyword_dataset(
     logger.info("加载关键词数据集: path=%s split=%s", dataset_path, split)
     if _is_audiofolder_dataset_dir(dataset_path):
         dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
     else:
         dataset = load_dataset(str(dataset_path), split=split)
 
@@ -1684,17 +1674,6 @@ def _load_denoise_dataset(
     logger.info("加载 SE 数据集: path=%s split=%s", dataset_path, split)
     if _is_audiofolder_dataset_dir(dataset_path):
         dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
     else:
         dataset = load_dataset(str(dataset_path), split=split)
 
@@ -1718,17 +1697,6 @@ def _load_lid_dataset(
     logger.info("加载 LID 数据集: path=%s split=%s", dataset_path, split)
     if _is_audiofolder_dataset_dir(dataset_path):
         dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
     else:
         dataset = load_dataset(str(dataset_path), split=split)
 
@@ -1753,17 +1721,6 @@ def _load_vad_dataset(
     logger.info("加载 VAD 数据集: path=%s split=%s", dataset_path, split)
     if _is_audiofolder_dataset_dir(dataset_path):
         dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
     else:
         dataset = load_dataset(str(dataset_path), split=split)
 
@@ -1879,20 +1836,8 @@ def _build_vad_report(
 
     frame_average_keys = [
         "frame_accuracy",
-        "frame_recall",
-        "frame_precision",
-        "frame_f1",
         "frame_specificity",
-        "frame_false_alarm_rate",
-        "frame_miss_rate",
         "frame_balanced_accuracy",
-    ]
-    segment_average_keys = [
-        "segment_recall",
-        "segment_precision",
-        "segment_f1",
-        "segment_miss_rate",
-        "segment_false_alarm_rate",
     ]
     frame_count_keys = [
         "frame_total",
@@ -1914,11 +1859,69 @@ def _build_vad_report(
         key: float(np.mean([row[key] for row in rows]))
         for key in frame_average_keys
     }
+    reference_segment_weights = [
+        float(row["reference_segment_count"]) + VAD_REPORT_WEIGHT_EPS
+        for row in rows
+    ]
+    prediction_segment_weights = [
+        float(row["prediction_segment_count"]) + VAD_REPORT_WEIGHT_EPS
+        for row in rows
+    ]
+    frame_metrics.update(
+        {
+            "frame_recall": _weighted_vad_metric(
+                rows,
+                key="frame_recall",
+                weights=reference_segment_weights,
+            ),
+            "frame_precision": _weighted_vad_metric(
+                rows,
+                key="frame_precision",
+                weights=prediction_segment_weights,
+            ),
+            "frame_miss_rate": _weighted_vad_metric(
+                rows,
+                key="frame_miss_rate",
+                weights=reference_segment_weights,
+            ),
+            "frame_false_alarm_rate": _weighted_vad_metric(
+                rows,
+                key="frame_false_alarm_rate",
+                weights=prediction_segment_weights,
+            ),
+        }
+    )
+    frame_metrics["frame_f1"] = _f1_from_precision_recall(
+        frame_metrics["frame_precision"],
+        frame_metrics["frame_recall"],
+    )
     frame_metrics.update({key: int(sum(row[key] for row in rows)) for key in frame_count_keys})
     segment_metrics = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in segment_average_keys
+        "segment_recall": _weighted_vad_metric(
+            rows,
+            key="segment_recall",
+            weights=reference_segment_weights,
+        ),
+        "segment_precision": _weighted_vad_metric(
+            rows,
+            key="segment_precision",
+            weights=prediction_segment_weights,
+        ),
+        "segment_miss_rate": _weighted_vad_metric(
+            rows,
+            key="segment_miss_rate",
+            weights=reference_segment_weights,
+        ),
+        "segment_false_alarm_rate": _weighted_vad_metric(
+            rows,
+            key="segment_false_alarm_rate",
+            weights=prediction_segment_weights,
+        ),
     }
+    segment_metrics["segment_f1"] = _f1_from_precision_recall(
+        segment_metrics["segment_precision"],
+        segment_metrics["segment_recall"],
+    )
     segment_metrics.update(
         {key: int(sum(row[key] for row in rows)) for key in segment_count_keys}
     )
@@ -1931,6 +1934,27 @@ def _build_vad_report(
     report.update(segment_metrics)
     report["sample_count"] = len(rows)
     return report
+
+
+def _weighted_vad_metric(
+    rows: list[dict[str, Any]],
+    *,
+    key: str,
+    weights: list[float],
+) -> float:
+    weight_sum = sum(weights)
+    if weight_sum <= 0:
+        return 0.0
+    return float(
+        sum(float(row[key]) * weight for row, weight in zip(rows, weights))
+        / weight_sum
+    )
+
+
+def _f1_from_precision_recall(precision: float, recall: float) -> float:
+    if precision + recall <= 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
 
 
 def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
