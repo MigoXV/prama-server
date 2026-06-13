@@ -9,8 +9,13 @@ import numpy as np
 import soundfile as sf
 from datasets import load_dataset
 from datasets.exceptions import DatasetGenerationError
+from typer.testing import CliRunner
 
+from prama_server.utils.vad_select.app import app as vad_select_app
 from prama_server.utils.vad_select import select_vad_dataset
+
+
+runner = CliRunner()
 
 
 class VadSelectDatasetTest(unittest.TestCase):
@@ -139,6 +144,41 @@ class VadSelectDatasetTest(unittest.TestCase):
                     dataset_path=source,
                     output=root / "selected",
                 )
+
+    def test_cli_metric_options_override_file_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_source_dataset(root)
+            result_json = self._write_result_json(root, ["sample_a", "sample_b"])
+            output = root / "selected"
+
+            result = runner.invoke(
+                vad_select_app,
+                [
+                    "--result-json",
+                    str(result_json),
+                    "--dataset-path",
+                    str(source),
+                    "--output",
+                    str(output),
+                    "--min-frame-recall",
+                    "0.8",
+                    "--max-segment-f1",
+                    "0.6",
+                ],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            rows = self._read_jsonl(output / "test/metadata.jsonl")
+            self.assertEqual([row["id"] for row in rows], ["sample_a"])
+            summary = json.loads((output / "test/selection_summary.json").read_text())
+            self.assertEqual(
+                summary["enabled_metric_ranges"],
+                {
+                    "frame_recall": {"min": 0.8, "max": None},
+                    "segment_f1": {"min": None, "max": 0.6},
+                },
+            )
 
     def _write_source_dataset(self, root: Path) -> Path:
         source = root / "source"
