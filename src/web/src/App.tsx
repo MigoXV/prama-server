@@ -1724,12 +1724,8 @@ function KeywordOverviewMetrics({ result }: { result: EvaluationResult | null })
   return (
     <div className="panel keyword-overview-panel">
       <div className="metric-strip keyword-overview-metrics">
-        <Metric label="Accuracy" value={formatRate(result.accuracy)} />
-        <Metric label="Precision" value={formatRate(result.precision)} />
-        <Metric label="Recall" value={formatRate(result.recall)} />
-        <Metric label="F1" value={formatRate(result.f1)} />
-        <Metric label="Miss" value={formatNumber(result.miss_count)} />
-        <Metric label="False Alarm" value={formatNumber(result.false_alarm_count)} />
+        <Metric label="准确率" value={formatRate(result.precision)} />
+        <Metric label="召回率" value={formatRate(result.recall)} />
       </div>
       <SampleCountStrip
         result={result}
@@ -2027,20 +2023,8 @@ function KeywordReportPanel({
       {result ? (
         <>
           <div className="report-summary keyword-summary">
-            <Metric label="Accuracy" value={formatRate(result.accuracy)} />
-            <Metric label="Precision" value={formatRate(result.precision)} />
-            <Metric label="Recall" value={formatRate(result.recall)} />
-            <Metric label="F1" value={formatRate(result.f1)} />
-            <Metric label="Hit" value={formatNumber(result.hit_count)} />
-            <Metric label="Miss" value={formatNumber(result.miss_count)} />
-            <Metric
-              label="False Alarm"
-              value={formatNumber(result.false_alarm_count)}
-            />
-            <Metric
-              label="Correct Reject"
-              value={formatNumber(result.correct_reject_count)}
-            />
+            <Metric label="准确率" value={formatRate(result.precision)} />
+            <Metric label="召回率" value={formatRate(result.recall)} />
           </div>
           <CompactReportMeta result={result} fallbackCount={samples.length} />
           <SqaSummaryMetrics summary={result.sqa_summary} />
