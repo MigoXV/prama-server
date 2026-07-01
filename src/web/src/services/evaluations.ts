@@ -4,7 +4,6 @@ import type {
   EvaluationProgress,
   EvaluationRequest,
   EvaluationSnapshot,
-  HelpDocument,
   ServerDirectoryListing,
 } from "../types";
 
@@ -60,16 +59,6 @@ export async function testEngineConnectivity(
   }
 
   return response.json() as Promise<{ ok: boolean; target: string; message: string }>;
-}
-
-export async function getHelpDocument(): Promise<HelpDocument> {
-  const response = await fetch("/api/help");
-
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-
-  return response.json() as Promise<HelpDocument>;
 }
 
 export function subscribeEvaluationEvents(

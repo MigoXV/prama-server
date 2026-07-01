@@ -3,11 +3,6 @@ export type JobStatus = "queued" | "running" | "completed" | "failed";
 export type ThemeMode = "system" | "light" | "dark";
 export type EvaluationTask = "asr" | "vad" | "lid" | "denoise" | "keyword";
 
-export interface HelpDocument {
-  title: string;
-  markdown: string;
-}
-
 export interface SqaScore {
   engine_name: string;
   target: string;

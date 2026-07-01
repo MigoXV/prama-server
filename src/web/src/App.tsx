@@ -1,7 +1,6 @@
 import {
   Activity,
   BarChart3,
-  BookOpen,
   CheckCircle2,
   CircleDashed,
   Clipboard,
@@ -16,9 +15,7 @@ import {
   TriangleAlert,
   Monitor,
 } from "lucide-react";
-import katex from "katex";
-import "katex/dist/katex.min.css";
-import type { ChangeEvent, FormEvent, MouseEvent, ReactNode } from "react";
+import type { ChangeEvent, FormEvent, MouseEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
@@ -37,7 +34,6 @@ import { useThemeMode } from "./hooks/useThemeMode";
 import packageJson from "../package.json";
 import {
   createEvaluation,
-  getHelpDocument,
   getEvaluation,
   listServerDirectory,
   subscribeEvaluationEvents,
@@ -52,7 +48,6 @@ import type {
   EvaluationSnapshot,
   EvaluationTask,
   DenoiseReportSample,
-  HelpDocument,
   JobStatus,
   KeywordAudioReportSample,
   KeywordReportSample,
@@ -172,7 +167,7 @@ const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
   failed: "失败",
 };
 
-type ConsoleModule = "evaluation" | "settings" | "help";
+type ConsoleModule = "evaluation" | "settings";
 
 const MODULES: Array<{
   id: ConsoleModule;
@@ -181,7 +176,6 @@ const MODULES: Array<{
 }> = [
   { id: "evaluation", label: "在线评估", icon: Activity },
   { id: "settings", label: "设置", icon: Settings },
-  { id: "help", label: "帮助", icon: BookOpen },
 ];
 
 type AlignmentMetric = "wer" | "cer";
@@ -207,14 +201,6 @@ type EvaluationRunState = {
   busy: boolean;
 };
 type TaskEventClosers = Record<EvaluationTask, (() => void) | null>;
-type MarkdownBlock =
-  | { type: "heading"; level: 1 | 2 | 3; text: string; id: string }
-  | { type: "paragraph"; text: string }
-  | { type: "list"; items: string[] }
-  | { type: "code"; language: string; text: string }
-  | { type: "formula"; text: string }
-  | { type: "table"; headers: string[]; rows: string[][] };
-
 const EMPTY_RUN_STATE: EvaluationRunState = {
   status: "idle",
   jobId: "",
@@ -276,8 +262,6 @@ export default function App() {
     useState<AlignmentMetric>("wer");
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
   const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
-  const [helpDocument, setHelpDocument] = useState<HelpDocument | null>(null);
-  const [helpError, setHelpError] = useState("");
   const evaluationConnectivityKey = `evaluation:${formState.task}`;
   const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
   const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
@@ -366,27 +350,6 @@ export default function App() {
   useEffect(() => {
     datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
   }, [activeModule]);
-
-  useEffect(() => {
-    if (activeModule !== "help" || helpDocument || helpError) {
-      return;
-    }
-    let canceled = false;
-    getHelpDocument()
-      .then((document) => {
-        if (!canceled) {
-          setHelpDocument(document);
-        }
-      })
-      .catch((error) => {
-        if (!canceled) {
-          setHelpError(error instanceof Error ? error.message : "帮助文档加载失败");
-        }
-      });
-    return () => {
-      canceled = true;
-    };
-  }, [activeModule, helpDocument, helpError]);
 
   useEffect(() => {
     function handleGlobalKeyDown(event: KeyboardEvent) {
@@ -1220,27 +1183,6 @@ export default function App() {
             </section>
           ) : null}
 
-          {activeModule === "help" ? (
-            <section className="panel help-panel">
-              <div className="panel-heading">
-                <div>
-                  <h2>{helpDocument?.title || "帮助"}</h2>
-                  <span>数据集格式、字段要求和示例</span>
-                </div>
-              </div>
-              {helpError ? (
-                <div className="inline-warning">
-                  <TriangleAlert size={15} />
-                  {helpError}
-                </div>
-              ) : helpDocument ? (
-                <MarkdownDocument markdown={helpDocument.markdown} />
-              ) : (
-                <div className="empty-state">正在加载帮助文档</div>
-              )}
-            </section>
-          ) : null}
-
           {activeModule === "evaluation" ? (
           <section
             className={`run-column ${
@@ -1718,105 +1660,6 @@ function SqaScoreChips({ scores }: { scores?: SqaScore[] }) {
         );
       })}
     </span>
-  );
-}
-
-function MarkdownDocument({ markdown }: { markdown: string }) {
-  const blocks = useMemo(() => parseMarkdown(markdown), [markdown]);
-  return (
-    <article className="markdown-document">
-      {blocks.map((block, index) => {
-        if (block.type === "heading") {
-          const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
-          return (
-            <HeadingTag id={block.id} key={index}>
-              {renderInlineMarkdown(block.text)}
-            </HeadingTag>
-          );
-        }
-        if (block.type === "formula") {
-          return <LatexFormula key={index} text={block.text} displayMode />;
-        }
-        if (block.type === "code") {
-          return (
-            <pre key={index} className="markdown-code-block">
-              {block.language ? <span>{block.language}</span> : null}
-              <code>{block.text}</code>
-            </pre>
-          );
-        }
-        if (block.type === "list") {
-          return (
-            <ul key={index}>
-              {block.items.map((item, itemIndex) => (
-                <li key={itemIndex}>{renderInlineMarkdown(item)}</li>
-              ))}
-            </ul>
-          );
-        }
-        if (block.type === "table") {
-          return (
-            <div className="table-wrap markdown-table-wrap" key={index}>
-              <table>
-                <thead>
-                  <tr>
-                    {block.headers.map((header, headerIndex) => (
-                      <th key={headerIndex}>{renderInlineMarkdown(header)}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {block.rows.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      {block.headers.map((_, cellIndex) => (
-                        <td key={cellIndex}>
-                          {renderInlineMarkdown(row[cellIndex] ?? "")}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        }
-        return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
-      })}
-    </article>
-  );
-}
-
-function LatexFormula({
-  text,
-  displayMode = false,
-}: {
-  text: string;
-  displayMode?: boolean;
-}) {
-  const html = useMemo(
-    () =>
-      katex.renderToString(text, {
-        displayMode,
-        throwOnError: false,
-        strict: false,
-        trust: false,
-      }),
-    [displayMode, text],
-  );
-
-  if (displayMode) {
-    return (
-      <div
-        className="markdown-formula"
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
-    );
-  }
-  return (
-    <span
-      className="markdown-inline-formula"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
   );
 }
 
@@ -3356,208 +3199,6 @@ function formatSignedScore(value: unknown): string {
     return "-";
   }
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
-}
-
-function parseMarkdown(markdown: string): MarkdownBlock[] {
-  const blocks: MarkdownBlock[] = [];
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  let paragraph: string[] = [];
-  let listItems: string[] = [];
-  let codeLines: string[] = [];
-  let formulaLines: string[] = [];
-  let codeLanguage = "";
-  let inCode = false;
-  let inFormula = false;
-
-  function flushParagraph() {
-    if (paragraph.length) {
-      blocks.push({ type: "paragraph", text: paragraph.join(" ") });
-      paragraph = [];
-    }
-  }
-
-  function flushList() {
-    if (listItems.length) {
-      blocks.push({ type: "list", items: listItems });
-      listItems = [];
-    }
-  }
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const trimmed = line.trim();
-
-    if (trimmed === "$$") {
-      if (inFormula) {
-        blocks.push({ type: "formula", text: formulaLines.join("\n") });
-        formulaLines = [];
-        inFormula = false;
-      } else {
-        flushParagraph();
-        flushList();
-        inFormula = true;
-      }
-      continue;
-    }
-
-    if (inFormula) {
-      formulaLines.push(line);
-      continue;
-    }
-
-    if (line.startsWith("```")) {
-      if (inCode) {
-        const text = codeLines.join("\n");
-        blocks.push(
-          codeLanguage === "math" || codeLanguage === "formula"
-            ? { type: "formula", text }
-            : { type: "code", language: codeLanguage, text },
-        );
-        codeLines = [];
-        codeLanguage = "";
-        inCode = false;
-      } else {
-        flushParagraph();
-        flushList();
-        codeLanguage = line.slice(3).trim();
-        inCode = true;
-      }
-      continue;
-    }
-
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (!trimmed) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-
-    const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
-    if (heading) {
-      flushParagraph();
-      flushList();
-      const text = heading[2];
-      blocks.push({
-        type: "heading",
-        level: heading[1].length as 1 | 2 | 3,
-        text,
-        id: slugifyHeading(text),
-      });
-      continue;
-    }
-
-    if (isMarkdownTableStart(lines, index)) {
-      flushParagraph();
-      flushList();
-      const parsedTable = parseMarkdownTable(lines, index);
-      blocks.push(parsedTable.block);
-      index = parsedTable.nextIndex - 1;
-      continue;
-    }
-
-    if (trimmed.startsWith("- ")) {
-      flushParagraph();
-      listItems.push(trimmed.slice(2));
-      continue;
-    }
-
-    flushList();
-    paragraph.push(trimmed);
-  }
-
-  if (inCode) {
-    const text = codeLines.join("\n");
-    blocks.push(
-      codeLanguage === "math" || codeLanguage === "formula"
-        ? { type: "formula", text }
-        : { type: "code", language: codeLanguage, text },
-    );
-  }
-  if (inFormula) {
-    blocks.push({ type: "formula", text: formulaLines.join("\n") });
-  }
-  flushParagraph();
-  flushList();
-  return blocks;
-}
-
-function isMarkdownTableStart(lines: string[], index: number): boolean {
-  const current = lines[index]?.trim() ?? "";
-  const next = lines[index + 1]?.trim() ?? "";
-  return (
-    current.startsWith("|") &&
-    current.endsWith("|") &&
-    /^\|[\s:\-|]+\|$/.test(next)
-  );
-}
-
-function parseMarkdownTable(
-  lines: string[],
-  startIndex: number,
-): { block: MarkdownBlock; nextIndex: number } {
-  const headers = splitMarkdownTableRow(lines[startIndex]);
-  const rows: string[][] = [];
-  let index = startIndex + 2;
-  while (index < lines.length) {
-    const line = lines[index].trim();
-    if (!line.startsWith("|") || !line.endsWith("|")) {
-      break;
-    }
-    rows.push(splitMarkdownTableRow(line));
-    index += 1;
-  }
-  return { block: { type: "table", headers, rows }, nextIndex: index };
-}
-
-function splitMarkdownTableRow(line: string): string[] {
-  return line
-    .trim()
-    .slice(1, -1)
-    .split("|")
-    .map((cell) => cell.trim());
-}
-
-function renderInlineMarkdown(text: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const pattern = /(`([^`]+)`|\[([^\]]+)\]\((#[^)]+)\)|\$([^$]+)\$)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push(text.slice(lastIndex, match.index));
-    }
-    if (match[2]) {
-      nodes.push(<code key={`code-${match.index}`}>{match[2]}</code>);
-    } else if (match[3] && match[4]) {
-      nodes.push(
-        <a href={match[4]} key={`link-${match.index}`}>
-          {match[3]}
-        </a>,
-      );
-    } else if (match[5]) {
-      nodes.push(
-        <LatexFormula key={`math-${match.index}`} text={match[5]} />,
-      );
-    }
-    lastIndex = pattern.lastIndex;
-  }
-  if (lastIndex < text.length) {
-    nodes.push(text.slice(lastIndex));
-  }
-  return nodes;
-}
-
-function slugifyHeading(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/`/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/[^\p{L}\p{N}\-_]/gu, "");
 }
 
 function getVadTimelineWidth(duration: number): number {
