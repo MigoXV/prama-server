@@ -1867,7 +1867,7 @@ function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
 
   return (
     <div className="metric-strip lid-overview-metrics">
-      <Metric label="精确率" value={formatRate(result.macro_precision ?? result.precision)} />
+      <Metric label="准确率" value={formatRate(result.macro_precision ?? result.precision)} />
       <Metric label="召回率" value={formatRate(result.macro_recall ?? result.recall)} />
     </div>
   );
@@ -2180,7 +2180,7 @@ function LidReportPanel({
         <>
           <div className="report-summary lid-summary">
             <Metric
-              label="精确率"
+              label="准确率"
               value={formatRate(result.macro_precision ?? result.precision)}
             />
             <Metric
@@ -2627,7 +2627,7 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
                   <th>正确数</th>
                   <th>真实总数</th>
                   <th>预测总数</th>
-                  <th>精确率</th>
+                  <th>准确率</th>
                   <th>召回率</th>
                 </tr>
               </thead>
