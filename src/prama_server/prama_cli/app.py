@@ -112,17 +112,8 @@ _TSV_HEADERS = {
         "id",
         "audio_file",
         "duration_seconds",
-        "frame_accuracy",
-        "frame_precision",
-        "frame_recall",
-        "frame_f1",
-        "segment_precision",
-        "segment_recall",
-        "segment_f1",
-        "reference_segment_count",
-        "prediction_segment_count",
-        "segment_miss_count",
-        "segment_false_alarm_count",
+        "召回率",
+        "准确率",
     ],
     "lid": [
         "index",
@@ -594,17 +585,8 @@ def _vad_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "id": sample.get("id", ""),
                 "audio_file": sample.get("audio_file", ""),
                 "duration_seconds": sample.get("duration_seconds", ""),
-                "frame_accuracy": metrics.get("frame_accuracy", ""),
-                "frame_precision": metrics.get("frame_precision", ""),
-                "frame_recall": metrics.get("frame_recall", ""),
-                "frame_f1": metrics.get("frame_f1", ""),
-                "segment_precision": metrics.get("segment_precision", ""),
-                "segment_recall": metrics.get("segment_recall", ""),
-                "segment_f1": metrics.get("segment_f1", ""),
-                "reference_segment_count": metrics.get("reference_segment_count", ""),
-                "prediction_segment_count": metrics.get("prediction_segment_count", ""),
-                "segment_miss_count": metrics.get("segment_miss_count", ""),
-                "segment_false_alarm_count": metrics.get("segment_false_alarm_count", ""),
+                "召回率": metrics.get("frame_recall", ""),
+                "准确率": metrics.get("frame_precision", ""),
             }
         )
     return rows
@@ -705,7 +687,7 @@ def _tokens_to_text(tokens: list[dict[str, Any]], key: str) -> str:
 def _log_summary(*, task: str, result: dict[str, Any], output: Path) -> None:
     summary_keys = {
         "asr": ("wer", "cer"),
-        "vad": ("frame_f1", "segment_f1"),
+        "vad": ("frame_recall", "frame_precision"),
         "lid": ("precision", "recall"),
         "denoise": ("mean_snr_delta", "mean_mos_delta"),
         "keyword": ("accuracy", "precision", "recall", "f1"),

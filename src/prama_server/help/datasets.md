@@ -175,33 +175,20 @@ $$
 
 ### VAD 指标
 
-VAD 会把参考语音段和预测语音段转换为固定帧长的布尔 mask，再计算帧级指标；段级指标按语音段命中情况计算。
+VAD 会把参考语音段和预测语音段转换为固定帧长的布尔 mask，再计算语音帧的召回率和准确率。
 
 | 指标 | 定义 |
 | --- | --- |
-| Frame Accuracy | 所有帧中预测正确的比例 |
-| Frame Recall | 真实语音帧中被预测为语音的比例 |
-| Frame Precision | 预测语音帧中真实为语音的比例 |
-| Segment Recall | 真实语音段中被预测段命中的比例 |
-| Segment Precision | 预测语音段中命中真实段的比例 |
+| 召回率 | 真实语音帧中被预测为语音的比例 |
+| 准确率 | 预测语音帧中真实为语音的比例 |
 
 $$
-\mathrm{FrameAccuracy} = \frac{TP + TN}{TP + TN + FP + FN}
+\mathrm{Recall} = \frac{TP}{TP + FN}
 $$
 
 $$
-\mathrm{FrameRecall} = \frac{TP}{TP + FN}
+\mathrm{Precision} = \frac{TP}{TP + FP}
 $$
-
-$$
-\mathrm{FramePrecision} = \frac{TP}{TP + FP}
-$$
-
-$$
-\mathrm{FrameF1} = \frac{2 \times \mathrm{FramePrecision} \times \mathrm{FrameRecall}}{\mathrm{FramePrecision} + \mathrm{FrameRecall}}
-$$
-
-段级召回率以真实语音段为分母，段级精确率以预测语音段为分母。一个预测段只要满足当前命中阈值，就算命中对应真实段；未命中的预测段计为误报段。
 
 ### LID 指标
 

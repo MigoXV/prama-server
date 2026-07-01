@@ -1920,60 +1920,22 @@ function DenoiseOverviewMetrics({ result }: { result: EvaluationResult | null })
 
 function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   const frame = metrics.frame;
-  const segment = metrics.segment;
 
   return (
     <div className="vad-metric-groups">
       <section className="vad-metric-section">
         <div className="vad-metric-title">
           <span>帧级指标</span>
-          <strong>{formatRate(frame?.frame_f1 ?? metrics.frame_f1)}</strong>
+          <strong>{formatRate(frame?.frame_precision ?? metrics.frame_precision)}</strong>
         </div>
         <div className="report-summary vad-summary vad-frame-summary">
           <Metric
-            label="Accuracy"
-            value={formatRate(frame?.frame_accuracy ?? metrics.frame_accuracy)}
-          />
-          <Metric
-            label="Recall"
+            label="召回率"
             value={formatRate(frame?.frame_recall ?? metrics.frame_recall)}
           />
           <Metric
-            label="Precision"
+            label="准确率"
             value={formatRate(frame?.frame_precision ?? metrics.frame_precision)}
-          />
-          <Metric label="F1" value={formatRate(frame?.frame_f1 ?? metrics.frame_f1)} />
-        </div>
-      </section>
-
-      <section className="vad-metric-section">
-        <div className="vad-metric-title">
-          <span>段级指标</span>
-          <strong>{formatRate(segment?.segment_f1)}</strong>
-        </div>
-        <div className="report-summary vad-summary">
-          <Metric
-            label="Recall"
-            value={formatRate(segment?.segment_recall ?? metrics.segment_recall)}
-          />
-          <Metric
-            label="Precision"
-            value={formatRate(segment?.segment_precision ?? metrics.segment_precision)}
-          />
-          <Metric label="F1" value={formatRate(segment?.segment_f1)} />
-        </div>
-        <div className="metric-strip vad-segment-counts">
-          <Metric
-            label="Reference Segments"
-            value={formatNumber(
-              segment?.reference_segment_count ?? metrics.reference_segment_count,
-            )}
-          />
-          <Metric
-            label="Prediction Segments"
-            value={formatNumber(
-              segment?.prediction_segment_count ?? metrics.prediction_segment_count,
-            )}
           />
         </div>
       </section>

@@ -146,6 +146,20 @@ class PramaCliTsvTest(unittest.TestCase):
                 rows = _read_tsv(output)
                 self.assertEqual(rows[1]["index"], "1")
                 self.assertTrue(rows[1]["id"])
+                if task == "vad":
+                    self.assertEqual(
+                        list(rows[0]),
+                        [
+                            "index",
+                            "id",
+                            "audio_file",
+                            "duration_seconds",
+                            "召回率",
+                            "准确率",
+                        ],
+                    )
+                    self.assertEqual(rows[1]["召回率"], "1.0")
+                    self.assertEqual(rows[1]["准确率"], "1.0")
 
 
 def _read_tsv(path: Path) -> list[dict[str, str]]:
