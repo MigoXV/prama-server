@@ -15,7 +15,7 @@ import {
   TriangleAlert,
   Monitor,
 } from "lucide-react";
-import type { ChangeEvent, FormEvent, MouseEvent } from "react";
+import type { ChangeEvent, FormEvent, MouseEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
@@ -1452,13 +1452,179 @@ function Metric({ label, value }: { label: string; value: string }) {
   return <MetricTile className="metric" label={label} value={value} />;
 }
 
-function TextBlock({ label, value }: { label: string; value: string }) {
+function TextBlock({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="text-block">
       <span>{label}</span>
       <p>{value}</p>
     </div>
   );
+}
+
+type KeywordHighlightTone = "hit" | "false_alarm";
+
+interface KeywordHighlight {
+  keyword: string;
+  tone: KeywordHighlightTone;
+}
+
+function KeywordMatchTextBlock({
+  matchText,
+  highlights,
+}: {
+  matchText: string;
+  highlights: KeywordHighlight[];
+}) {
+  return (
+    <TextBlock
+      label="正则化后的推理结果"
+      value={
+        matchText ? (
+          <HighlightedKeywordText text={matchText} highlights={highlights} />
+        ) : (
+          "-"
+        )
+      }
+    />
+  );
+}
+
+function keywordHighlightsFromSample(sample: KeywordReportSample): KeywordHighlight[] {
+  if (!sample.predicted_hit) {
+    return [];
+  }
+  return [
+    {
+      keyword: sample.keyword,
+      tone: sample.expected_hit ? "hit" : "false_alarm",
+    },
+  ];
+}
+
+function keywordHighlightsFromAudioSample(
+  sample: KeywordAudioReportSample,
+): KeywordHighlight[] {
+  return sample.keywords.flatMap((keyword) => {
+    if (!keyword.predicted_hit) {
+      return [];
+    }
+    return [
+      {
+        keyword: keyword.keyword,
+        tone: keyword.expected_hit ? "hit" : "false_alarm",
+      },
+    ];
+  });
+}
+
+function HighlightedKeywordText({
+  text,
+  highlights,
+}: {
+  text: string;
+  highlights: KeywordHighlight[];
+}) {
+  const ranges = keywordHighlightRanges(text, highlights);
+  if (!ranges.length) {
+    return <>{text}</>;
+  }
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) {
+      parts.push(text.slice(cursor, range.start));
+    }
+    parts.push(
+      <mark
+        className={`keyword-match-highlight ${range.tone}`}
+        key={`${range.start}-${range.end}-${index}`}
+      >
+        {text.slice(range.start, range.end)}
+      </mark>,
+    );
+    cursor = range.end;
+  });
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
+  return <>{parts}</>;
+}
+
+function keywordHighlightRanges(text: string, highlights: KeywordHighlight[]) {
+  const ranges = highlights
+    .flatMap((highlight) =>
+      keywordRangesForHighlight(text, highlight).map((range) => ({
+        ...range,
+        tone: highlight.tone,
+      })),
+    )
+    .sort((left, right) => left.start - right.start || right.end - left.end);
+
+  const merged: Array<{ start: number; end: number; tone: KeywordHighlightTone }> = [];
+  ranges.forEach((range) => {
+    const previous = merged[merged.length - 1];
+    if (!previous || range.start >= previous.end) {
+      merged.push(range);
+      return;
+    }
+    if (range.end > previous.end && range.tone === previous.tone) {
+      previous.end = range.end;
+    }
+  });
+  return merged;
+}
+
+function keywordRangesForHighlight(text: string, highlight: KeywordHighlight) {
+  const normalizedKeyword = normalizeKeywordText(highlight.keyword);
+  if (!normalizedKeyword) {
+    return [];
+  }
+  if (isWordKeyword(normalizedKeyword)) {
+    return wordKeywordRanges(text, normalizedKeyword);
+  }
+  return substringKeywordRanges(text, normalizedKeyword);
+}
+
+function wordKeywordRanges(text: string, normalizedKeyword: string) {
+  const tokens = Array.from(text.matchAll(/\S+/g));
+  const keywordTokens = normalizedKeyword.split(" ");
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (let index = 0; index <= tokens.length - keywordTokens.length; index += 1) {
+    const tokenSlice = tokens.slice(index, index + keywordTokens.length);
+    const matches = tokenSlice.every((token, tokenIndex) => token[0] === keywordTokens[tokenIndex]);
+    if (matches) {
+      const firstToken = tokenSlice[0];
+      const lastToken = tokenSlice[tokenSlice.length - 1];
+      ranges.push({
+        start: firstToken.index ?? 0,
+        end: (lastToken.index ?? 0) + lastToken[0].length,
+      });
+    }
+  }
+  return ranges;
+}
+
+function substringKeywordRanges(text: string, normalizedKeyword: string) {
+  const ranges: Array<{ start: number; end: number }> = [];
+  let start = text.indexOf(normalizedKeyword);
+  while (start >= 0) {
+    ranges.push({ start, end: start + normalizedKeyword.length });
+    start = text.indexOf(normalizedKeyword, start + normalizedKeyword.length);
+  }
+  return ranges;
+}
+
+function normalizeKeywordText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/\p{P}/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function isWordKeyword(normalizedKeyword: string) {
+  return /^[a-z0-9]+(?: [a-z0-9]+)*$/.test(normalizedKeyword);
 }
 
 function AudioPlayer({
@@ -2112,10 +2278,10 @@ function KeywordAudioSampleList({ samples }: { samples: KeywordAudioReportSample
                 </div>
               ))}
             </div>
-            <div className="keyword-transcript-grid">
-              <TextBlock label="Transcript" value={sample.transcript || "-"} />
-              <TextBlock label="Match Text" value={sample.match_text || "-"} />
-            </div>
+            <KeywordMatchTextBlock
+              matchText={sample.match_text}
+              highlights={keywordHighlightsFromAudioSample(sample)}
+            />
           </section>
         ))}
         {hasMore ? (
@@ -2181,10 +2347,10 @@ function KeywordSampleList({ samples }: { samples: KeywordReportSample[] }) {
               <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
             </div>
             <SqaScoreChips scores={sample.sqa_scores} />
-            <div className="keyword-transcript-grid">
-              <TextBlock label="Transcript" value={sample.transcript || "-"} />
-              <TextBlock label="Match Text" value={sample.match_text || "-"} />
-            </div>
+            <KeywordMatchTextBlock
+              matchText={sample.match_text}
+              highlights={keywordHighlightsFromSample(sample)}
+            />
           </section>
         ))}
         {hasMore ? (
