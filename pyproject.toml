@@ -8,7 +8,7 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
 dependencies = [
-    "prama (>=0.1.0a1,<0.2.0)",
+    "prama (>=0.1.1,<0.2.0)",
     "typer (>=0.25.1,<0.26.0)",
     "fastapi (>=0.136.1,<0.137.0)",
     "uvicorn (>=0.46.0,<0.47.0)",

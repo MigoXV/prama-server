@@ -45,21 +45,22 @@ ASR 评估每条样本必须包含：
 
 ## 关键词数据集
 
-关键词评估复用 ASR 引擎：系统先对音频做 ASR，再从 ASR 输出文本里查找关键词。每条样本都可以提供自己的 `keyword`，因此同一个数据集可以包含多个关键词。
+关键词评估复用 ASR 引擎：系统先对音频做一次 ASR，再从 ASR 输出文本里查找该音频对应的全部关键词。推荐一条音频记录使用 `keywords` 数组。
 
 每条样本必须包含：
 
 - `audio`: 音频文件或可解码音频对象。
-- `keyword`: 要查找的关键词。
-- `expected_hit`: 布尔值，表示该音频真实是否应命中关键词。
+- `keywords`: 非空数组；每项包含 `keyword` 和布尔字段 `expected_hit`。
 - `id` 或 `utt_id`: 可选样本 ID。
 
 `audiofolder` 的 `metadata.jsonl` 示例：
 
 ```jsonl
-{"file_name":"keyword_demo_hit_01.wav","id":"keyword_hit_001","keyword":"AUSTRIAN","expected_hit":true}
-{"file_name":"keyword_demo_negative_silence.wav","id":"keyword_neg_001","keyword":"AUSTRIAN","expected_hit":false}
+{"file_name":"keyword_demo_01.wav","id":"keyword_001","keywords":[{"keyword":"AUSTRIAN","expected_hit":true},{"keyword":"SPEED","expected_hit":false}]}
+{"file_name":"keyword_demo_02.wav","id":"keyword_002","keywords":[{"keyword":"LEVEL","expected_hit":true}]}
 ```
+
+旧格式的顶层 `keyword`、`expected_hit` 仍受支持。同一 `file_name` 的旧格式多行记录会合并为一条音频，只推理一次。`limit` 限制音频条数，每条入选音频的所有关键词都会参与统计。
 
 匹配时会把 ASR 文本和关键词统一转小写、去标点并压缩空白。英文和数字关键词按词边界匹配，避免 `CAT` 误命中 `CATCH`；中文等非空白语言文本按规范化后的子串匹配。
 
@@ -71,11 +72,11 @@ VAD 评估每条样本必须包含：
 - `seconds`: 参考语音段列表，单位为秒。
 - `id` 或 `utt_id`: 可选样本 ID。
 
-`seconds` 是二维数组，每个元素为 `[start, end]`。
+`seconds` 包含等长的 `starts` 和 `durations` 数组，单位均为秒。
 
 ```jsonl
-{"file_name":"vad_001.wav","id":"vad_001","seconds":[[0.32,1.46],[2.10,3.80]]}
-{"file_name":"vad_002.wav","id":"vad_002","seconds":[]}
+{"file_name":"vad_001.wav","id":"vad_001","seconds":{"starts":[0.32,2.10],"durations":[1.14,1.70]}}
+{"file_name":"vad_002.wav","id":"vad_002","seconds":{"starts":[],"durations":[]}}
 ```
 
 ## LID 数据集
@@ -130,8 +131,10 @@ ASR 使用参考文本 `Reference` 与识别文本 `Hypothesis` 对齐后计算 
 
 | 指标 | 含义 | 分母 |
 | --- | --- | --- |
-| WER | 词错误率 | 参考文本词数 |
-| CER | 字符错误率 | 参考文本字符数 |
+| WER | 词错误率，百分制 | 参考文本词数 |
+| CER | 字符错误率，百分制 | 参考文本字符数 |
+| 词正确率 | `(C-I)/N = 1-WER`，百分制 | 参考文本词数 |
+| 字正确率 | `(C-I)/N = 1-CER`，百分制 | 参考文本字符数 |
 
 $$
 \mathrm{WER} = \frac{S_{\mathrm{word}} + D_{\mathrm{word}} + I_{\mathrm{word}}}{N_{\mathrm{word}}}
@@ -142,6 +145,14 @@ $$
 $$
 
 其中 `S` 为替换数，`D` 为删除数，`I` 为插入数，`N` 为参考文本单元数。插入错误计入分子，但分母仍只使用参考文本单元数。
+
+正确率沿用 SCLITE 定义：
+
+$$
+\mathrm{Accuracy} = \frac{C-I}{N} = 1-\mathrm{ErrorRate}
+$$
+
+API 和界面中的 WER、CER、词正确率、字正确率均使用百分制，例如 `12.5` 表示 `12.5%`。插入错误数大于正确数时，正确率可以为负值；这是指标定义的正常结果，不会截断为 0。顶层 `accuracy` 是 `word_accuracy` 的兼容别名。
 
 ### 关键词指标
 
@@ -174,7 +185,7 @@ $$
 
 ### VAD 指标
 
-VAD 会把参考语音段和预测语音段转换为固定帧长的布尔 mask，再计算帧级指标；段级指标按语音段命中情况计算。
+VAD 会把参考语音段和预测语音段转换为固定帧长的布尔 mask，再计算帧级指标；段级指标按语音段命中情况计算。顶层字段以及 `frame`、`segment` 是把所有样本的计数先相加再计算的 Micro 指标；`frame_macro`、`segment_macro` 是各样本比率的算术平均。
 
 | 指标 | 定义 |
 | --- | --- |
@@ -200,7 +211,12 @@ $$
 \mathrm{FrameF1} = \frac{2 \times \mathrm{FramePrecision} \times \mathrm{FrameRecall}}{\mathrm{FramePrecision} + \mathrm{FrameRecall}}
 $$
 
-段级召回率以真实语音段为分母，段级精确率以预测语音段为分母。一个预测段只要满足当前命中阈值，就算命中对应真实段；未命中的预测段计为误报段。
+段级指标有意沿用现有评估器的非对称定义：
+
+- 段召回率以真实语音段为分母。对每个真实段，预测覆盖占该真实段的比例达到 `hit_threshold` 才算命中。
+- 段精确率以预测语音段为分母。预测段只要与任一真实段存在正长度重叠就算命中，否则计为误报段；这里不应用 `hit_threshold`。
+
+聚合时 Micro F1 由 Micro Precision 和 Micro Recall 重新计算；Macro F1 是逐样本 F1 的算术平均。任何分母为 0 的比率都定义为 0。
 
 ### LID 指标
 
@@ -209,7 +225,9 @@ LID 按开放集识别计算。真实标签为 `<others>` 的样本是未知语�
 | 指标 | 定义 | 分母 |
 | --- | --- | --- |
 | 已知语种准确率 | 真实标签不是 `<others>` 且预测正确的样本比例 | 真实已知语种样本数 |
+| 类别精确率 | 预测为某个已知语种的样本中预测正确的比例 | 预测为该类别的样本数 |
 | 类别召回率 | 某个有效已知语种真实标签下预测正确的样本比例；`<others>` 不计算召回率 | 该有效类别真实样本数 |
+| 宏平均精确率 | 对真实标签中出现的已知类别精确率取算术平均 | 真实已知语种类别数 |
 | 宏平均召回率 | 仅对真实标签不是 `<others>` 的有效类别召回率取算术平均 | 真实已知语种类别数 |
 | 未知误接收 | 真实 `<others>` 干扰样本被预测为已知语种的样本数 | 不做比例化 |
 | 已知被拒识 | 真实已知语种被预测为 `<others>` 的样本数 | 不做比例化 |
@@ -223,10 +241,18 @@ $$
 $$
 
 $$
+\mathrm{Precision}_{\mathrm{label}} = \frac{\mathrm{Correct}_{\mathrm{label}}}{\mathrm{Predicted}_{\mathrm{label}}}
+$$
+
+$$
+\mathrm{Precision}_{\mathrm{macro}} = \frac{\sum_{\ell \in \mathcal{K}} \mathrm{Precision}_{\ell}}{|\mathcal{K}|}
+$$
+
+$$
 \mathrm{Recall}_{\mathrm{macro}} = \frac{\sum_{\ell \in \mathcal{K}} \mathrm{Recall}_{\ell}}{|\mathcal{K}|}, \quad \mathcal{K}=\{\ell \mid \ell \ne \langle others \rangle\}
 $$
 
-`<others>` 是干扰集，不计算类别召回率，也不进入宏平均召回率。它仍保留在混淆矩阵中：`<others>` 行表示干扰样本是否被正确拒识；`<others>` 列表示已知语种是否被错误拒识。
+已知类别集合 $\mathcal{K}$ 由真实标签中出现且不等于 `<others>` 的类别构成。`<others>` 不计算类别精确率或召回率，也不进入宏平均。它仍保留在混淆矩阵中：`<others>` 行表示干扰样本是否被正确拒识；`<others>` 列表示已知语种是否被错误拒识。类别没有预测样本时，其精确率按 0 计算。
 
 ### SE 指标
 

@@ -86,7 +86,7 @@ class EvaluationRequest(BaseModel):
         0.0,
         ge=0,
         le=1,
-        description="LID 置信度阈值兼容字段；当前严格按模型输出标签判定",
+        description="LID 置信度阈值；低于阈值的预测按 <others> 处理",
     )
     remove_punctuation: bool = Field(False, description="ASR 评估时是否移除标点")
     mask_frame_seconds: float = Field(0.01, gt=0, description="VAD mask 帧长秒数")
@@ -304,11 +304,19 @@ ALLOWED_UPLOAD_SUFFIXES = {
     ".parquet",
     ".txt",
 }
+FRONTEND_DIST_ENV = "PRAMA_SERVER_WEB_DIST"
+FRONTEND_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+FRONTEND_DOCUMENT_CACHE_CONTROL = "no-cache"
 
 
-@app.get("/")
-def index() -> dict[str, str]:
+@app.get("/api/health")
+def get_health() -> dict[str, str]:
     return {"name": "Prama ASR Evaluation Service", "status": "ok"}
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return _serve_frontend_path("")
 
 
 @app.get("/api/help", response_model=HelpDocument)
@@ -540,6 +548,50 @@ def _upload_root() -> Path:
     if configured_upload_root:
         return Path(configured_upload_root).resolve()
     return _workspace_root()
+
+
+def _frontend_dist_path() -> Path:
+    configured_dist = os.environ.get(FRONTEND_DIST_ENV, "").strip()
+    if configured_dist:
+        return Path(configured_dist).expanduser().resolve()
+    return (Path(__file__).resolve().parents[2] / "web" / "dist").resolve()
+
+
+def _serve_frontend_path(frontend_path: str) -> FileResponse:
+    dist_path = _frontend_dist_path()
+    index_path = dist_path / "index.html"
+    if not index_path.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Web 前端尚未构建；请先执行前端构建，"
+                f"或通过 {FRONTEND_DIST_ENV} 指定构建产物目录"
+            ),
+        )
+
+    requested_path = (dist_path / frontend_path).resolve()
+    if requested_path != dist_path and dist_path not in requested_path.parents:
+        raise HTTPException(status_code=404, detail="前端资源不存在")
+
+    if requested_path.is_file():
+        cache_control = (
+            FRONTEND_ASSET_CACHE_CONTROL
+            if requested_path.parent == dist_path / "assets"
+            or dist_path / "assets" in requested_path.parents
+            else FRONTEND_DOCUMENT_CACHE_CONTROL
+        )
+        return FileResponse(
+            requested_path,
+            headers={"Cache-Control": cache_control},
+        )
+
+    if Path(frontend_path).suffix:
+        raise HTTPException(status_code=404, detail="前端资源不存在")
+
+    return FileResponse(
+        index_path,
+        headers={"Cache-Control": FRONTEND_DOCUMENT_CACHE_CONTROL},
+    )
 
 
 def _workspace_root() -> Path:
@@ -781,8 +833,13 @@ def _run_evaluation(job: EvaluationJob) -> None:
 
         wer_report = _build_wer_report(inference_rows)
         cer_report = _build_cer_report(inference_rows)
+        word_accuracy = _asr_accuracy_from_report(wer_report)
+        character_accuracy = _asr_accuracy_from_report(cer_report)
         result = {
             **metrics,
+            "accuracy": word_accuracy,
+            "word_accuracy": word_accuracy,
+            "character_accuracy": character_accuracy,
             "wer_report": wer_report,
             "cer_report": cer_report,
             **_performance_payload(
@@ -834,121 +891,192 @@ def _run_keyword_evaluation(job: EvaluationJob) -> None:
     dataset = _load_keyword_dataset(
         Path(request.dataset_path),
         split=request.split,
-        limit=request.limit,
+        limit=None,
         sample_rate=request.sample_rate,
     )
-    total = len(dataset)
+    audio_samples = _group_keyword_audio_samples(dataset, limit=request.limit)
+    total = sum(len(sample["keyword_entries"]) for sample in audio_samples)
     report_samples: list[dict[str, Any]] = []
+    audio_report_samples: list[dict[str, Any]] = []
     evaluation_start_time = time.perf_counter()
 
-    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
-        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
-        keyword = str(sample["keyword"]).strip()
-        expected_hit = _as_bool(sample["expected_hit"])
+    def evaluate_audio_sample(group: dict[str, Any]) -> dict[str, Any]:
+        index = int(group["index"])
+        sample = group["sample"]
+        audio_sample_id = str(group["id"])
         audio_array, audio_sample_rate = _decode_sample_audio(sample["audio"])
         if audio_sample_rate != request.sample_rate:
             raise ValueError(
-                f"样本采样率与关键词评估配置不一致: id={sample_id} "
+                f"样本采样率与关键词评估配置不一致: id={audio_sample_id} "
                 f"audio_sample_rate={audio_sample_rate} sample_rate={request.sample_rate}"
             )
         audio_array = _prepare_audio_for_export(audio_array)
         sample_record = _register_sample_record(
             job=job,
             sample=sample,
-            sample_id=sample_id,
+            sample_id=audio_sample_id,
             index=index,
             audio_array=audio_array,
             sample_rate=audio_sample_rate,
         )
         transcript = _infer_final_transcript(inferencer, audio_array)
         match_text = _normalize_keyword_text(transcript)
-        predicted_hit = _keyword_matches(transcript, keyword)
-        correct = predicted_hit == expected_hit
-        report_sample = {
-            "id": sample_id,
-            "index": index,
-            "audio_url": sample_record.get("audio_url"),
-            "duration_seconds": sample_record.get("duration_seconds"),
-            "keyword": keyword,
-            "expected_hit": expected_hit,
-            "predicted_hit": predicted_hit,
-            "correct": correct,
-            "transcript": transcript,
-            "match_text": match_text,
-            "sqa_scores": sqa_assessor.assess(audio_array),
-        }
-        return {
-            "report_sample": report_sample,
-            "payload": {
-                "status": "running",
-                "tag": job.job_id,
-                "total": total,
+        sqa_scores = sqa_assessor.assess(audio_array)
+        keyword_results: list[dict[str, Any]] = []
+        keyword_report_samples: list[dict[str, Any]] = []
+        payloads: list[dict[str, Any]] = []
+
+        for entry in group["keyword_entries"]:
+            sample_id = str(entry["id"])
+            keyword = str(entry["keyword"])
+            expected_hit = bool(entry["expected_hit"])
+            predicted_hit = _keyword_matches(transcript, keyword)
+            correct = predicted_hit == expected_hit
+            keyword_result = {
                 "id": sample_id,
-                "current_id": sample_id,
-                "reference": f"{keyword}: {'hit' if expected_hit else 'no hit'}",
-                "hypothesis": "hit" if predicted_hit else "no hit",
-                "is_final": True,
-                "result": report_sample,
+                "index": int(entry["index"]),
+                "keyword": keyword,
+                "expected_hit": expected_hit,
+                "predicted_hit": predicted_hit,
+                "correct": correct,
+            }
+            report_sample = {
+                **keyword_result,
+                "audio_id": audio_sample_id,
+                "audio_index": index,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
-                "sqa_scores": report_sample.get("sqa_scores", []),
+                "transcript": transcript,
+                "match_text": match_text,
+                "sqa_scores": sqa_scores,
+            }
+            keyword_results.append(keyword_result)
+            keyword_report_samples.append(report_sample)
+            payloads.append(
+                {
+                    "status": "running",
+                    "tag": job.job_id,
+                    "total": total,
+                    "id": sample_id,
+                    "current_id": sample_id,
+                    "reference": f"{keyword}: {'hit' if expected_hit else 'no hit'}",
+                    "hypothesis": "hit" if predicted_hit else "no hit",
+                    "is_final": True,
+                    "result": report_sample,
+                    "audio_url": sample_record.get("audio_url"),
+                    "duration_seconds": sample_record.get("duration_seconds"),
+                    "sqa_scores": sqa_scores,
+                }
+            )
+
+        return {
+            "audio_report_sample": {
+                "id": audio_sample_id,
+                "index": index,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+                "transcript": transcript,
+                "match_text": match_text,
+                "sqa_scores": sqa_scores,
+                "keywords": keyword_results,
             },
+            "report_samples": keyword_report_samples,
+            "payloads": payloads,
         }
 
-    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
-        report_samples.append(item["report_sample"])
-        payload = {
-            **item["payload"],
-            "processed": processed,
-            "evaluated": processed,
-        }
-        with job.lock:
-            job.latest_progress = payload
-        message_manager.put(
-            ManagedMessage(
-                job_id=job.job_id,
-                event_name="inference_result",
-                payload=payload,
+    def publish_sample_result(item: dict[str, Any], processed: int) -> int:
+        audio_report_samples.append(item["audio_report_sample"])
+        for report_sample, payload in zip(
+            item["report_samples"],
+            item["payloads"],
+            strict=True,
+        ):
+            processed += 1
+            report_samples.append(report_sample)
+            progress_payload = {
+                **payload,
+                "processed": processed,
+                "evaluated": processed,
+            }
+            with job.lock:
+                job.latest_progress = progress_payload
+            message_manager.put(
+                ManagedMessage(
+                    job_id=job.job_id,
+                    event_name="inference_result",
+                    payload=progress_payload,
+                )
             )
-        )
+        return processed
 
     try:
-        samples = list(enumerate(dataset, start=1))
         inference_concurrency = _task_inference_concurrency(request, "keyword")
-        if inference_concurrency > 0 and samples:
-            max_workers = min(inference_concurrency, len(samples))
+        processed = 0
+        if inference_concurrency > 0 and audio_samples:
+            max_workers = min(inference_concurrency, len(audio_samples))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
-                    executor.submit(evaluate_sample, index, sample)
-                    for index, sample in samples
+                    executor.submit(evaluate_audio_sample, sample)
+                    for sample in audio_samples
                 ]
-                for processed, future in enumerate(as_completed(futures), start=1):
-                    publish_sample_result(future.result(), processed)
+                for future in as_completed(futures):
+                    processed = publish_sample_result(future.result(), processed)
         else:
-            for index, sample in samples:
-                publish_sample_result(evaluate_sample(index, sample), index)
+            for sample in audio_samples:
+                processed = publish_sample_result(
+                    evaluate_audio_sample(sample),
+                    processed,
+                )
 
         processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
         report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        audio_report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
         with job.lock:
             job.status = "completed"
             job.keyword_report_samples = report_samples
             job.result = {
                 **_build_keyword_report(report_samples),
+                "keyword_audio_report": {"samples": audio_report_samples},
+                "audio_sample_count": len(audio_report_samples),
                 **_performance_payload(
-                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    audio_duration_seconds=_sum_sample_duration(audio_report_samples),
                     processing_elapsed_seconds=processing_elapsed_seconds,
                 ),
                 **_sample_count_payload(
                     included_count=len(report_samples),
                     total_count=len(report_samples),
                 ),
-                **_sqa_summary_payload(report_samples),
+                **_sqa_summary_payload(audio_report_samples),
             }
         logger.info("关键词评估任务完成: job_id=%s", job.job_id)
     finally:
         sqa_assessor.close()
         inferencer.close()
+
+
+def _load_dataset_source(dataset_path: Path, *, split: str) -> Dataset:
+    if _is_audiofolder_dataset_dir(dataset_path):
+        return load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
+    if _is_saved_to_disk_dataset_dir(dataset_path):
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            if split not in loaded:
+                available_splits = ", ".join(loaded.keys())
+                raise ValueError(
+                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
+                )
+            return loaded[split]
+        return loaded
+    return load_dataset(str(dataset_path), split=split)
+
+
+def _is_saved_to_disk_dataset_dir(dataset_path: Path) -> bool:
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return False
+    return (dataset_path / "dataset_dict.json").is_file() or (
+        (dataset_path / "state.json").is_file()
+        and (dataset_path / "dataset_info.json").is_file()
+    )
 
 
 def _load_evaluation_dataset(
@@ -960,10 +1088,10 @@ def _load_evaluation_dataset(
     min_reference_words: int | None,
 ) -> Dataset:
     logger.info("加载数据集: path=%s split=%s", dataset_path, split)
-    if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
+    missing = sorted({"audio", "text"} - set(dataset.column_names))
+    if missing:
+        raise ValueError(f"ASR 数据集缺少必要字段: {', '.join(missing)}")
     dataset = dataset.cast_column(
         "audio",
         Audio(sampling_rate=sample_rate),
@@ -996,46 +1124,237 @@ def _load_keyword_dataset(
     sample_rate: int,
 ) -> Dataset:
     logger.info("加载关键词数据集: path=%s split=%s", dataset_path, split)
+    audio_file_names: list[str] | None = None
     if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+        audio_file_names = _read_keyword_audio_file_names(dataset_path, split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
 
-    missing = sorted({"audio", "keyword", "expected_hit"} - set(dataset.column_names))
-    if missing:
-        raise ValueError(f"关键词数据集缺少必要字段: {', '.join(missing)}")
+    column_names = set(dataset.column_names)
+    if "audio" not in column_names:
+        raise ValueError("关键词数据集缺少必要字段: audio")
+    if "keywords" not in column_names and not {"keyword", "expected_hit"} <= column_names:
+        raise ValueError("关键词数据集缺少必要字段: keywords 或 keyword, expected_hit")
+
+    if audio_file_names is not None and len(audio_file_names) == len(dataset):
+        dataset = dataset.add_column("_keyword_audio_file_name", audio_file_names)
+    elif audio_file_names is not None:
+        logger.warning(
+            "关键词 audiofolder 元数据行数与数据集行数不一致，跳过音频路径分组字段: "
+            "metadata=%s dataset=%s",
+            len(audio_file_names),
+            len(dataset),
+        )
 
     dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
-    if limit is not None:
-        dataset = dataset.select(range(min(limit, len(dataset))))
-
-    normalized_keywords = {
-        _normalize_keyword_text(str(sample["keyword"]))
-        for sample in dataset
-        if str(sample["keyword"]).strip()
-    }
+    normalized_keywords = _keyword_dataset_normalized_keywords(dataset)
     if not normalized_keywords:
         raise ValueError("关键词数据集必须提供非空 keyword")
-    for sample in dataset:
-        _as_bool(sample["expected_hit"])
 
     logger.info(
-        "关键词数据集已加载: size=%s keyword_count=%s",
+        "关键词数据集已加载: row_count=%s keyword_count=%s limit=%s",
         len(dataset),
         len(normalized_keywords),
+        limit,
     )
     return dataset
+
+
+def _read_keyword_audio_file_names(dataset_path: Path, *, split: str) -> list[str] | None:
+    metadata_candidates = [
+        dataset_path / split / "metadata.jsonl",
+        dataset_path / "metadata.jsonl",
+    ]
+    metadata_path = next(
+        (path for path in metadata_candidates if path.exists() and path.is_file()),
+        None,
+    )
+    if metadata_path is None:
+        return None
+
+    audio_file_names: list[str] = []
+    with metadata_path.open("r", encoding="utf-8") as file_obj:
+        for line_number, line in enumerate(file_obj, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"关键词元数据 JSON 无效: {metadata_path}:{line_number}"
+                ) from exc
+            file_name = payload.get("file_name")
+            audio_file_names.append(str(file_name) if file_name else "")
+    return audio_file_names
+
+
+def _keyword_dataset_normalized_keywords(dataset: Dataset) -> set[str]:
+    normalized_keywords: set[str] = set()
+    for index, sample in enumerate(dataset, start=1):
+        audio_sample_id = _keyword_audio_sample_id(sample, index)
+        entries = _keyword_entries_for_sample(
+            sample,
+            index=index,
+            audio_sample_id=audio_sample_id,
+        )
+        normalized_keywords.update(
+            _normalize_keyword_text(entry["keyword"])
+            for entry in entries
+            if entry["keyword"]
+        )
+    return normalized_keywords
+
+
+def _group_keyword_audio_samples(
+    dataset: Dataset,
+    *,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for row_index, sample in enumerate(dataset, start=1):
+        group_key = _keyword_audio_group_key(sample, row_index)
+        group = groups.get(group_key)
+        if group is None:
+            group = {
+                "sample": sample,
+                "base_id": _keyword_audio_sample_id(sample, row_index),
+                "raw_entries": [],
+            }
+            groups[group_key] = group
+        group["raw_entries"].extend(
+            _keyword_entries_for_sample(
+                sample,
+                index=row_index,
+                audio_sample_id=str(group["base_id"]),
+            )
+        )
+
+    selected_groups = list(groups.values())
+    if limit is not None:
+        selected_groups = selected_groups[:limit]
+
+    used_audio_ids: set[str] = set()
+    used_keyword_ids: set[str] = set()
+    keyword_index = 0
+    result: list[dict[str, Any]] = []
+    for audio_index, group in enumerate(selected_groups, start=1):
+        audio_id = _unique_keyword_id(
+            str(group["base_id"]) or str(audio_index),
+            used_audio_ids,
+        )
+        entries: list[dict[str, Any]] = []
+        for raw_entry in group["raw_entries"]:
+            keyword_index += 1
+            entry = dict(raw_entry)
+            entry["id"] = _unique_keyword_id(str(entry["id"]), used_keyword_ids)
+            entry["index"] = keyword_index
+            entries.append(entry)
+        result.append(
+            {
+                "id": audio_id,
+                "index": audio_index,
+                "sample": group["sample"],
+                "keyword_entries": entries,
+            }
+        )
+    return result
+
+
+def _keyword_audio_group_key(sample: dict[str, Any], index: int) -> str:
+    for key in ("_keyword_audio_file_name", "file_name", "path"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return f"path:{value}"
+    audio = sample.get("audio")
+    if isinstance(audio, dict):
+        audio_path = audio.get("path")
+        if isinstance(audio_path, str) and audio_path:
+            return f"path:{audio_path}"
+    # 嵌套结构天然是一音频一行；缺少路径时不能安全合并旧格式的不同音频。
+    return f"row:{index}"
+
+
+def _unique_keyword_id(value: str, used: set[str]) -> str:
+    candidate = value
+    suffix = 2
+    while candidate in used:
+        candidate = f"{value}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _keyword_entries_for_sample(
+    sample: dict[str, Any],
+    *,
+    index: int,
+    audio_sample_id: str,
+) -> list[dict[str, Any]]:
+    if "keywords" in sample and sample["keywords"] is not None:
+        raw_entries = sample["keywords"]
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"keywords 必须是列表: id={audio_sample_id}")
+        if not raw_entries:
+            raise ValueError(f"keywords 不能为空: id={audio_sample_id}")
+
+        entries = []
+        for keyword_index, raw_entry in enumerate(raw_entries, start=1):
+            if not isinstance(raw_entry, dict):
+                raise ValueError(f"keywords 条目必须是对象: id={audio_sample_id}")
+            keyword = str(raw_entry.get("keyword") or "").strip()
+            if not keyword:
+                raise ValueError(f"keyword 不能为空: id={audio_sample_id}")
+            expected_hit = _as_bool(raw_entry.get("expected_hit"))
+            entry_id = str(
+                raw_entry.get("id")
+                or (
+                    f"{audio_sample_id}__kw_"
+                    f"{_keyword_slug(keyword, keyword_index)}_{keyword_index}"
+                )
+            )
+            entries.append(
+                {
+                    "id": entry_id,
+                    "index": index,
+                    "keyword": keyword,
+                    "expected_hit": expected_hit,
+                }
+            )
+        return entries
+
+    if "keyword" not in sample or "expected_hit" not in sample:
+        raise ValueError(f"关键词样本缺少 keywords 或 keyword, expected_hit: id={audio_sample_id}")
+    keyword = str(sample["keyword"]).strip()
+    if not keyword:
+        raise ValueError(f"keyword 不能为空: id={audio_sample_id}")
+    return [
+        {
+            "id": str(sample.get("id") or sample.get("utt_id") or index),
+            "index": index,
+            "keyword": keyword,
+            "expected_hit": _as_bool(sample["expected_hit"]),
+        }
+    ]
+
+
+def _keyword_slug(keyword: str, index: int) -> str:
+    normalized = _normalize_keyword_text(keyword)
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return slug or str(index)
+
+
+def _keyword_audio_sample_id(sample: dict[str, Any], index: int) -> str:
+    for key in ("_keyword_audio_file_name", "file_name", "path"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return Path(value).stem or str(index)
+
+    audio = sample.get("audio")
+    if isinstance(audio, dict):
+        audio_path = audio.get("path")
+        if isinstance(audio_path, str) and audio_path:
+            return Path(audio_path).stem or str(index)
+
+    return str(sample.get("id") or sample.get("utt_id") or index)
 
 
 def _infer_final_transcript(
@@ -1682,21 +2001,7 @@ def _load_denoise_dataset(
     sample_rate: int,
 ) -> Dataset:
     logger.info("加载 SE 数据集: path=%s split=%s", dataset_path, split)
-    if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
 
     if "audio" not in dataset.column_names:
         raise ValueError("SE 数据集缺少必要字段: audio")
@@ -1716,21 +2021,7 @@ def _load_lid_dataset(
     sample_rate: int,
 ) -> Dataset:
     logger.info("加载 LID 数据集: path=%s split=%s", dataset_path, split)
-    if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
 
     missing = sorted({"audio", "language_id"} - set(dataset.column_names))
     if missing:
@@ -1751,21 +2042,7 @@ def _load_vad_dataset(
     sample_rate: int,
 ) -> Dataset:
     logger.info("加载 VAD 数据集: path=%s split=%s", dataset_path, split)
-    if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
 
     missing = sorted({"audio", "seconds"} - set(dataset.column_names))
     if missing:
@@ -1861,23 +2138,7 @@ def _build_vad_report(
     *,
     samples: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if not rows:
-        return {
-            "frame_accuracy": 0.0,
-            "frame_recall": 0.0,
-            "frame_precision": 0.0,
-            "frame_f1": 0.0,
-            "frame": {},
-            "segment": {},
-            "vad_report": {"samples": []},
-            "segment_recall": 0.0,
-            "segment_precision": 0.0,
-            "reference_segment_count": 0,
-            "prediction_segment_count": 0,
-            "sample_count": 0,
-        }
-
-    frame_average_keys = [
+    frame_rate_keys = [
         "frame_accuracy",
         "frame_recall",
         "frame_precision",
@@ -1887,7 +2148,7 @@ def _build_vad_report(
         "frame_miss_rate",
         "frame_balanced_accuracy",
     ]
-    segment_average_keys = [
+    segment_rate_keys = [
         "segment_recall",
         "segment_precision",
         "segment_f1",
@@ -1910,21 +2171,99 @@ def _build_vad_report(
         "segment_miss_count",
         "segment_false_alarm_count",
     ]
-    frame_metrics = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in frame_average_keys
+
+    frame_counts = {
+        key: int(sum(int(row.get(key, 0)) for row in rows))
+        for key in frame_count_keys
     }
-    frame_metrics.update({key: int(sum(row[key] for row in rows)) for key in frame_count_keys})
-    segment_metrics = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in segment_average_keys
+    segment_counts = {
+        key: int(sum(int(row.get(key, 0)) for row in rows))
+        for key in segment_count_keys
     }
-    segment_metrics.update(
-        {key: int(sum(row[key] for row in rows)) for key in segment_count_keys}
+
+    true_positive = frame_counts["frame_true_positive"]
+    true_negative = frame_counts["frame_true_negative"]
+    false_positive = frame_counts["frame_false_positive"]
+    false_negative = frame_counts["frame_false_negative"]
+    frame_precision = _safe_divide_float(
+        true_positive,
+        true_positive + false_positive,
     )
+    frame_recall = _safe_divide_float(
+        true_positive,
+        true_positive + false_negative,
+    )
+    frame_specificity = _safe_divide_float(
+        true_negative,
+        true_negative + false_positive,
+    )
+    frame_metrics = {
+        "frame_accuracy": _safe_divide_float(
+            true_positive + true_negative,
+            frame_counts["frame_total"],
+        ),
+        "frame_recall": frame_recall,
+        "frame_precision": frame_precision,
+        "frame_f1": _f1_from_precision_recall(frame_precision, frame_recall),
+        "frame_specificity": frame_specificity,
+        "frame_false_alarm_rate": _safe_divide_float(
+            false_positive,
+            false_positive + true_negative,
+        ),
+        "frame_miss_rate": _safe_divide_float(
+            false_negative,
+            false_negative + true_positive,
+        ),
+        "frame_balanced_accuracy": (frame_recall + frame_specificity) / 2,
+        **frame_counts,
+    }
+
+    reference_segments = segment_counts["reference_segment_count"]
+    prediction_segments = segment_counts["prediction_segment_count"]
+    segment_recall = _safe_divide_float(
+        segment_counts["segment_hit_count"],
+        reference_segments,
+    )
+    # 段召回要求参考段达到覆盖阈值；段精确率沿用既有定义，只要预测段与
+    # 任一参考段有重叠即算命中，因此用“预测段数 - 无重叠段数”作为分子。
+    segment_precision = _safe_divide_float(
+        prediction_segments - segment_counts["segment_false_alarm_count"],
+        prediction_segments,
+    )
+    segment_metrics = {
+        "segment_recall": segment_recall,
+        "segment_precision": segment_precision,
+        "segment_f1": _f1_from_precision_recall(
+            segment_precision,
+            segment_recall,
+        ),
+        "segment_miss_rate": _safe_divide_float(
+            segment_counts["segment_miss_count"],
+            reference_segments,
+        ),
+        "segment_false_alarm_rate": _safe_divide_float(
+            segment_counts["segment_false_alarm_count"],
+            prediction_segments,
+        ),
+        **segment_counts,
+    }
+    frame_macro = {
+        key: float(np.mean([float(row.get(key, 0.0)) for row in rows]))
+        if rows
+        else 0.0
+        for key in frame_rate_keys
+    }
+    segment_macro = {
+        key: float(np.mean([float(row.get(key, 0.0)) for row in rows]))
+        if rows
+        else 0.0
+        for key in segment_rate_keys
+    }
     report = {
         "frame": frame_metrics,
         "segment": segment_metrics,
+        "frame_macro": frame_macro,
+        "segment_macro": segment_macro,
         "vad_report": {"samples": samples},
     }
     report.update(frame_metrics)
@@ -1933,10 +2272,17 @@ def _build_vad_report(
     return report
 
 
+def _f1_from_precision_recall(precision: float, recall: float) -> float:
+    if precision + recall <= 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
 def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
     sample_count = len(samples)
     language_totals: dict[str, int] = {}
     language_hits: dict[str, int] = {}
+    predicted_totals: dict[str, int] = {}
     confusion_counts: dict[str, dict[str, int]] = {}
     known_correct_count = 0
     known_sample_count = 0
@@ -1951,6 +2297,9 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
         known_reference = reference_language != LID_UNKNOWN_LANGUAGE
 
         language_totals[reference_language] = language_totals.get(reference_language, 0) + 1
+        predicted_totals[predicted_language] = (
+            predicted_totals.get(predicted_language, 0) + 1
+        )
         confusion_counts.setdefault(reference_language, {})
         confusion_counts[reference_language][predicted_language] = (
             confusion_counts[reference_language].get(predicted_language, 0) + 1
@@ -1980,6 +2329,11 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "language": language,
             "correct_count": language_hits.get(language, 0),
             "sample_count": language_totals[language],
+            "predicted_count": predicted_totals.get(language, 0),
+            "precision": _safe_divide_float(
+                language_hits.get(language, 0),
+                predicted_totals.get(language, 0),
+            ),
             "recall": _safe_divide_float(
                 language_hits.get(language, 0),
                 language_totals[language],
@@ -1998,11 +2352,19 @@ def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
         if known_language_recalls
         else 0.0
     )
+    macro_precision = (
+        sum(item["precision"] for item in known_language_recalls)
+        / len(known_language_recalls)
+        if known_language_recalls
+        else 0.0
+    )
     known_accuracy = _safe_divide_float(known_correct_count, known_sample_count)
     return {
         "accuracy": known_accuracy,
+        "precision": macro_precision,
         "recall": macro_recall,
         "known_accuracy": known_accuracy,
+        "macro_precision": macro_precision,
         "macro_recall": macro_recall,
         "known_correct_count": known_correct_count,
         "known_sample_count": known_sample_count,
@@ -2524,10 +2886,16 @@ def _build_cer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return _build_asr_alignment_report(rows, metric_fn=get_cer)
 
 
+def _asr_accuracy_from_report(report: dict[str, Any]) -> float:
+    summary = report.get("summary") if isinstance(report, dict) else None
+    accuracy = summary.get("accuracy") if isinstance(summary, dict) else None
+    return float(accuracy) if isinstance(accuracy, int | float) else 0.0
+
+
 def _build_asr_alignment_report(
     rows: list[dict[str, Any]],
     *,
-    metric_fn: Callable[[list[str], list[str], list[str]], Any],
+    metric_fn: Callable[..., Any],
 ) -> dict[str, Any]:
     if not rows:
         return {
@@ -2550,6 +2918,7 @@ def _build_asr_alignment_report(
         [row["reference"] for row in rows],
         [row["hypothesis"] for row in rows],
         [row["id"] for row in rows],
+        include_details=True,
     )
     summary = alignment_result.summary
     utterance_summaries = {
@@ -2631,3 +3000,10 @@ def _wer_counts_to_payload(counts: Any) -> dict[str, Any]:
 def _format_sse(event_name: str, payload: dict[str, Any]) -> str:
     data = json.dumps(payload, ensure_ascii=False)
     return f"event: {event_name}\ndata: {data}\n\n"
+
+
+@app.get("/{frontend_path:path}", include_in_schema=False)
+def get_frontend(frontend_path: str) -> FileResponse:
+    if frontend_path == "api" or frontend_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API 接口不存在")
+    return _serve_frontend_path(frontend_path)

@@ -90,11 +90,16 @@ export interface EvaluationResult {
   wer?: number;
   cer?: number;
   accuracy?: number;
+  word_accuracy?: number;
+  character_accuracy?: number;
+  macro_precision?: number;
   recall?: number;
   known_accuracy?: number;
   macro_recall?: number;
   frame?: VadFrameMetrics;
   segment?: VadSegmentMetrics;
+  frame_macro?: VadFrameMetrics;
+  segment_macro?: VadSegmentMetrics;
   frame_accuracy?: number;
   frame_recall?: number;
   frame_precision?: number;
@@ -131,6 +136,8 @@ export interface EvaluationResult {
   lid_report?: LidReport;
   denoise_report?: DenoiseReport;
   keyword_report?: KeywordReport;
+  keyword_audio_report?: KeywordAudioReport;
+  audio_sample_count?: number;
   sqa_summary?: SqaSummary[];
   [key: string]: unknown;
 }
@@ -142,6 +149,8 @@ export interface KeywordReport {
 export interface KeywordReportSample {
   id: string;
   index?: number;
+  audio_id?: string;
+  audio_index?: number;
   audio_url?: string;
   duration_seconds?: number;
   keyword: string;
@@ -151,6 +160,30 @@ export interface KeywordReportSample {
   transcript: string;
   match_text: string;
   sqa_scores?: SqaScore[];
+}
+
+export interface KeywordAudioReport {
+  samples: KeywordAudioReportSample[];
+}
+
+export interface KeywordAudioReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  transcript: string;
+  match_text: string;
+  sqa_scores?: SqaScore[];
+  keywords: KeywordAudioKeywordResult[];
+}
+
+export interface KeywordAudioKeywordResult {
+  id: string;
+  index?: number;
+  keyword: string;
+  expected_hit: boolean;
+  predicted_hit: boolean;
+  correct: boolean;
 }
 
 export interface DenoiseReport {
@@ -182,6 +215,8 @@ export interface LidLanguageRecall {
   language: string;
   correct_count: number;
   sample_count: number;
+  predicted_count?: number;
+  precision?: number;
   recall: number;
 }
 

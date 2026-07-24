@@ -7,6 +7,8 @@ tmp_workspace/
 tmp-workspace/
 .hydra
 nohup.out
+src/web/node_modules/
+src/web/dist/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

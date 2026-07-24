@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import soundfile as sf
 from fastapi.testclient import TestClient
 
@@ -13,15 +15,20 @@ from prama_server.servicer.http import (
     EvaluationJob,
     EvaluationRequest,
     SqaAssessor,
+    _asr_accuracy_from_report,
     _build_keyword_report,
     _build_denoise_report,
     _build_sqa_summary,
     _build_cer_report,
+    _build_vad_report,
     _build_wer_report,
     _build_lid_report,
+    _group_keyword_audio_samples,
     _keyword_matches,
     _load_keyword_dataset,
+    _load_vad_dataset,
     _normalize_keyword_text,
+    _run_keyword_evaluation,
     _lid_predicted_language,
     app,
     jobs,
@@ -105,7 +112,9 @@ class HttpReportMetricsTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["accuracy"], 1 / 3)
+        self.assertEqual(payload["precision"], 0.25)
         self.assertEqual(payload["known_accuracy"], 1 / 3)
+        self.assertEqual(payload["macro_precision"], 0.25)
         self.assertEqual(payload["recall"], 0.25)
         self.assertEqual(payload["macro_recall"], 0.25)
         self.assertEqual(payload["known_correct_count"], 1)
@@ -129,6 +138,115 @@ class HttpReportMetricsTest(unittest.TestCase):
         self.assertEqual(confusion_rows["cn"]["en"], 1)
         self.assertEqual(confusion_rows["<others>"]["<others>"], 1)
         self.assertEqual(confusion_rows["<others>"]["cn"], 1)
+
+    def test_vad_report_exposes_micro_and_macro_metrics(self) -> None:
+        rows = [
+            {
+                "frame_total": 10,
+                "frame_speech": 10,
+                "frame_non_speech": 0,
+                "frame_true_positive": 10,
+                "frame_true_negative": 0,
+                "frame_false_positive": 0,
+                "frame_false_negative": 0,
+                "frame_accuracy": 1.0,
+                "frame_recall": 1.0,
+                "frame_precision": 1.0,
+                "frame_f1": 1.0,
+                "frame_specificity": 0.0,
+                "frame_false_alarm_rate": 0.0,
+                "frame_miss_rate": 0.0,
+                "frame_balanced_accuracy": 0.5,
+                "reference_segment_count": 1,
+                "prediction_segment_count": 1,
+                "segment_hit_count": 1,
+                "segment_miss_count": 0,
+                "segment_false_alarm_count": 0,
+                "segment_recall": 1.0,
+                "segment_precision": 1.0,
+                "segment_f1": 1.0,
+                "segment_miss_rate": 0.0,
+                "segment_false_alarm_rate": 0.0,
+            },
+            {
+                "frame_total": 90,
+                "frame_speech": 10,
+                "frame_non_speech": 80,
+                "frame_true_positive": 0,
+                "frame_true_negative": 80,
+                "frame_false_positive": 0,
+                "frame_false_negative": 10,
+                "frame_accuracy": 80 / 90,
+                "frame_recall": 0.0,
+                "frame_precision": 0.0,
+                "frame_f1": 0.0,
+                "frame_specificity": 1.0,
+                "frame_false_alarm_rate": 0.0,
+                "frame_miss_rate": 1.0,
+                "frame_balanced_accuracy": 0.5,
+                "reference_segment_count": 3,
+                "prediction_segment_count": 2,
+                "segment_hit_count": 1,
+                "segment_miss_count": 2,
+                "segment_false_alarm_count": 1,
+                "segment_recall": 1 / 3,
+                "segment_precision": 0.5,
+                "segment_f1": 0.4,
+                "segment_miss_rate": 2 / 3,
+                "segment_false_alarm_rate": 0.5,
+            },
+        ]
+
+        report = _build_vad_report(rows, samples=[])
+
+        self.assertEqual(report["frame_accuracy"], 0.9)
+        self.assertEqual(report["frame_recall"], 0.5)
+        self.assertEqual(report["frame_precision"], 1.0)
+        self.assertAlmostEqual(report["frame_f1"], 2 / 3)
+        self.assertAlmostEqual(report["frame_macro"]["frame_accuracy"], 17 / 18)
+        self.assertEqual(report["frame_macro"]["frame_f1"], 0.5)
+        self.assertEqual(report["segment_recall"], 0.5)
+        self.assertAlmostEqual(report["segment_precision"], 2 / 3)
+        self.assertAlmostEqual(report["segment_f1"], 4 / 7)
+        self.assertEqual(report["segment_macro"]["segment_f1"], 0.7)
+
+    def test_vad_report_zero_denominators_are_zero(self) -> None:
+        report = _build_vad_report([], samples=[])
+
+        self.assertEqual(report["frame_precision"], 0.0)
+        self.assertEqual(report["segment_recall"], 0.0)
+        self.assertEqual(report["frame_macro"]["frame_f1"], 0.0)
+        self.assertEqual(report["sample_count"], 0)
+
+    def test_vad_dataset_loads_local_parquet_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir)
+            audio_bytes = io.BytesIO()
+            sf.write(
+                audio_bytes,
+                np.zeros(160, dtype=np.float32),
+                16000,
+                format="WAV",
+            )
+            pd.DataFrame(
+                [
+                    {
+                        "audio": {"bytes": audio_bytes.getvalue(), "path": None},
+                        "id": "sample-1",
+                        "seconds": {"starts": [0.0], "durations": [0.01]},
+                    }
+                ]
+            ).to_parquet(dataset_dir / "test-00000-of-00001.parquet")
+
+            dataset = _load_vad_dataset(
+                dataset_dir,
+                split="test",
+                limit=None,
+                sample_rate=16000,
+            )
+
+        self.assertEqual(len(dataset), 1)
+        self.assertEqual(dataset[0]["id"], "sample-1")
 
     def test_keyword_matching_normalizes_case_punctuation_and_word_boundaries(self) -> None:
         self.assertEqual(
@@ -224,6 +342,101 @@ class HttpReportMetricsTest(unittest.TestCase):
                 sample_rate=16000,
             )
             self.assertEqual(len(dataset), 2)
+
+    def test_keyword_grouping_supports_old_and_nested_rows_and_limits_audio(self) -> None:
+        dataset = [
+            {
+                "id": "first-a",
+                "file_name": "first.wav",
+                "keyword": "LEVEL",
+                "expected_hit": True,
+            },
+            {
+                "id": "first-b",
+                "file_name": "first.wav",
+                "keyword": "SPEED",
+                "expected_hit": False,
+            },
+            {
+                "id": "second",
+                "file_name": "second.wav",
+                "keywords": [
+                    {"keyword": "ALTITUDE", "expected_hit": True},
+                    {"keyword": "ALTITUDE", "expected_hit": False},
+                ],
+            },
+        ]
+
+        groups = _group_keyword_audio_samples(dataset, limit=None)
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["id"], "first")
+        self.assertEqual(len(groups[0]["keyword_entries"]), 2)
+        self.assertEqual(len(groups[1]["keyword_entries"]), 2)
+        self.assertEqual(
+            len({entry["id"] for entry in groups[1]["keyword_entries"]}),
+            2,
+        )
+        self.assertEqual(
+            [entry["index"] for entry in groups[0]["keyword_entries"]],
+            [1, 2],
+        )
+        self.assertEqual(len(_group_keyword_audio_samples(dataset, limit=1)), 1)
+
+    def test_keyword_evaluation_infers_once_for_all_keywords_on_an_audio(self) -> None:
+        class FakeAsrInferencer:
+            calls: list[np.ndarray] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def infer(self, audio: np.ndarray):
+                self.calls.append(audio)
+                yield ("LEVEL SPEED", True)
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset_dir = Path(temp_dir) / "keyword"
+            test_dir = dataset_dir / "test"
+            test_dir.mkdir(parents=True)
+            sf.write(
+                test_dir / "sample.wav",
+                np.zeros(160, dtype=np.float32),
+                16000,
+            )
+            (test_dir / "metadata.jsonl").write_text(
+                (
+                    '{"file_name":"sample.wav","id":"sample","keywords":['
+                    '{"keyword":"LEVEL","expected_hit":true},'
+                    '{"keyword":"ALTITUDE","expected_hit":false}]}'
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            job = EvaluationJob(
+                job_id="keyword-group-test",
+                request=EvaluationRequest(
+                    task="keyword",
+                    dataset_path=str(dataset_dir),
+                    split="test",
+                    sample_rate=16000,
+                ),
+            )
+
+            with patch(
+                "prama_server.servicer.http.AsrGrpcInferencer",
+                FakeAsrInferencer,
+            ):
+                _run_keyword_evaluation(job)
+
+        self.assertEqual(len(FakeAsrInferencer.calls), 1)
+        self.assertEqual(job.status, "completed")
+        assert job.result is not None
+        self.assertEqual(job.result["sample_count"], 2)
+        self.assertEqual(job.result["audio_sample_count"], 1)
+        self.assertEqual(len(job.result["keyword_audio_report"]["samples"]), 1)
 
     def test_lid_metrics_use_strict_language_labels(self) -> None:
         report = _build_lid_report(
@@ -478,6 +691,21 @@ class HttpReportMetricsTest(unittest.TestCase):
         self.assertGreater(len(cer_report["utterances"][0]["tokens"]), 1)
         self.assertEqual(cer_report["utterances"][0]["tokens"][0]["ref"], "我")
         self.assertLess(cer_report["summary"]["wer"], wer_report["summary"]["wer"])
+
+    def test_asr_accuracy_uses_sclite_percent_scale_and_can_be_negative(self) -> None:
+        report = _build_wer_report(
+            [
+                {
+                    "id": "insertions",
+                    "index": 1,
+                    "reference": "one",
+                    "hypothesis": "one two three",
+                }
+            ]
+        )
+
+        self.assertEqual(report["summary"]["wer"], 200.0)
+        self.assertEqual(_asr_accuracy_from_report(report), -100.0)
 
     def test_sample_audio_endpoint_only_serves_registered_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

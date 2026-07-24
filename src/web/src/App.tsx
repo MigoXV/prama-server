@@ -54,6 +54,7 @@ import type {
   DenoiseReportSample,
   HelpDocument,
   JobStatus,
+  KeywordAudioReportSample,
   KeywordReportSample,
   LidReportSample,
   SqaScore,
@@ -99,6 +100,8 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   hit_threshold: "0.9",
   streaming: false,
 };
+const KEYWORD_REPORT_INITIAL_VISIBLE = 100;
+const KEYWORD_REPORT_LOAD_STEP = 100;
 
 const APP_VERSION = packageJson.version;
 
@@ -1507,13 +1510,166 @@ function Metric({ label, value }: { label: string; value: string }) {
   return <MetricTile className="metric" label={label} value={value} />;
 }
 
-function TextBlock({ label, value }: { label: string; value: string }) {
+function TextBlock({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="text-block">
       <span>{label}</span>
       <p>{value}</p>
     </div>
   );
+}
+
+type KeywordHighlightTone = "hit" | "false_alarm";
+
+interface KeywordHighlight {
+  keyword: string;
+  tone: KeywordHighlightTone;
+}
+
+function KeywordMatchTextBlock({
+  matchText,
+  highlights,
+}: {
+  matchText: string;
+  highlights: KeywordHighlight[];
+}) {
+  return (
+    <TextBlock
+      label="正则化后的推理结果"
+      value={
+        matchText ? (
+          <HighlightedKeywordText text={matchText} highlights={highlights} />
+        ) : (
+          "-"
+        )
+      }
+    />
+  );
+}
+
+function keywordHighlightsFromSample(sample: KeywordReportSample): KeywordHighlight[] {
+  if (!sample.predicted_hit) {
+    return [];
+  }
+  return [
+    {
+      keyword: sample.keyword,
+      tone: sample.expected_hit ? "hit" : "false_alarm",
+    },
+  ];
+}
+
+function keywordHighlightsFromAudioSample(
+  sample: KeywordAudioReportSample,
+): KeywordHighlight[] {
+  return sample.keywords
+    .filter((keyword) => keyword.predicted_hit)
+    .map((keyword) => ({
+      keyword: keyword.keyword,
+      tone: keyword.expected_hit ? "hit" : "false_alarm",
+    }));
+}
+
+function HighlightedKeywordText({
+  text,
+  highlights,
+}: {
+  text: string;
+  highlights: KeywordHighlight[];
+}) {
+  const ranges = keywordHighlightRanges(text, highlights);
+  if (!ranges.length) {
+    return <>{text}</>;
+  }
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) {
+      parts.push(text.slice(cursor, range.start));
+    }
+    parts.push(
+      <mark
+        className={`keyword-match-highlight ${range.tone}`}
+        key={`${range.start}-${range.end}-${index}`}
+      >
+        {text.slice(range.start, range.end)}
+      </mark>,
+    );
+    cursor = range.end;
+  });
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
+  return <>{parts}</>;
+}
+
+function keywordHighlightRanges(text: string, highlights: KeywordHighlight[]) {
+  const ranges = highlights
+    .flatMap((highlight) =>
+      keywordRangesForHighlight(text, highlight).map((range) => ({
+        ...range,
+        tone: highlight.tone,
+      })),
+    )
+    .sort((left, right) => left.start - right.start || right.end - left.end);
+
+  const merged: Array<{ start: number; end: number; tone: KeywordHighlightTone }> = [];
+  ranges.forEach((range) => {
+    const previous = merged[merged.length - 1];
+    if (!previous || range.start >= previous.end) {
+      merged.push(range);
+      return;
+    }
+    if (range.end > previous.end && range.tone === previous.tone) {
+      previous.end = range.end;
+    }
+  });
+  return merged;
+}
+
+function keywordRangesForHighlight(text: string, highlight: KeywordHighlight) {
+  const normalizedKeyword = normalizeKeywordText(highlight.keyword);
+  if (!normalizedKeyword) {
+    return [];
+  }
+  if (/^[a-z0-9]+(?: [a-z0-9]+)*$/.test(normalizedKeyword)) {
+    const tokens = Array.from(text.matchAll(/\S+/g));
+    const keywordTokens = normalizedKeyword.split(" ");
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let index = 0; index <= tokens.length - keywordTokens.length; index += 1) {
+      const tokenSlice = tokens.slice(index, index + keywordTokens.length);
+      if (
+        tokenSlice.every(
+          (token, tokenIndex) => token[0] === keywordTokens[tokenIndex],
+        )
+      ) {
+        const firstToken = tokenSlice[0];
+        const lastToken = tokenSlice[tokenSlice.length - 1];
+        ranges.push({
+          start: firstToken.index ?? 0,
+          end: (lastToken.index ?? 0) + lastToken[0].length,
+        });
+      }
+    }
+    return ranges;
+  }
+
+  const ranges: Array<{ start: number; end: number }> = [];
+  let start = text.indexOf(normalizedKeyword);
+  while (start >= 0) {
+    ranges.push({ start, end: start + normalizedKeyword.length });
+    start = text.indexOf(normalizedKeyword, start + normalizedKeyword.length);
+  }
+  return ranges;
+}
+
+function normalizeKeywordText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/\p{P}/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function AudioPlayer({
@@ -1821,12 +1977,21 @@ function AsrOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   if (!result) {
     return null;
   }
+  const wordAccuracy =
+    result.word_accuracy ??
+    result.accuracy ??
+    result.wer_report?.summary?.accuracy;
+  const characterAccuracy =
+    result.character_accuracy ??
+    result.cer_report?.summary?.accuracy;
 
   return (
     <div className="panel asr-overview-panel">
       <div className="metric-strip asr-overview-metrics">
-        <Metric label="WER" value={formatRate(result.wer)} />
-        <Metric label="CER" value={formatRate(result.cer)} />
+        <Metric label="词正确率" value={formatPercentScale(wordAccuracy)} />
+        <Metric label="字正确率" value={formatPercentScale(characterAccuracy)} />
+        <Metric label="WER" value={formatPercentScale(result.wer)} />
+        <Metric label="CER" value={formatPercentScale(result.cer)} />
       </div>
       <SampleCountStrip
         result={result}
@@ -1856,6 +2021,7 @@ function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   return (
     <div className="metric-strip lid-overview-metrics">
       <Metric label="已知语种准确率" value={formatRate(result.known_accuracy ?? result.accuracy)} />
+      <Metric label="宏平均精确率" value={formatRate(result.macro_precision ?? result.precision)} />
       <Metric label="宏平均召回率" value={formatRate(result.macro_recall ?? result.recall)} />
       <Metric label="未知误接收" value={formatNumber(result.unknown_false_accept_count)} />
       <Metric label="已知被拒识" value={formatNumber(result.known_reject_count)} />
@@ -1911,12 +2077,14 @@ function DenoiseOverviewMetrics({ result }: { result: EvaluationResult | null })
 function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   const frame = metrics.frame;
   const segment = metrics.segment;
+  const frameMacro = metrics.frame_macro;
+  const segmentMacro = metrics.segment_macro;
 
   return (
     <div className="vad-metric-groups">
       <section className="vad-metric-section">
         <div className="vad-metric-title">
-          <span>帧级指标</span>
+          <span>帧级指标（Micro）</span>
           <strong>{formatRate(frame?.frame_f1 ?? metrics.frame_f1)}</strong>
         </div>
         <div className="report-summary vad-summary vad-frame-summary">
@@ -1934,11 +2102,17 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
           />
           <Metric label="F1" value={formatRate(frame?.frame_f1 ?? metrics.frame_f1)} />
         </div>
+        <div className="report-summary vad-summary vad-macro-summary">
+          <Metric label="Macro Accuracy" value={formatRate(frameMacro?.frame_accuracy)} />
+          <Metric label="Macro Recall" value={formatRate(frameMacro?.frame_recall)} />
+          <Metric label="Macro Precision" value={formatRate(frameMacro?.frame_precision)} />
+          <Metric label="Macro F1" value={formatRate(frameMacro?.frame_f1)} />
+        </div>
       </section>
 
       <section className="vad-metric-section">
         <div className="vad-metric-title">
-          <span>段级指标</span>
+          <span>段级指标（Micro）</span>
           <strong>{formatRate(segment?.segment_f1)}</strong>
         </div>
         <div className="report-summary vad-summary">
@@ -1951,6 +2125,11 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
             value={formatRate(segment?.segment_precision ?? metrics.segment_precision)}
           />
           <Metric label="F1" value={formatRate(segment?.segment_f1)} />
+        </div>
+        <div className="report-summary vad-summary vad-macro-summary">
+          <Metric label="Macro Recall" value={formatRate(segmentMacro?.segment_recall)} />
+          <Metric label="Macro Precision" value={formatRate(segmentMacro?.segment_precision)} />
+          <Metric label="Macro F1" value={formatRate(segmentMacro?.segment_f1)} />
         </div>
         <div className="metric-strip vad-segment-counts">
           <Metric
@@ -2045,11 +2224,15 @@ function AsrAlignmentReportPanel({
               label="WER"
               summary={werReport?.summary}
               fallbackRate={result?.wer}
+              accuracy={result?.word_accuracy}
+              accuracyLabel="词正确率"
             />
             <AsrMetricSummaryCard
               label="CER"
               summary={cerReport?.summary}
               fallbackRate={result?.cer}
+              accuracy={result?.character_accuracy}
+              accuracyLabel="字正确率"
             />
           </div>
           <CompactReportMeta result={result} fallbackCount={sampleCount} />
@@ -2170,6 +2353,10 @@ function LidReportPanel({
               value={formatRate(result.known_accuracy ?? result.accuracy)}
             />
             <Metric
+              label="宏平均精确率"
+              value={formatRate(result.macro_precision ?? result.precision)}
+            />
+            <Metric
               label="宏平均召回率"
               value={formatRate(result.macro_recall ?? result.recall)}
             />
@@ -2200,12 +2387,17 @@ function KeywordReportPanel({
   result: EvaluationResult | null;
 }) {
   const samples = result?.keyword_report?.samples ?? [];
+  const audioSamples = result?.keyword_audio_report?.samples ?? [];
+  const [viewMode, setViewMode] = useState<"keyword" | "audio">("keyword");
   return (
     <div className="panel report-panel keyword-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>关键词报告</h2>
-          <span>{formatNumber(result?.sample_count)} 个样本</span>
+          <span>
+            {formatNumber(result?.sample_count)} 个关键词 /{" "}
+            {formatNumber(result?.audio_sample_count ?? audioSamples.length)} 条语音
+          </span>
         </div>
       </div>
       {result ? (
@@ -2228,7 +2420,29 @@ function KeywordReportPanel({
           </div>
           <CompactReportMeta result={result} fallbackCount={samples.length} />
           <SqaSummaryMetrics summary={result.sqa_summary} />
-          <KeywordSampleList samples={samples} />
+          {audioSamples.length ? (
+            <div className="keyword-view-tabs" role="tablist" aria-label="关键词报告视图">
+              <button
+                type="button"
+                className={viewMode === "keyword" ? "active" : ""}
+                onClick={() => setViewMode("keyword")}
+              >
+                按关键词
+              </button>
+              <button
+                type="button"
+                className={viewMode === "audio" ? "active" : ""}
+                onClick={() => setViewMode("audio")}
+              >
+                按语音
+              </button>
+            </div>
+          ) : null}
+          {viewMode === "audio" && audioSamples.length ? (
+            <KeywordAudioSampleList samples={audioSamples} />
+          ) : (
+            <KeywordSampleList samples={samples} />
+          )}
         </>
       ) : (
         <div className="empty-state">评估完成后生成关键词报告</div>
@@ -2237,44 +2451,177 @@ function KeywordReportPanel({
   );
 }
 
+function KeywordAudioSampleList({ samples }: { samples: KeywordAudioReportSample[] }) {
+  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
+  useEffect(() => {
+    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
+  }, [samples]);
+
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成语音聚合结果</div>;
+  }
+  const visibleSamples = samples.slice(0, visibleCount);
+
+  return (
+    <>
+      <KeywordListToolbar
+        total={samples.length}
+        visible={visibleSamples.length}
+        onCollapse={
+          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
+            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
+            : undefined
+        }
+      />
+      <div className="keyword-sample-list">
+        {visibleSamples.map((sample) => (
+          <section className="keyword-sample keyword-audio-sample" key={sample.id}>
+            <div className="keyword-sample-title">
+              <span className="keyword-sample-name">
+                <strong>#{sample.index ?? "-"}</strong>
+                <span title={sample.id}>{sample.id}</span>
+              </span>
+              <span className="keyword-status">
+                {formatNumber(sample.keywords.length)} 个关键词
+              </span>
+            </div>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="keyword-token-list">
+              {sample.keywords.map((keyword) => (
+                <div
+                  className={`keyword-token ${keyword.correct ? "correct" : "incorrect"}`}
+                  key={keyword.id}
+                >
+                  <span title={keyword.id}>{keyword.keyword}</span>
+                  <small>
+                    {keyword.expected_hit ? "Expected Hit" : "Expected No Hit"} /{" "}
+                    {keyword.predicted_hit ? "Predicted Hit" : "Predicted No Hit"}
+                  </small>
+                </div>
+              ))}
+            </div>
+            <KeywordMatchTextBlock
+              matchText={sample.match_text}
+              highlights={keywordHighlightsFromAudioSample(sample)}
+            />
+          </section>
+        ))}
+        {visibleCount < samples.length ? (
+          <KeywordLoadMoreButton
+            onClick={() =>
+              setVisibleCount((current) =>
+                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
+              )
+            }
+          />
+        ) : null}
+      </div>
+    </>
+  );
+}
+
 function KeywordSampleList({ samples }: { samples: KeywordReportSample[] }) {
+  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
+  useEffect(() => {
+    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
+  }, [samples]);
+
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成关键词结果</div>;
   }
+  const visibleSamples = samples.slice(0, visibleCount);
 
   return (
-    <div className="keyword-sample-list">
-      {samples.map((sample) => (
-        <section
-          className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
-          key={sample.id}
-        >
-          <div className="keyword-sample-title">
-            <span className="keyword-sample-name">
-              <strong>#{sample.index ?? "-"}</strong>
-              <span title={sample.id}>{sample.id}</span>
-            </span>
-            <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
-              {sample.correct ? "正确" : "错误"}
-            </span>
-          </div>
-          <AudioPlayer
-            src={sample.audio_url}
-            durationSeconds={sample.duration_seconds}
+    <>
+      <KeywordListToolbar
+        total={samples.length}
+        visible={visibleSamples.length}
+        onCollapse={
+          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
+            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
+            : undefined
+        }
+      />
+      <div className="keyword-sample-list">
+        {visibleSamples.map((sample) => (
+          <section
+            className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
+            key={sample.id}
+          >
+            <div className="keyword-sample-title">
+              <span className="keyword-sample-name">
+                <strong>#{sample.index ?? "-"}</strong>
+                <span title={sample.id}>{sample.id}</span>
+              </span>
+              <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
+                {sample.correct ? "正确" : "错误"}
+              </span>
+            </div>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <div className="keyword-sample-metrics">
+              <Metric label="Keyword" value={sample.keyword || "-"} />
+              <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
+              <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
+            </div>
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="keyword-transcript-grid">
+              <TextBlock label="Transcript" value={sample.transcript || "-"} />
+              <KeywordMatchTextBlock
+                matchText={sample.match_text}
+                highlights={keywordHighlightsFromSample(sample)}
+              />
+            </div>
+          </section>
+        ))}
+        {visibleCount < samples.length ? (
+          <KeywordLoadMoreButton
+            onClick={() =>
+              setVisibleCount((current) =>
+                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
+              )
+            }
           />
-          <div className="keyword-sample-metrics">
-            <Metric label="Keyword" value={sample.keyword || "-"} />
-            <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
-            <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
-          </div>
-          <SqaScoreChips scores={sample.sqa_scores} />
-          <div className="keyword-transcript-grid">
-            <TextBlock label="Transcript" value={sample.transcript || "-"} />
-            <TextBlock label="Match Text" value={sample.match_text || "-"} />
-          </div>
-        </section>
-      ))}
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+function KeywordListToolbar({
+  total,
+  visible,
+  onCollapse,
+}: {
+  total: number;
+  visible: number;
+  onCollapse?: () => void;
+}) {
+  return (
+    <div className="keyword-list-toolbar">
+      <span>
+        已显示 {formatNumber(visible)} / {formatNumber(total)}
+      </span>
+      {onCollapse ? (
+        <button type="button" onClick={onCollapse}>
+          收起
+        </button>
+      ) : null}
     </div>
+  );
+}
+
+function KeywordLoadMoreButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" className="keyword-load-more" onClick={onClick}>
+      加载更多
+    </button>
   );
 }
 
@@ -2423,7 +2770,7 @@ function LidMetricsDetails({ result }: { result: EvaluationResult }) {
   return (
     <details className="lid-metrics-details">
       <summary>
-        <span>类别召回率与混淆矩阵</span>
+        <span>类别指标与混淆矩阵</span>
         <small>
           {recalls.length} 类 / 正确 {formatNumber(overallCorrect)} / 错误{" "}
           {formatNumber(errorCount)} / 未知误接收{" "}
@@ -2455,7 +2802,7 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
       {recalls.length ? (
         <section className="metric-table-section">
           <div className="metric-table-heading">
-            <h3>类别召回率</h3>
+            <h3>类别指标</h3>
           </div>
           <div className="table-wrap lid-recall-table">
             <table>
@@ -2464,6 +2811,8 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
                   <th>真实标签</th>
                   <th>正确数</th>
                   <th>真实总数</th>
+                  <th>预测总数</th>
+                  <th>精确率</th>
                   <th>召回率</th>
                 </tr>
               </thead>
@@ -2476,6 +2825,8 @@ function LidMetricsTables({ result }: { result: EvaluationResult }) {
                     <td title={item.language}>{item.language || "-"}</td>
                     <td>{formatNumber(item.correct_count)}</td>
                     <td>{formatNumber(item.sample_count)}</td>
+                    <td>{formatNumber(item.predicted_count)}</td>
+                    <td>{formatRate(item.precision)}</td>
                     <td>{formatRate(item.recall)}</td>
                   </tr>
                 ))}
@@ -2640,18 +2991,26 @@ function AsrMetricSummaryCard({
   label,
   summary,
   fallbackRate,
+  accuracy,
+  accuracyLabel,
 }: {
   label: "WER" | "CER";
   summary?: WerSummary;
   fallbackRate?: number;
+  accuracy?: number;
+  accuracyLabel: string;
 }) {
   return (
     <section className="asr-summary-card">
       <div className="asr-summary-title">
         <span>{label}</span>
-        <strong>{formatRate(summary?.wer ?? fallbackRate)}</strong>
+        <strong>{formatPercentScale(summary?.wer ?? fallbackRate)}</strong>
       </div>
       <div className="report-summary">
+        <Metric
+          label={accuracyLabel}
+          value={formatPercentScale(accuracy ?? summary?.accuracy)}
+        />
         <Metric label="Correct" value={formatNumber(summary?.correct)} />
         <Metric label="Sub" value={formatNumber(summary?.substitutions)} />
         <Metric label="Del" value={formatNumber(summary?.deletions)} />
@@ -2851,7 +3210,7 @@ function TokenCounts({
 
   return (
     <span className="token-counts">
-      {summary ? `${metricLabel} ${formatRate(summary.wer)} · ` : ""}
+      {summary ? `${metricLabel} ${formatPercentScale(summary.wer)} · ` : ""}
       C {summary?.correct ?? counts.correct ?? 0} · S{" "}
       {summary?.substitutions ?? counts.substitution ?? 0} · D{" "}
       {summary?.deletions ?? counts.deletion ?? 0} · I{" "}
@@ -3181,6 +3540,12 @@ function formatRate(value: unknown): string {
   }
   const percentage = Math.abs(value) <= 1 ? value * 100 : value;
   return `${percentage.toFixed(2)}%`;
+}
+
+function formatPercentScale(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(2)}%`
+    : "-";
 }
 
 function formatNumber(value: unknown): string {
