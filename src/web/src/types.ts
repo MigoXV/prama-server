@@ -1,7 +1,27 @@
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 
 export type ThemeMode = "system" | "light" | "dark";
-export type EvaluationTask = "asr" | "vad";
+export type EvaluationTask = "asr" | "vad" | "lid" | "denoise" | "keyword";
+
+export interface HelpDocument {
+  title: string;
+  markdown: string;
+}
+
+export interface SqaScore {
+  engine_name: string;
+  target: string;
+  score: number | null;
+  error?: string | null;
+}
+
+export interface SqaSummary {
+  engine_name: string;
+  target: string;
+  mean_score: number | null;
+  scored_count: number;
+  failed_count: number;
+}
 
 export interface EvaluationRequest {
   task: EvaluationTask;
@@ -17,9 +37,20 @@ export interface EvaluationRequest {
   connect_timeout_seconds: number | null;
   request_timeout_seconds: number;
   interim_results: boolean;
+  inference_concurrency: number;
+  asr_inference_concurrency: number;
+  vad_inference_concurrency: number;
+  lid_inference_concurrency: number;
+  enable_mos: boolean;
+  mos_target: string;
+  enable_snr: boolean;
+  snr_target: string;
+  sqa_inference_concurrency: number;
+  lid_confidence_threshold: number;
   remove_punctuation: boolean;
   mask_frame_seconds: number;
   chunk_duration_seconds: number;
+  speech_padding_seconds: number;
   hit_threshold: number;
   streaming: boolean;
 }
@@ -43,6 +74,7 @@ export interface EvaluationProgress {
   result?: EvaluationResult;
   audio_url?: string;
   duration_seconds?: number;
+  sqa_scores?: SqaScore[];
 }
 
 export interface EvaluationSnapshot {
@@ -58,8 +90,16 @@ export interface EvaluationResult {
   wer?: number;
   cer?: number;
   accuracy?: number;
+  word_accuracy?: number;
+  character_accuracy?: number;
+  macro_precision?: number;
+  recall?: number;
+  known_accuracy?: number;
+  macro_recall?: number;
   frame?: VadFrameMetrics;
   segment?: VadSegmentMetrics;
+  frame_macro?: VadFrameMetrics;
+  segment_macro?: VadSegmentMetrics;
   frame_accuracy?: number;
   frame_recall?: number;
   frame_precision?: number;
@@ -70,12 +110,139 @@ export interface EvaluationResult {
   prediction_segment_count?: number;
   sample_count?: number;
   included_sample_count?: number;
-  excluded_sample_count?: number;
-  excluded_sample_ids?: string[];
   total_sample_count?: number;
+  correct_count?: number;
+  known_correct_count?: number;
+  known_sample_count?: number;
+  overall_correct_count?: number;
+  unknown_false_accept_count?: number;
+  known_reject_count?: number;
+  precision?: number;
+  f1?: number;
+  hit_count?: number;
+  miss_count?: number;
+  false_alarm_count?: number;
+  correct_reject_count?: number;
+  positive_sample_count?: number;
+  negative_sample_count?: number;
+  lid_language_recalls?: LidLanguageRecall[];
+  lid_confusion_matrix?: LidConfusionMatrix;
+  audio_duration_seconds?: number;
+  processing_elapsed_seconds?: number;
+  realtime_factor?: number;
   wer_report?: WerReport;
+  cer_report?: WerReport;
   vad_report?: VadReport;
+  lid_report?: LidReport;
+  denoise_report?: DenoiseReport;
+  keyword_report?: KeywordReport;
+  keyword_audio_report?: KeywordAudioReport;
+  audio_sample_count?: number;
+  sqa_summary?: SqaSummary[];
   [key: string]: unknown;
+}
+
+export interface KeywordReport {
+  samples: KeywordReportSample[];
+}
+
+export interface KeywordReportSample {
+  id: string;
+  index?: number;
+  audio_id?: string;
+  audio_index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  keyword: string;
+  expected_hit: boolean;
+  predicted_hit: boolean;
+  correct: boolean;
+  transcript: string;
+  match_text: string;
+  sqa_scores?: SqaScore[];
+}
+
+export interface KeywordAudioReport {
+  samples: KeywordAudioReportSample[];
+}
+
+export interface KeywordAudioReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  transcript: string;
+  match_text: string;
+  sqa_scores?: SqaScore[];
+  keywords: KeywordAudioKeywordResult[];
+}
+
+export interface KeywordAudioKeywordResult {
+  id: string;
+  index?: number;
+  keyword: string;
+  expected_hit: boolean;
+  predicted_hit: boolean;
+  correct: boolean;
+}
+
+export interface DenoiseReport {
+  samples: DenoiseReportSample[];
+}
+
+export interface DenoiseReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  denoised_audio_url?: string | null;
+  duration_seconds?: number;
+  original_sqa_scores?: SqaScore[];
+  denoised_sqa_scores?: SqaScore[];
+  original_snr?: number | null;
+  denoised_snr?: number | null;
+  snr_delta?: number | null;
+  original_mos?: number | null;
+  denoised_mos?: number | null;
+  mos_delta?: number | null;
+  error?: string | null;
+}
+
+export interface LidReport {
+  samples: LidReportSample[];
+}
+
+export interface LidLanguageRecall {
+  language: string;
+  correct_count: number;
+  sample_count: number;
+  predicted_count?: number;
+  precision?: number;
+  recall: number;
+}
+
+export interface LidConfusionMatrix {
+  reference_languages: string[];
+  predicted_languages: string[];
+  rows: LidConfusionMatrixRow[];
+}
+
+export interface LidConfusionMatrixRow {
+  reference_language: string;
+  total: number;
+  counts: Record<string, number>;
+}
+
+export interface LidReportSample {
+  id: string;
+  index?: number;
+  audio_url?: string;
+  duration_seconds?: number;
+  reference_language: string;
+  predicted_language: string;
+  raw_language: string;
+  confidence: number;
+  correct: boolean;
+  sqa_scores?: SqaScore[];
 }
 
 export interface VadFrameMetrics {
@@ -121,8 +288,8 @@ export interface VadReportSample {
   duration_seconds: number;
   frame_seconds: number;
   audio_url?: string;
-  excluded?: boolean;
   metrics?: EvaluationResult;
+  sqa_scores?: SqaScore[];
   reference_segments: VadReportSegment[];
   prediction_segments: VadReportSegment[];
   regions: VadReportRegion[];
@@ -172,7 +339,7 @@ export interface WerUtterance {
   index?: number;
   audio_url?: string;
   duration_seconds?: number;
-  excluded?: boolean;
+  sqa_scores?: SqaScore[];
   summary?: WerSummary;
   tokens: WerToken[];
 }
@@ -192,7 +359,6 @@ export interface InferenceRow {
   hypothesis: string;
   audioUrl?: string;
   durationSeconds?: number;
-  excluded?: boolean;
 }
 
 export interface EvaluationFormState {
@@ -209,9 +375,39 @@ export interface EvaluationFormState {
   connect_timeout_seconds: string;
   request_timeout_seconds: string;
   interim_results: boolean;
+  inference_concurrency: string;
+  asr_inference_concurrency: string;
+  vad_inference_concurrency: string;
+  lid_inference_concurrency: string;
+  enable_mos: boolean;
+  mos_target: string;
+  enable_snr: boolean;
+  snr_target: string;
+  sqa_inference_concurrency: string;
+  lid_confidence_threshold: string;
   remove_punctuation: boolean;
   mask_frame_seconds: string;
   chunk_duration_seconds: string;
+  speech_padding_seconds: string;
   hit_threshold: string;
   streaming: boolean;
+}
+
+export interface ServerDirectoryEntry {
+  name: string;
+  path: string;
+  kind: "directory" | "file";
+}
+
+export interface ServerDirectoryListing {
+  currentPath: string;
+  parentPath: string | null;
+  entries: ServerDirectoryEntry[];
+}
+
+export interface DatasetUploadResult {
+  dataset_path: string;
+  imported_count: number;
+  skipped_count?: number;
+  message?: string;
 }

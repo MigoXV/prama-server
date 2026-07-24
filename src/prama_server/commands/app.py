@@ -5,6 +5,8 @@ import logging
 import typer
 import uvicorn
 
+from prama_server.prama_cli import app as eval_app
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -12,6 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = typer.Typer()
+app.add_typer(eval_app, name="eval")
 
 
 @app.command()

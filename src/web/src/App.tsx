@@ -1,43 +1,66 @@
 import {
   Activity,
   BarChart3,
+  BookOpen,
   CheckCircle2,
-  ChevronDown,
   CircleDashed,
   Clipboard,
-  Database,
   Download,
-  EyeOff,
-  FileText,
+  Upload,
   Moon,
   Pause,
   Play,
   Server,
   Settings,
   Sun,
-  TerminalSquare,
   TriangleAlert,
   Monitor,
-  Radio,
 } from "lucide-react";
-import type { ChangeEvent, FormEvent, MouseEvent } from "react";
+import katex from "katex";
+import "katex/dist/katex.min.css";
+import type { ChangeEvent, FormEvent, MouseEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Button,
+  Field,
+  GhostButton,
+  MetricTile,
+  ServerDirectoryBrowserDialog,
+  SidebarPane,
+  StatusChip,
+  SvaraThemeProvider,
+  WorkbenchShell,
+  WorkspacePane,
+} from "svara-ui";
 import { usePersistentState } from "./hooks/usePersistentState";
 import { useThemeMode } from "./hooks/useThemeMode";
+import packageJson from "../package.json";
 import {
   createEvaluation,
-  recalculateEvaluationMetrics,
+  getHelpDocument,
+  getEvaluation,
+  listServerDirectory,
   subscribeEvaluationEvents,
+  testEngineConnectivity,
+  uploadDatasetFiles,
 } from "./services/evaluations";
 import type {
   EvaluationFormState,
   EvaluationProgress,
   EvaluationRequest,
   EvaluationResult,
+  EvaluationSnapshot,
   EvaluationTask,
-  InferenceRow,
+  DenoiseReportSample,
+  HelpDocument,
   JobStatus,
+  KeywordAudioReportSample,
+  KeywordReportSample,
+  LidReportSample,
+  SqaScore,
+  SqaSummary,
   ThemeMode,
+  VadReportRegion,
   VadReportSample,
   VadReportSegment,
   WerReport,
@@ -60,12 +83,32 @@ const DEFAULT_FORM_STATE: EvaluationFormState = {
   connect_timeout_seconds: "10",
   request_timeout_seconds: "60",
   interim_results: true,
+  inference_concurrency: "0",
+  asr_inference_concurrency: "0",
+  vad_inference_concurrency: "0",
+  lid_inference_concurrency: "0",
+  enable_mos: false,
+  mos_target: "",
+  enable_snr: false,
+  snr_target: "",
+  sqa_inference_concurrency: "0",
+  lid_confidence_threshold: "0",
   remove_punctuation: false,
   mask_frame_seconds: "0.01",
   chunk_duration_seconds: "0.1",
+  speech_padding_seconds: "0",
   hit_threshold: "0.9",
   streaming: false,
 };
+const KEYWORD_REPORT_INITIAL_VISIBLE = 100;
+const KEYWORD_REPORT_LOAD_STEP = 100;
+
+const APP_VERSION = packageJson.version;
+
+const LAST_EVALUATION_JOB_KEY = "prama.lastEvaluationJobId";
+const VAD_TIMELINE_LABEL_WIDTH = 88;
+const VAD_TIMELINE_PIXELS_PER_SECOND = 24;
+const VAD_TIMELINE_MIN_WIDTH = 760;
 
 const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
   asr: {
@@ -78,6 +121,46 @@ const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
     dataset_path: "data-bin/audiofolder/vad-demo",
     min_reference_words: "0",
   },
+  lid: {
+    target: "192.168.0.222:50026",
+    dataset_path: "data-bin/audiofolder/lid-demo",
+    min_reference_words: "0",
+  },
+  keyword: {
+    target: "192.168.0.222:50011",
+    dataset_path: "data-bin/audiofolder/keyword-demo",
+    min_reference_words: "0",
+  },
+  denoise: {
+    target: "192.168.0.222:50027",
+    dataset_path: "data-bin/audiofolder/denoise-demo",
+    min_reference_words: "0",
+  },
+};
+
+type TaskRememberedFields = Pick<EvaluationFormState, "target" | "dataset_path">;
+
+const TASK_REMEMBERED_DEFAULTS: Record<EvaluationTask, TaskRememberedFields> = {
+  asr: {
+    target: "192.168.0.222:50011",
+    dataset_path: "data-bin/audiofolder/asr-demo",
+  },
+  vad: {
+    target: "192.168.0.222:50021",
+    dataset_path: "data-bin/audiofolder/vad-demo",
+  },
+  lid: {
+    target: "192.168.0.222:50026",
+    dataset_path: "data-bin/audiofolder/lid-demo",
+  },
+  keyword: {
+    target: "192.168.0.222:50011",
+    dataset_path: "data-bin/audiofolder/keyword-demo",
+  },
+  denoise: {
+    target: "192.168.0.222:50027",
+    dataset_path: "data-bin/audiofolder/denoise-demo",
+  },
 };
 
 const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
@@ -89,55 +172,221 @@ const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
   failed: "失败",
 };
 
-const MODULES = [
-  { label: "在线评估", icon: Activity, active: true },
-  { label: "任务队列", icon: TerminalSquare, active: false },
-  { label: "数据集", icon: Database, active: false },
-  { label: "报告", icon: FileText, active: false },
-  { label: "设置", icon: Settings, active: false },
+type ConsoleModule = "evaluation" | "settings" | "help";
+
+const MODULES: Array<{
+  id: ConsoleModule;
+  label: string;
+  icon: typeof Activity;
+}> = [
+  { id: "evaluation", label: "在线评估", icon: Activity },
+  { id: "settings", label: "设置", icon: Settings },
+  { id: "help", label: "帮助", icon: BookOpen },
 ];
 
-type ReportSortMode = "index-asc" | "index-desc" | "wer-desc" | "wer-asc";
+type AlignmentMetric = "wer" | "cer";
+type ReportSortMode =
+  | "index-asc"
+  | "index-desc"
+  | "wer-desc"
+  | "wer-asc"
+  | "cer-desc"
+  | "cer-asc";
+type ConnectivityState = "idle" | "testing" | "ok" | "failed";
+type ConnectivityStatus = {
+  state: ConnectivityState;
+  message: string;
+};
+type EvaluationRunState = {
+  status: JobStatus | "idle" | "started";
+  jobId: string;
+  progress: EvaluationProgress | null;
+  finalResult: EvaluationResult | null;
+  errorMessage: string;
+  connectionWarning: string;
+  busy: boolean;
+};
+type TaskEventClosers = Record<EvaluationTask, (() => void) | null>;
+type MarkdownBlock =
+  | { type: "heading"; level: 1 | 2 | 3; text: string; id: string }
+  | { type: "paragraph"; text: string }
+  | { type: "list"; items: string[] }
+  | { type: "code"; language: string; text: string }
+  | { type: "formula"; text: string }
+  | { type: "table"; headers: string[]; rows: string[][] };
+
+const EMPTY_RUN_STATE: EvaluationRunState = {
+  status: "idle",
+  jobId: "",
+  progress: null,
+  finalResult: null,
+  errorMessage: "",
+  connectionWarning: "",
+  busy: false,
+};
+
+function createRunState(): EvaluationRunState {
+  return { ...EMPTY_RUN_STATE };
+}
+
+function createTaskRunStates(): Record<EvaluationTask, EvaluationRunState> {
+  return {
+    asr: createRunState(),
+    vad: createRunState(),
+    lid: createRunState(),
+    keyword: createRunState(),
+    denoise: createRunState(),
+  };
+}
+
+function createTaskEventClosers(): TaskEventClosers {
+  return {
+    asr: null,
+    vad: null,
+    lid: null,
+    keyword: null,
+    denoise: null,
+  };
+}
 
 export default function App() {
-  const { themeMode, setThemeMode } = useThemeMode();
+  const { themeMode, effectiveTheme, setThemeMode } = useThemeMode();
   const [storedFormState, setFormState] = usePersistentState<EvaluationFormState>(
     "prama.evaluationForm",
     DEFAULT_FORM_STATE,
   );
-  const formState = { ...DEFAULT_FORM_STATE, ...storedFormState };
-  const [advancedOpen, setAdvancedOpen] = usePersistentState(
-    "prama.advancedOpen",
-    false,
+  const formState = normalizeFormState(storedFormState);
+  const [taskRememberedFields, setTaskRememberedFields] = usePersistentState<
+    Record<EvaluationTask, TaskRememberedFields>
+  >("prama.taskRememberedFields", TASK_REMEMBERED_DEFAULTS);
+  const [runStates, setRunStates] = useState<Record<EvaluationTask, EvaluationRunState>>(
+    () => createTaskRunStates(),
   );
-  const [status, setStatus] = useState<JobStatus | "idle" | "started">("idle");
-  const [jobId, setJobId] = useState("");
-  const [progress, setProgress] = useState<EvaluationProgress | null>(null);
-  const [rows, setRows] = useState<InferenceRow[]>([]);
-  const [finalResult, setFinalResult] = useState<EvaluationResult | null>(null);
-  const [excludedSampleIds, setExcludedSampleIds] = useState<Set<string>>(
-    () => new Set(),
+  const [rememberedJobId, setRememberedJobId] = usePersistentState<string>(
+    LAST_EVALUATION_JOB_KEY,
+    "",
   );
-  const [errorMessage, setErrorMessage] = useState("");
-  const [connectionWarning, setConnectionWarning] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [recalculating, setRecalculating] = useState(false);
-  const [activeTab, setActiveTab] = useState<"overview" | "results" | "report">(
-    "overview",
-  );
+  const [connectivityStatus, setConnectivityStatus] = useState<
+    Record<string, ConnectivityStatus>
+  >({});
+  const [datasetUploading, setDatasetUploading] = useState(false);
+  const [activeModule, setActiveModule] = useState<ConsoleModule>("evaluation");
+  const [activeTab, setActiveTab] = useState<"overview" | "report">("overview");
+  const [activeAlignmentMetric, setActiveAlignmentMetric] =
+    useState<AlignmentMetric>("wer");
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
   const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
-  const [resultJumpIndex, setResultJumpIndex] = useState("");
-  const [highlightedResultIndex, setHighlightedResultIndex] = useState<number | null>(
-    null,
+  const [helpDocument, setHelpDocument] = useState<HelpDocument | null>(null);
+  const [helpError, setHelpError] = useState("");
+  const evaluationConnectivityKey = `evaluation:${formState.task}`;
+  const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
+  const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
+    formState.dataset_path,
   );
-  const resultRowRefs = useRef(new Map<number, HTMLTableRowElement>());
-  const closeEventsRef = useRef<(() => void) | null>(null);
+  const eventClosersRef = useRef<TaskEventClosers>(createTaskEventClosers());
+  const datasetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
+  const activeRunState = runStates[formState.task] ?? EMPTY_RUN_STATE;
+  const status = activeRunState.status;
+  const jobId = activeRunState.jobId;
+  const progress = activeRunState.progress;
+  const finalResult = activeRunState.finalResult;
+  const errorMessage = activeRunState.errorMessage;
+  const connectionWarning = activeRunState.connectionWarning;
+  const busy = activeRunState.busy;
+
+  function updateTaskRunState(
+    task: EvaluationTask,
+    update:
+      | Partial<EvaluationRunState>
+      | ((current: EvaluationRunState) => EvaluationRunState),
+  ) {
+    setRunStates((current) => {
+      const currentTaskState = current[task] ?? createRunState();
+      const nextTaskState =
+        typeof update === "function"
+          ? update(currentTaskState)
+          : { ...currentTaskState, ...update };
+      return {
+        ...current,
+        [task]: nextTaskState,
+      };
+    });
+  }
 
   useEffect(() => {
-    return () => closeEventsRef.current?.();
+    return () => {
+      Object.values(eventClosersRef.current).forEach((closeEvents) => {
+        closeEvents?.();
+      });
+    };
   }, []);
+
+  useEffect(() => {
+    if (
+      activeModule !== "evaluation" ||
+      jobId ||
+      activeRunState.busy ||
+      !rememberedJobId
+    ) {
+      return;
+    }
+
+    let canceled = false;
+    getEvaluation(rememberedJobId)
+      .then((snapshot) => {
+        if (canceled) {
+          return;
+        }
+        applyEvaluationSnapshot(snapshot);
+        if (snapshot.status === "queued" || snapshot.status === "running") {
+          subscribeToEvaluation(snapshot.job_id, snapshot.request.task);
+        }
+      })
+      .catch((error) => {
+        if (canceled) {
+          return;
+        }
+        const message =
+          error instanceof Error ? error.message : "最近评估任务恢复失败";
+        if (message.includes("评估任务不存在")) {
+          setRememberedJobId("");
+          return;
+        }
+        updateTaskRunState(formState.task, {
+          connectionWarning: message,
+        });
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [activeModule, rememberedJobId, jobId, activeRunState.busy, formState.task]);
+
+  useEffect(() => {
+    datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
+  }, [activeModule]);
+
+  useEffect(() => {
+    if (activeModule !== "help" || helpDocument || helpError) {
+      return;
+    }
+    let canceled = false;
+    getHelpDocument()
+      .then((document) => {
+        if (!canceled) {
+          setHelpDocument(document);
+        }
+      })
+      .catch((error) => {
+        if (!canceled) {
+          setHelpError(error instanceof Error ? error.message : "帮助文档加载失败");
+        }
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [activeModule, helpDocument, helpError]);
 
   useEffect(() => {
     function handleGlobalKeyDown(event: KeyboardEvent) {
@@ -161,172 +410,218 @@ export default function App() {
     return total > 0 ? Math.min((processed / total) * 100, 100) : 0;
   }, [progress]);
 
-  const report = finalResult?.wer_report;
-  const summary = report?.summary;
+  const werReport = finalResult?.wer_report;
+  const cerReport = finalResult?.cer_report;
+  const lidReport = finalResult?.lid_report;
+  const denoiseReport = finalResult?.denoise_report;
+  const keywordReport = finalResult?.keyword_report;
   const canExport = finalResult !== null;
-  const isVad = formState.task === "vad";
-  const canRecalculate = status === "completed" && finalResult !== null && !recalculating;
-
-  function resetRunState() {
-    closeEventsRef.current?.();
-    closeEventsRef.current = null;
-    setStatus("idle");
-    setJobId("");
-    setProgress(null);
-    setRows([]);
-    setFinalResult(null);
-    setExcludedSampleIds(new Set());
-    setErrorMessage("");
-    setConnectionWarning("");
-    setBusy(false);
-    setRecalculating(false);
-    setResultJumpIndex("");
-    setHighlightedResultIndex(null);
-    resultRowRefs.current.clear();
-  }
+  const displayTask = formState.task;
+  const isVad = displayTask === "vad";
+  const isLid = displayTask === "lid";
+  const isDenoise = displayTask === "denoise";
+  const isKeyword = displayTask === "keyword";
 
   function handleTaskChange(task: EvaluationTask) {
     if (task === formState.task) {
       return;
     }
-    resetRunState();
+    const nextTaskRemembered =
+      taskRememberedFields[task] ?? TASK_REMEMBERED_DEFAULTS[task];
+    setTaskRememberedFields((current) => ({
+      ...current,
+      [formState.task]: pickTaskRememberedFields(formState),
+    }));
     setFormState((current) => ({
       ...current,
       ...TASK_DEFAULTS[task],
+      ...nextTaskRemembered,
       task,
     }));
+    setDirectoryBrowserPath(nextTaskRemembered.dataset_path);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    closeEventsRef.current?.();
-    closeEventsRef.current = null;
-    setBusy(true);
-    setErrorMessage("");
-    setConnectionWarning("");
-    setRows([]);
-    setProgress(null);
-    setFinalResult(null);
-    setExcludedSampleIds(new Set());
-    setStatus("queued");
-    setJobId("");
+    const requestTask = formState.task;
+    updateTaskRunState(requestTask, {
+      busy: true,
+      errorMessage: "",
+      connectionWarning: "",
+    });
 
     try {
       const request = buildRequest(formState);
       const created = await createEvaluation(request);
-      setJobId(created.job_id);
-      setStatus(created.status);
-      closeEventsRef.current = subscribeEvaluationEvents(created.job_id, {
-        onProgress: (nextProgress) => {
-          setConnectionWarning("");
-          setProgress(nextProgress);
-          setStatus(nextProgress.status ?? "running");
-          appendProgressRow(nextProgress);
-          if (nextProgress.result) {
-            setFinalResult(nextProgress.result);
-          }
-        },
-        onPartialProgress: (nextProgress) => {
-          setConnectionWarning("");
-          setProgress(nextProgress);
-          setStatus(nextProgress.status ?? "running");
-        },
-        onDone: (snapshot) => {
-          setStatus(snapshot.status);
-          setProgress(snapshot.progress);
-          setFinalResult(snapshot.result);
-          setExcludedSampleIds(
-            new Set(snapshot.result?.excluded_sample_ids ?? []),
-          );
-          setErrorMessage(snapshot.error ?? "");
-          setBusy(false);
-          closeEventsRef.current = null;
-          if (snapshot.progress) {
-            appendProgressRow(snapshot.progress);
-          }
-        },
-        onError: (message) => {
-          setStatus("failed");
-          setErrorMessage(message);
-          setBusy(false);
-        },
-        onConnectionError: () => {
-          setConnectionWarning("事件流连接暂时不可用");
-        },
+      closeTaskEvents(request.task);
+      setRememberedJobId(created.job_id);
+      updateTaskRunState(request.task, {
+        status: created.status,
+        jobId: created.job_id,
+        progress: null,
+        finalResult: null,
+        errorMessage: "",
+        connectionWarning: "",
+        busy: true,
       });
+      subscribeToEvaluation(created.job_id, request.task);
     } catch (error) {
-      setStatus("failed");
-      setErrorMessage(error instanceof Error ? error.message : "评估任务创建失败");
-      setBusy(false);
+      updateTaskRunState(requestTask, (current) => ({
+        ...current,
+        errorMessage: error instanceof Error ? error.message : "评估任务创建失败",
+        busy: false,
+      }));
     }
   }
 
-  function appendProgressRow(nextProgress: EvaluationProgress) {
-    const sampleId = nextProgress.id || nextProgress.current_id;
-    if (!sampleId) {
+  async function handleTestConnectivity(key: string, target: string) {
+    const normalizedTarget = target.trim();
+    if (!normalizedTarget) {
+      setConnectivityStatus((current) => ({
+        ...current,
+        [key]: { state: "failed", message: "引擎地址不能为空" },
+      }));
       return;
     }
-
-    setRows((currentRows) => {
-      const index = nextProgress.evaluated ?? currentRows.length + 1;
-      if (currentRows.some((row) => row.index === index && row.sampleId === sampleId)) {
-        return currentRows;
-      }
-
-      return [
-        ...currentRows,
-        {
-          index,
-          sampleId,
-          reference: nextProgress.reference || "-",
-          hypothesis: nextProgress.hypothesis || "-",
-          audioUrl: nextProgress.audio_url,
-          durationSeconds: nextProgress.duration_seconds,
-        },
-      ];
-    });
-  }
-
-  function toggleExcludedSample(sampleId: string, excluded: boolean) {
-    setExcludedSampleIds((current) => {
-      const next = new Set(current);
-      if (excluded) {
-        next.add(sampleId);
-      } else {
-        next.delete(sampleId);
-      }
-      return next;
-    });
-  }
-
-  async function handleRecalculateMetrics() {
-    if (!jobId || !canRecalculate) {
-      return;
-    }
-    setRecalculating(true);
-    setErrorMessage("");
+    setConnectivityStatus((current) => ({
+      ...current,
+      [key]: { state: "testing", message: "测试中" },
+    }));
     try {
-      const nextResult = await recalculateEvaluationMetrics(
-        jobId,
-        [...excludedSampleIds],
+      const result = await testEngineConnectivity(
+        normalizedTarget,
+        toOptionalNumber(formState.connect_timeout_seconds),
       );
-      setFinalResult(nextResult);
-      setExcludedSampleIds(new Set(nextResult.excluded_sample_ids ?? []));
+      setConnectivityStatus((current) => ({
+        ...current,
+        [key]: {
+          state: result.ok ? "ok" : "failed",
+          message: result.message,
+        },
+      }));
     } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "重新计算评估指标失败",
-      );
-    } finally {
-      setRecalculating(false);
+      setConnectivityStatus((current) => ({
+        ...current,
+        [key]: {
+          state: "failed",
+          message: error instanceof Error ? error.message : "连接测试失败",
+        },
+      }));
     }
+  }
+
+  function applyEvaluationSnapshot(snapshot: EvaluationSnapshot) {
+    setRememberedJobId(snapshot.job_id);
+    updateTaskRunState(snapshot.request.task, {
+      status: snapshot.status,
+      jobId: snapshot.job_id,
+      progress: snapshot.progress,
+      finalResult: snapshot.result,
+      errorMessage: snapshot.error ?? "",
+      busy: snapshot.status === "queued" || snapshot.status === "running",
+    });
+  }
+
+  function subscribeToEvaluation(nextJobId: string, task: EvaluationTask) {
+    closeTaskEvents(task);
+    const closeEvents = subscribeEvaluationEvents(nextJobId, {
+      onProgress: (nextProgress) => {
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          connectionWarning: "",
+          progress: nextProgress,
+          status: nextProgress.status ?? "running",
+          finalResult: nextProgress.result ?? current.finalResult,
+        }));
+      },
+      onPartialProgress: (nextProgress) => {
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          connectionWarning: "",
+          progress: nextProgress,
+          status: nextProgress.status ?? "running",
+        }));
+      },
+      onDone: (snapshot) => {
+        applyEvaluationSnapshot(snapshot);
+        if (eventClosersRef.current[task] === closeEvents) {
+          eventClosersRef.current[task] = null;
+        }
+      },
+      onError: (message) => {
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          status: "failed",
+          errorMessage: message,
+          busy: false,
+        }));
+      },
+      onConnectionError: () => {
+        updateTaskRunState(task, (current) => ({
+          ...current,
+          connectionWarning: "事件流连接暂时不可用",
+        }));
+      },
+    });
+    eventClosersRef.current[task] = closeEvents;
+  }
+
+  function closeTaskEvents(task: EvaluationTask) {
+    eventClosersRef.current[task]?.();
+    eventClosersRef.current[task] = null;
   }
 
   function updateField(field: keyof EvaluationFormState, value: string) {
     setFormState((current) => ({ ...current, [field]: value }));
+    if (field === "target" || field === "dataset_path") {
+      setTaskRememberedFields((current) => ({
+        ...current,
+        [formState.task]: {
+          ...(current[formState.task] ?? TASK_REMEMBERED_DEFAULTS[formState.task]),
+          [field]: value,
+        },
+      }));
+    }
+  }
+
+  function setBooleanField(field: keyof EvaluationFormState, value: boolean) {
+    setFormState((current) => ({ ...current, [field]: value }));
+  }
+
+  async function handleImportDataset(files: File[]) {
+    const result = await uploadDatasetFiles(files);
+    updateField("dataset_path", result.dataset_path);
+    setDirectoryBrowserPath(result.dataset_path);
+    return {
+      importedCount: result.imported_count,
+      skippedCount: result.skipped_count,
+      message: result.message,
+    };
+  }
+
+  async function handleDatasetUploadChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) {
+      return;
+    }
+    setDatasetUploading(true);
+    updateTaskRunState(formState.task, { errorMessage: "" });
+    try {
+      await handleImportDataset(files);
+    } catch (error) {
+      updateTaskRunState(formState.task, {
+        errorMessage: error instanceof Error ? error.message : "数据集上传失败",
+      });
+    } finally {
+      setDatasetUploading(false);
+      event.target.value = "";
+    }
   }
 
   function resetForm() {
     setFormState(DEFAULT_FORM_STATE);
+    setTaskRememberedFields(TASK_REMEMBERED_DEFAULTS);
+    setDirectoryBrowserPath(DEFAULT_FORM_STATE.dataset_path);
   }
 
   async function copyText(value: string) {
@@ -351,28 +646,23 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
-  function jumpToResultIndex() {
-    const index = Number(resultJumpIndex);
-    if (!Number.isInteger(index) || index < 1) {
-      return;
-    }
-    const row = resultRowRefs.current.get(index);
-    if (!row) {
-      return;
-    }
-    row.scrollIntoView({ block: "center", behavior: "smooth" });
-    setHighlightedResultIndex(index);
-  }
-
   return (
-    <div className="console-frame">
-      <aside className="sidebar">
+    <SvaraThemeProvider
+      mode={effectiveTheme}
+      applyBackground={false}
+      className="app-theme-root"
+    >
+      <WorkbenchShell className="console-frame" sidebarWidth={232} variant="bare">
+        <SidebarPane className="sidebar" variant="bare">
         <div className="sidebar-brand">
           <div className="brand-symbol">
             <Server size={19} />
           </div>
           <div>
-            <strong>Prama</strong>
+            <div className="brand-title-row">
+              <strong>Prama</strong>
+              <small>v{APP_VERSION}</small>
+            </div>
             <span>评估控制台</span>
           </div>
         </div>
@@ -381,158 +671,391 @@ export default function App() {
           {MODULES.map((item) => {
             const Icon = item.icon;
             return (
-              <button
-                key={item.label}
-                type="button"
-                className={`module-item ${item.active ? "active" : ""}`}
-                disabled={!item.active}
-              >
-                <Icon size={17} />
-                <span>{item.label}</span>
-              </button>
+              <div className="module-group" key={item.id}>
+                <button
+                  type="button"
+                  className={`module-item ${activeModule === item.id ? "active" : ""}`}
+                  onClick={() => setActiveModule(item.id)}
+                >
+                  <Icon size={17} />
+                  <span>{item.label}</span>
+                </button>
+                {item.id === "evaluation" ? (
+                  <div className="task-nav" aria-label="评估类型">
+                    <button
+                      type="button"
+                      className={formState.task === "asr" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("asr");
+                      }}
+                    >
+                      ASR
+                    </button>
+                    <button
+                      type="button"
+                      className={formState.task === "vad" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("vad");
+                      }}
+                    >
+                      VAD
+                    </button>
+                    <button
+                      type="button"
+                      className={formState.task === "lid" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("lid");
+                      }}
+                    >
+                      LID
+                    </button>
+                    <button
+                      type="button"
+                      className={formState.task === "keyword" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("keyword");
+                      }}
+                    >
+                      Keyword
+                    </button>
+                    <button
+                      type="button"
+                      className={formState.task === "denoise" ? "active" : ""}
+                      onClick={() => {
+                        setActiveModule("evaluation");
+                        handleTaskChange("denoise");
+                      }}
+                    >
+                      SE
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             );
           })}
         </nav>
 
-        <div className="sidebar-footer">
-          <span className="sidebar-label">主题</span>
-          <div className="theme-switcher" aria-label="主题切换">
-            <ThemeButton
-              label="系统"
-              active={themeMode === "system"}
-              mode="system"
-              onClick={setThemeMode}
-            />
-            <ThemeButton
-              label="白色"
-              active={themeMode === "light"}
-              mode="light"
-              onClick={setThemeMode}
-            />
-            <ThemeButton
-              label="黑色"
-              active={themeMode === "dark"}
-              mode="dark"
-              onClick={setThemeMode}
-            />
-          </div>
-        </div>
-      </aside>
+        </SidebarPane>
 
-      <main className="workspace">
-        <header className="workspace-header">
-          <div>
-            <p className="eyebrow">{isVad ? "VAD Evaluation" : "ASR Evaluation"}</p>
-            <h1>{isVad ? "语音活动检测评估" : "语音识别评估"}</h1>
-          </div>
-          <div className="header-actions">
-            <StatusPill status={status} />
-            <button
-              type="button"
-              className="icon-action"
-              title="复制任务 ID"
-              aria-label="复制任务 ID"
-              disabled={!jobId}
-              onClick={() => void copyText(jobId)}
-            >
-              <Clipboard size={16} />
-            </button>
-            <button
-              type="button"
-              className="icon-action"
-              title="下载结果 JSON"
-              aria-label="下载结果 JSON"
-              disabled={!canExport}
-              onClick={downloadResult}
-            >
-              <Download size={16} />
-            </button>
-          </div>
-        </header>
-
-        <div className="page-tabs" role="tablist" aria-label="评估视图">
-          <TabButton
-            active={activeTab === "overview"}
-            label="运行概览"
-            meta={STATUS_LABELS[status]}
-            onClick={() => setActiveTab("overview")}
-          />
-          <TabButton
-            active={activeTab === "report"}
-            label={isVad ? "VAD 指标" : "WER 对齐报告"}
-            meta={
-              isVad
-                ? `${formatNumber(finalResult?.sample_count)} 个样本`
-                : `${report?.utterances.length ?? 0} 个样本`
-            }
-            onClick={() => setActiveTab("report")}
-          />
-          <TabButton
-            active={activeTab === "results"}
-            label="推理结果"
-            meta={`${rows.length} 条`}
-            onClick={() => setActiveTab("results")}
-          />
-        </div>
-
-        <section className="work-grid">
-          <form ref={formRef} className="panel evaluation-form" onSubmit={handleSubmit}>
-            <div className="panel-heading">
-              <div>
-                <h2>评估参数</h2>
-                <span>Job {jobId || "-"}</span>
-              </div>
-              <button type="button" className="ghost-button" onClick={resetForm}>
-                重置
+        <WorkspacePane
+          className={`workspace ${
+            activeModule === "evaluation" ? "" : "workspace-compact"
+          }`}
+          variant="bare"
+        >
+        {activeModule === "evaluation" ? (
+          <header className="workspace-header">
+            <div>
+              <p className="eyebrow">{evaluationTaskEnglishLabel(formState.task)}</p>
+              <h1>{evaluationTaskTitle(formState.task)}</h1>
+            </div>
+            <div className="header-actions">
+              <StatusPill status={status} />
+              <button
+                type="button"
+                className="icon-action"
+                title="复制任务 ID"
+                aria-label="复制任务 ID"
+                disabled={!jobId}
+                onClick={() => void copyText(jobId)}
+              >
+                <Clipboard size={16} />
+              </button>
+              <button
+                type="button"
+                className="icon-action"
+                title="下载结果 JSON"
+                aria-label="下载结果 JSON"
+                disabled={!canExport}
+                onClick={downloadResult}
+              >
+                <Download size={16} />
               </button>
             </div>
+          </header>
+        ) : null}
 
-            <div className="field-grid">
-              <TaskSelector
-                value={formState.task}
-                onChange={handleTaskChange}
-              />
-              <TextField
-                label={`${isVad ? "VAD" : "ASR"} gRPC 地址`}
-                value={formState.target}
-                onChange={(value) => updateField("target", value)}
-                required
-              />
-              <TextField
-                label="数据集路径"
-                value={formState.dataset_path}
-                onChange={(value) => updateField("dataset_path", value)}
-                required
-              />
-              <TextField
-                label="Split"
-                value={formState.split}
-                onChange={(value) => updateField("split", value)}
-                required
-              />
-              <TextField
-                label="Limit"
-                value={formState.limit}
-                type="number"
-                min="1"
-                placeholder="不限制"
-                onChange={(value) => updateField("limit", value)}
-              />
-            </div>
+        {activeModule === "evaluation" ? (
+          <div className="page-tabs" role="tablist" aria-label="评估视图">
+            <TabButton
+              active={activeTab === "overview"}
+              label="运行概览"
+              meta={STATUS_LABELS[status]}
+              onClick={() => setActiveTab("overview")}
+            />
+            <TabButton
+              active={activeTab === "report"}
+              label={
+                isVad
+                  ? "VAD 指标"
+                  : isLid
+                    ? "LID 报告"
+                    : isKeyword
+                      ? "关键词报告"
+                      : isDenoise
+                        ? "SE 报告"
+                        : "对齐报告"
+              }
+              meta={
+                isVad
+                  ? `${formatNumber(finalResult?.sample_count)} 个样本`
+                  : isLid
+                    ? `${lidReport?.samples.length ?? 0} 个样本`
+                    : isKeyword
+                      ? `${keywordReport?.samples.length ?? 0} 个样本`
+                      : isDenoise
+                        ? `${denoiseReport?.samples.length ?? 0} 个样本`
+                        : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
+              }
+              onClick={() => setActiveTab("report")}
+            />
+          </div>
+        ) : null}
 
-            <button
-              type="button"
-              className={`advanced-toggle ${advancedOpen ? "open" : ""}`}
-              onClick={() => setAdvancedOpen((value) => !value)}
+        <section
+          className={`work-grid ${
+            activeModule === "evaluation" ? "" : "single-column"
+          }`}
+        >
+          {activeModule === "evaluation" ? (
+            <form
+              ref={formRef}
+              className="panel evaluation-form svara-surface svara-surface-padded"
+              onSubmit={handleSubmit}
             >
-              <span>高级参数</span>
-              <ChevronDown size={16} />
-            </button>
+              <div className="panel-heading">
+                <div>
+                  <h2>{evaluationTaskShortLabel(formState.task)} 在线评估</h2>
+                  <span>Job {jobId || "-"}</span>
+                </div>
+              </div>
 
-            {advancedOpen ? (
-              <div className="field-grid advanced-grid">
-                {!isVad ? (
-                  <>
+              <div className="field-grid">
+                <div className="engine-target-row">
+                  <TextField
+                    label={`${evaluationTaskShortLabel(formState.task)} 引擎地址`}
+                    value={formState.target}
+                    onChange={(value) => updateField("target", value)}
+                    required
+                  />
+                  <ConnectivityButton
+                    status={connectivityStatus[evaluationConnectivityKey]}
+                    onClick={() =>
+                      void handleTestConnectivity(
+                        evaluationConnectivityKey,
+                        formState.target,
+                      )
+                    }
+                  />
+                </div>
+                <label className="field dataset-path-field">
+                  <span>数据集路径</span>
+                  <div className="dataset-path-controls">
+                    <input
+                      value={formState.dataset_path}
+                      required
+                      disabled={busy || datasetUploading}
+                      onChange={(event) => updateField("dataset_path", event.target.value)}
+                    />
+                    <input
+                      ref={datasetUploadInputRef}
+                      type="file"
+                      hidden
+                      multiple
+                      accept=".wav,.mp3,.flac,.ogg,.json,.jsonl,.csv,.parquet,.txt"
+                      onChange={handleDatasetUploadChange}
+                    />
+                    <GhostButton
+                      className="dataset-action-button dataset-upload-button"
+                      disabled={busy || datasetUploading}
+                      onClick={() => datasetUploadInputRef.current?.click()}
+                    >
+                      <Upload size={14} />
+                      <span>{datasetUploading ? "上传中" : "上传"}</span>
+                    </GhostButton>
+                    <GhostButton
+                      className="dataset-action-button dataset-browser-button"
+                      disabled={busy || datasetUploading}
+                      onClick={() => {
+                        setDirectoryBrowserPath(formState.dataset_path);
+                        setDirectoryBrowserOpen(true);
+                      }}
+                    >
+                      浏览
+                    </GhostButton>
+                  </div>
+                </label>
+                <div className="dataset-options-grid">
+                  <TextField
+                    label="Split"
+                    value={formState.split}
+                    onChange={(value) => updateField("split", value)}
+                    required
+                  />
+                  <TextField
+                    label="Limit"
+                    value={formState.limit}
+                    type="number"
+                    min="1"
+                    placeholder="不限制"
+                    onChange={(value) => updateField("limit", value)}
+                  />
+                </div>
+              </div>
+
+              <div className="form-action-bar">
+                <Button type="submit" className="primary-action" disabled={busy || datasetUploading} stretch>
+                  {busy ? "评估中..." : "启动评估"}
+                </Button>
+              </div>
+            </form>
+          ) : null}
+
+          {activeModule === "settings" ? (
+            <section className="panel configuration-panel settings-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>设置</h2>
+                  <span>ASR、VAD、LID 与 SE 的高级评估参数</span>
+                </div>
+                <button type="button" className="ghost-button" onClick={resetForm}>
+                  重置
+                </button>
+              </div>
+              <div className="settings-stack">
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>界面设置</h3>
+                  </div>
+                  <div className="theme-switcher settings-theme-switcher" aria-label="主题切换">
+                    <ThemeButton
+                      label="系统"
+                      active={themeMode === "system"}
+                      mode="system"
+                      onClick={setThemeMode}
+                    />
+                    <ThemeButton
+                      label="白色"
+                      active={themeMode === "light"}
+                      mode="light"
+                      onClick={setThemeMode}
+                    />
+                    <ThemeButton
+                      label="黑色"
+                      active={themeMode === "dark"}
+                      mode="dark"
+                      onClick={setThemeMode}
+                    />
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>通用设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="采样率"
+                      value={formState.sample_rate}
+                      type="number"
+                      min="1"
+                      onChange={(value) => updateField("sample_rate", value)}
+                      required
+                    />
+                    <TextField
+                      label="连接超时秒"
+                      value={formState.connect_timeout_seconds}
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      onChange={(value) => updateField("connect_timeout_seconds", value)}
+                    />
+                    <TextField
+                      label="请求超时秒"
+                      value={formState.request_timeout_seconds}
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      onChange={(value) => updateField("request_timeout_seconds", value)}
+                      required
+                    />
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>SQA 语音质量评估</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="MOS/SNR 推理并发数"
+                      value={formState.sqa_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) => updateField("sqa_inference_concurrency", value)}
+                      required
+                    />
+                  </div>
+                  <div className="sqa-fixed-list">
+                    <div className="sqa-fixed-row">
+                      <label className="check-field">
+                        <input
+                          type="checkbox"
+                          checked={formState.enable_mos}
+                          onChange={(event) =>
+                            setBooleanField("enable_mos", event.target.checked)
+                          }
+                        />
+                        <span>MOS</span>
+                      </label>
+                      <TextField
+                        label="MOS 地址"
+                        value={formState.mos_target}
+                        onChange={(value) => updateField("mos_target", value)}
+                      />
+                      <ConnectivityButton
+                        status={connectivityStatus.mos}
+                        onClick={() =>
+                          void handleTestConnectivity("mos", formState.mos_target)
+                        }
+                      />
+                    </div>
+                    <div className="sqa-fixed-row">
+                      <label className="check-field">
+                        <input
+                          type="checkbox"
+                          checked={formState.enable_snr}
+                          onChange={(event) =>
+                            setBooleanField("enable_snr", event.target.checked)
+                          }
+                        />
+                        <span>SNR</span>
+                      </label>
+                      <TextField
+                        label="SNR 地址"
+                        value={formState.snr_target}
+                        onChange={(value) => updateField("snr_target", value)}
+                      />
+                      <ConnectivityButton
+                        status={connectivityStatus.snr}
+                        onClick={() =>
+                          void handleTestConnectivity("snr", formState.snr_target)
+                        }
+                      />
+                    </div>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>ASR 高级设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
                     <TextField
                       label="语言"
                       value={formState.language_code}
@@ -559,64 +1082,17 @@ export default function App() {
                       step="0.1"
                       onChange={(value) => updateField("hotword_bias", value)}
                     />
-                  </>
-                ) : null}
-                <TextField
-                  label="采样率"
-                  value={formState.sample_rate}
-                  type="number"
-                  min="1"
-                  onChange={(value) => updateField("sample_rate", value)}
-                  required
-                />
-                {isVad ? (
-                  <>
                     <TextField
-                      label="VAD 帧长秒"
-                      value={formState.mask_frame_seconds}
-                      type="number"
-                      min="0.001"
-                      step="0.001"
-                      onChange={(value) => updateField("mask_frame_seconds", value)}
-                    />
-                    <TextField
-                      label="VAD 分块秒"
-                      value={formState.chunk_duration_seconds}
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      onChange={(value) => updateField("chunk_duration_seconds", value)}
-                    />
-                    <TextField
-                      label="段命中阈值"
-                      value={formState.hit_threshold}
+                      label="ASR 推理并发数"
+                      value={formState.asr_inference_concurrency}
                       type="number"
                       min="0"
-                      max="1"
-                      step="0.01"
-                      onChange={(value) => updateField("hit_threshold", value)}
+                      step="1"
+                      onChange={(value) =>
+                        updateField("asr_inference_concurrency", value)
+                      }
+                      required
                     />
-                  </>
-                ) : null}
-                <TextField
-                  label="连接超时秒"
-                  value={formState.connect_timeout_seconds}
-                  type="number"
-                  min="0.1"
-                  step="0.1"
-                  onChange={(value) => updateField("connect_timeout_seconds", value)}
-                />
-                <TextField
-                  label="请求超时秒"
-                  value={formState.request_timeout_seconds}
-                  type="number"
-                  min="0.1"
-                  step="0.1"
-                  onChange={(value) => updateField("request_timeout_seconds", value)}
-                  required
-                />
-                {!isVad ? (
-                  <>
                     <label className="check-field">
                       <input
                         type="checkbox"
@@ -643,31 +1119,134 @@ export default function App() {
                       />
                       <span>评估时去掉标点</span>
                     </label>
-                  </>
-                ) : (
-                  <label className="check-field">
-                    <input
-                      type="checkbox"
-                      checked={formState.streaming}
-                      onChange={(event) =>
-                        setFormState((current) => ({
-                          ...current,
-                          streaming: event.target.checked,
-                        }))
-                      }
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>VAD 高级设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="VAD 帧长秒"
+                      value={formState.mask_frame_seconds}
+                      type="number"
+                      min="0.001"
+                      step="0.001"
+                      onChange={(value) => updateField("mask_frame_seconds", value)}
                     />
-                    <span>使用 VAD 流式接口</span>
-                  </label>
-                )}
+                    <TextField
+                      label="VAD 分块秒"
+                      value={formState.chunk_duration_seconds}
+                      type="number"
+                      min="0.01"
+                      step="0.01"
+                      onChange={(value) => updateField("chunk_duration_seconds", value)}
+                    />
+                    <TextField
+                      label="语音扩展秒"
+                      value={formState.speech_padding_seconds ?? "0"}
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      onChange={(value) => updateField("speech_padding_seconds", value)}
+                    />
+                    <TextField
+                      label="段命中阈值"
+                      value={formState.hit_threshold}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      onChange={(value) => updateField("hit_threshold", value)}
+                    />
+                    <TextField
+                      label="VAD 推理并发数"
+                      value={formState.vad_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) =>
+                        updateField("vad_inference_concurrency", value)
+                      }
+                      required
+                    />
+                    <label className="check-field">
+                      <input
+                        type="checkbox"
+                        checked={formState.streaming}
+                        onChange={(event) =>
+                          setFormState((current) => ({
+                            ...current,
+                            streaming: event.target.checked,
+                          }))
+                        }
+                      />
+                      <span>使用 VAD 流式接口</span>
+                    </label>
+                  </div>
+                </section>
+                <section className="settings-section">
+                  <div className="settings-section-heading">
+                    <h3>LID 高级设置</h3>
+                  </div>
+                  <div className="field-grid advanced-grid">
+                    <TextField
+                      label="LID 推理并发数"
+                      value={formState.lid_inference_concurrency}
+                      type="number"
+                      min="0"
+                      step="1"
+                      onChange={(value) =>
+                        updateField("lid_inference_concurrency", value)
+                      }
+                      required
+                    />
+                    <TextField
+                      label="LID 置信度阈值"
+                      value={formState.lid_confidence_threshold}
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      onChange={(value) =>
+                        updateField("lid_confidence_threshold", value)
+                      }
+                      required
+                    />
+                  </div>
+                </section>
               </div>
-            ) : null}
+            </section>
+          ) : null}
 
-            <button type="submit" className="primary-action" disabled={busy}>
-              {busy ? "评估中..." : "启动评估"}
-            </button>
-          </form>
+          {activeModule === "help" ? (
+            <section className="panel help-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>{helpDocument?.title || "帮助"}</h2>
+                  <span>数据集格式、字段要求和示例</span>
+                </div>
+              </div>
+              {helpError ? (
+                <div className="inline-warning">
+                  <TriangleAlert size={15} />
+                  {helpError}
+                </div>
+              ) : helpDocument ? (
+                <MarkdownDocument markdown={helpDocument.markdown} />
+              ) : (
+                <div className="empty-state">正在加载帮助文档</div>
+              )}
+            </section>
+          ) : null}
 
-          <section className="run-column">
+          {activeModule === "evaluation" ? (
+          <section
+            className={`run-column ${
+              activeTab === "report" ? "report-column" : "overview-column"
+            }`}
+          >
             {activeTab === "overview" ? (
               <>
                 <div className="panel progress-panel">
@@ -683,8 +1262,10 @@ export default function App() {
                   </div>
                   <div className="metric-strip progress-metrics">
                     <Metric label="已处理" value={`${progress?.processed ?? 0} / ${progress?.total ?? 0}`} />
-                    <Metric label="已评估" value={String(progress?.evaluated ?? rows.length)} />
+                    <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
                   </div>
+                  <PerformanceMetrics result={finalResult} />
+                  <SqaSummaryMetrics summary={finalResult?.sqa_summary} />
                   {connectionWarning ? (
                     <div className="inline-warning">
                       <TriangleAlert size={15} />
@@ -699,8 +1280,14 @@ export default function App() {
                   ) : null}
                 </div>
                 {isVad ? <VadOverviewMetrics result={finalResult} /> : null}
+                {isLid ? <LidOverviewMetrics result={finalResult} /> : null}
+                {isKeyword ? <KeywordOverviewMetrics result={finalResult} /> : null}
+                {isDenoise ? <DenoiseOverviewMetrics result={finalResult} /> : null}
+                {!isVad && !isLid && !isKeyword && !isDenoise ? (
+                  <AsrOverviewMetrics result={finalResult} />
+                ) : null}
 
-                {!isVad ? (
+                {!isVad && !isDenoise ? (
                   <div className="panel sample-panel">
                     <div className="panel-heading compact-heading">
                       <div>
@@ -709,128 +1296,76 @@ export default function App() {
                       </div>
                     </div>
                     <div className="sample-grid">
-                      <TextBlock label="Reference" value={progress?.reference || "-"} />
-                      <TextBlock label="Hypothesis" value={progress?.hypothesis || "-"} />
+                      <TextBlock
+                        label={
+                          isLid
+                            ? "Reference Language"
+                            : isKeyword
+                              ? "Expected"
+                              : "Reference"
+                        }
+                        value={progress?.reference || "-"}
+                      />
+                      <TextBlock
+                        label={
+                          isLid || isKeyword ? "Prediction" : "Hypothesis"
+                        }
+                        value={progress?.hypothesis || "-"}
+                      />
                     </div>
                   </div>
                 ) : null}
               </>
             ) : null}
 
-            {activeTab === "results" ? (
-              <div className="panel result-panel">
-                <div className="panel-heading compact-heading">
-                  <div>
-                    <h2>推理结果</h2>
-                    <span>{rows.length} 条</span>
-                  </div>
-                  <div className="jump-control">
-                    <label>
-                      <span>跳转序号</span>
-                      <input
-                        type="number"
-                        min="1"
-                        value={resultJumpIndex}
-                        placeholder="例如 12"
-                        onChange={(event) => setResultJumpIndex(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            jumpToResultIndex();
-                          }
-                        }}
-                      />
-                    </label>
-                    <button type="button" onClick={jumpToResultIndex}>
-                      跳转
-                    </button>
-                  </div>
-                </div>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>屏蔽</th>
-                        <th>序号</th>
-                        <th>样本</th>
-                        <th>{isVad ? "Reference Segments" : "Reference"}</th>
-                        <th>{isVad ? "Prediction Segments" : "Hypothesis"}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.length ? (
-                        rows.map((row) => (
-                          <tr
-                            key={`${row.index}:${row.sampleId}`}
-                            className={
-                              highlightedResultIndex === row.index
-                                ? "highlighted-row"
-                                : ""
-                            }
-                            ref={(element) => {
-                              if (element) {
-                                resultRowRefs.current.set(row.index, element);
-                              } else {
-                                resultRowRefs.current.delete(row.index);
-                              }
-                            }}
-                          >
-                            <td>
-                              <ExcludeCheckbox
-                                checked={excludedSampleIds.has(row.sampleId)}
-                                onChange={(checked) =>
-                                  toggleExcludedSample(row.sampleId, checked)
-                                }
-                              />
-                            </td>
-                            <td>{row.index}</td>
-                            <td>{row.sampleId}</td>
-                            <td>{row.reference}</td>
-                            <td>{row.hypothesis}</td>
-                          </tr>
-                        ))
-                      ) : (
-                        <tr>
-                          <td colSpan={5} className="empty-cell">
-                            暂无推理结果
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            ) : null}
-
             {activeTab === "report" ? (
               isVad ? (
                 <VadReportPanel
                   result={finalResult}
-                  excludedSampleIds={excludedSampleIds}
-                  onExcludedChange={toggleExcludedSample}
-                  canRecalculate={canRecalculate}
-                  recalculating={recalculating}
-                  onRecalculate={() => void handleRecalculateMetrics()}
+                />
+              ) : isLid ? (
+                <LidReportPanel
+                  result={finalResult}
+                />
+              ) : isDenoise ? (
+                <DenoiseReportPanel
+                  result={finalResult}
+                />
+              ) : isKeyword ? (
+                <KeywordReportPanel
+                  result={finalResult}
                 />
               ) : (
-                <WerReportPanel
-                  report={report}
+                <AsrAlignmentReportPanel
+                  werReport={werReport}
+                  cerReport={cerReport}
+                  activeMetric={activeAlignmentMetric}
+                  onActiveMetricChange={setActiveAlignmentMetric}
                   result={finalResult}
                   sortMode={reportSort}
                   onSortModeChange={setReportSort}
                   wrapAlignment={wrapWerAlignment}
                   onWrapAlignmentChange={setWrapWerAlignment}
-                  excludedSampleIds={excludedSampleIds}
-                  onExcludedChange={toggleExcludedSample}
-                  canRecalculate={canRecalculate}
-                  recalculating={recalculating}
-                  onRecalculate={() => void handleRecalculateMetrics()}
                 />
               )
             ) : null}
           </section>
+          ) : null}
         </section>
-      </main>
-    </div>
+        <ServerDirectoryBrowserDialog
+          isOpen={directoryBrowserOpen}
+          initialPath={directoryBrowserPath}
+          listDirectory={listServerDirectory}
+          onClose={() => setDirectoryBrowserOpen(false)}
+          onSelect={(path) => {
+            updateField("dataset_path", path);
+            setDirectoryBrowserPath(path);
+            setDirectoryBrowserOpen(false);
+          }}
+        />
+        </WorkspacePane>
+      </WorkbenchShell>
+    </SvaraThemeProvider>
   );
 }
 
@@ -895,10 +1430,39 @@ function StatusPill({ status }: { status: JobStatus | "idle" | "started" }) {
           ? CircleDashed
           : BarChart3;
   return (
-    <div className={`status-pill status-${status}`}>
+    <StatusChip className={`status-pill status-${status}`}>
       <Icon size={15} />
       {STATUS_LABELS[status]}
-    </div>
+    </StatusChip>
+  );
+}
+
+function ConnectivityButton({
+  status,
+  onClick,
+}: {
+  status?: ConnectivityStatus;
+  onClick: () => void;
+}) {
+  const state = status?.state ?? "idle";
+  const label =
+    state === "testing"
+      ? "测试中"
+      : state === "ok"
+        ? "已连接"
+        : state === "failed"
+          ? "失败"
+          : "测试";
+  return (
+    <button
+      type="button"
+      className={`connectivity-button ${state}`}
+      title={status?.message || "测试 gRPC 连通性"}
+      disabled={state === "testing"}
+      onClick={onClick}
+    >
+      {label}
+    </button>
   );
 }
 
@@ -926,8 +1490,7 @@ function TextField({
   disabled?: boolean;
 }) {
   return (
-    <label className="field">
-      <span>{label}</span>
+    <Field label={label} className="field">
       <input
         value={value}
         type={type}
@@ -939,49 +1502,15 @@ function TextField({
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
       />
-    </label>
-  );
-}
-
-function TaskSelector({
-  value,
-  onChange,
-}: {
-  value: EvaluationTask;
-  onChange: (task: EvaluationTask) => void;
-}) {
-  return (
-    <div className="task-selector" role="radiogroup" aria-label="评估类型">
-      <button
-        type="button"
-        className={value === "asr" ? "active" : ""}
-        onClick={() => onChange("asr")}
-      >
-        <Activity size={16} />
-        <span>ASR</span>
-      </button>
-      <button
-        type="button"
-        className={value === "vad" ? "active" : ""}
-        onClick={() => onChange("vad")}
-      >
-        <Radio size={16} />
-        <span>VAD</span>
-      </button>
-    </div>
+    </Field>
   );
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+  return <MetricTile className="metric" label={label} value={value} />;
 }
 
-function TextBlock({ label, value }: { label: string; value: string }) {
+function TextBlock({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="text-block">
       <span>{label}</span>
@@ -990,29 +1519,157 @@ function TextBlock({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ExcludeCheckbox({
-  checked,
-  onChange,
+type KeywordHighlightTone = "hit" | "false_alarm";
+
+interface KeywordHighlight {
+  keyword: string;
+  tone: KeywordHighlightTone;
+}
+
+function KeywordMatchTextBlock({
+  matchText,
+  highlights,
 }: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
+  matchText: string;
+  highlights: KeywordHighlight[];
 }) {
   return (
-    <button
-      type="button"
-      className={`exclude-toggle ${checked ? "excluded" : ""}`}
-      title={checked ? "取消屏蔽该样本" : "屏蔽该样本的推理结果"}
-      aria-label={checked ? "取消屏蔽该样本" : "屏蔽该样本的推理结果"}
-      aria-pressed={checked}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onChange(!checked);
-      }}
-    >
-      <EyeOff size={15} />
-    </button>
+    <TextBlock
+      label="正则化后的推理结果"
+      value={
+        matchText ? (
+          <HighlightedKeywordText text={matchText} highlights={highlights} />
+        ) : (
+          "-"
+        )
+      }
+    />
   );
+}
+
+function keywordHighlightsFromSample(sample: KeywordReportSample): KeywordHighlight[] {
+  if (!sample.predicted_hit) {
+    return [];
+  }
+  return [
+    {
+      keyword: sample.keyword,
+      tone: sample.expected_hit ? "hit" : "false_alarm",
+    },
+  ];
+}
+
+function keywordHighlightsFromAudioSample(
+  sample: KeywordAudioReportSample,
+): KeywordHighlight[] {
+  return sample.keywords
+    .filter((keyword) => keyword.predicted_hit)
+    .map((keyword) => ({
+      keyword: keyword.keyword,
+      tone: keyword.expected_hit ? "hit" : "false_alarm",
+    }));
+}
+
+function HighlightedKeywordText({
+  text,
+  highlights,
+}: {
+  text: string;
+  highlights: KeywordHighlight[];
+}) {
+  const ranges = keywordHighlightRanges(text, highlights);
+  if (!ranges.length) {
+    return <>{text}</>;
+  }
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) {
+      parts.push(text.slice(cursor, range.start));
+    }
+    parts.push(
+      <mark
+        className={`keyword-match-highlight ${range.tone}`}
+        key={`${range.start}-${range.end}-${index}`}
+      >
+        {text.slice(range.start, range.end)}
+      </mark>,
+    );
+    cursor = range.end;
+  });
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
+  return <>{parts}</>;
+}
+
+function keywordHighlightRanges(text: string, highlights: KeywordHighlight[]) {
+  const ranges = highlights
+    .flatMap((highlight) =>
+      keywordRangesForHighlight(text, highlight).map((range) => ({
+        ...range,
+        tone: highlight.tone,
+      })),
+    )
+    .sort((left, right) => left.start - right.start || right.end - left.end);
+
+  const merged: Array<{ start: number; end: number; tone: KeywordHighlightTone }> = [];
+  ranges.forEach((range) => {
+    const previous = merged[merged.length - 1];
+    if (!previous || range.start >= previous.end) {
+      merged.push(range);
+      return;
+    }
+    if (range.end > previous.end && range.tone === previous.tone) {
+      previous.end = range.end;
+    }
+  });
+  return merged;
+}
+
+function keywordRangesForHighlight(text: string, highlight: KeywordHighlight) {
+  const normalizedKeyword = normalizeKeywordText(highlight.keyword);
+  if (!normalizedKeyword) {
+    return [];
+  }
+  if (/^[a-z0-9]+(?: [a-z0-9]+)*$/.test(normalizedKeyword)) {
+    const tokens = Array.from(text.matchAll(/\S+/g));
+    const keywordTokens = normalizedKeyword.split(" ");
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let index = 0; index <= tokens.length - keywordTokens.length; index += 1) {
+      const tokenSlice = tokens.slice(index, index + keywordTokens.length);
+      if (
+        tokenSlice.every(
+          (token, tokenIndex) => token[0] === keywordTokens[tokenIndex],
+        )
+      ) {
+        const firstToken = tokenSlice[0];
+        const lastToken = tokenSlice[tokenSlice.length - 1];
+        ranges.push({
+          start: firstToken.index ?? 0,
+          end: (lastToken.index ?? 0) + lastToken[0].length,
+        });
+      }
+    }
+    return ranges;
+  }
+
+  const ranges: Array<{ start: number; end: number }> = [];
+  let start = text.indexOf(normalizedKeyword);
+  while (start >= 0) {
+    ranges.push({ start, end: start + normalizedKeyword.length });
+    start = text.indexOf(normalizedKeyword, start + normalizedKeyword.length);
+  }
+  return ranges;
+}
+
+function normalizeKeywordText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/\p{P}/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function AudioPlayer({
@@ -1110,11 +1767,240 @@ function SampleCountStrip({
   fallbackCount: number;
 }) {
   const included = result?.included_sample_count ?? fallbackCount;
-  const excluded = result?.excluded_sample_count ?? 0;
+  const total = result?.total_sample_count;
   return (
     <div className="metric-strip sample-count-strip">
       <Metric label="参与样本" value={formatNumber(included)} />
-      <Metric label="屏蔽样本" value={formatNumber(excluded)} />
+      {typeof total === "number" && total !== included ? (
+        <Metric label="总样本" value={formatNumber(total)} />
+      ) : null}
+    </div>
+  );
+}
+
+function PerformanceMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="metric-strip performance-metrics">
+      <Metric label="音频时长" value={formatSeconds(result.audio_duration_seconds)} />
+      <Metric label="处理耗时" value={formatSeconds(result.processing_elapsed_seconds)} />
+      <Metric label="倍时" value={formatRealtimeFactor(result.realtime_factor)} />
+    </div>
+  );
+}
+
+function CompactReportMeta({
+  result,
+  fallbackCount,
+  className = "",
+}: {
+  result: EvaluationResult | null;
+  fallbackCount: number;
+  className?: string;
+}) {
+  const included = result?.included_sample_count ?? fallbackCount;
+  const total = result?.total_sample_count;
+  const sampleText =
+    typeof total === "number" && total !== included
+      ? `${formatNumber(included)} / ${formatNumber(total)}`
+      : formatNumber(included);
+  const items = [
+    { label: "参与样本", value: sampleText },
+    { label: "音频时长", value: formatSeconds(result?.audio_duration_seconds) },
+    { label: "处理耗时", value: formatSeconds(result?.processing_elapsed_seconds) },
+    { label: "倍时", value: formatRealtimeFactor(result?.realtime_factor) },
+  ];
+
+  return (
+    <div
+      className={`compact-report-meta ${className}`.trim()}
+      aria-label="评估运行元信息"
+    >
+      {items.map((item) => (
+        <span key={item.label}>
+          <em>{item.label}</em>
+          <strong>{item.value}</strong>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function SqaSummaryMetrics({ summary }: { summary?: SqaSummary[] }) {
+  if (!summary?.length) {
+    return null;
+  }
+
+  return (
+    <div className="metric-strip sqa-summary-metrics">
+      {summary.map((item) => (
+        <Metric
+          key={`${item.engine_name}-${item.target}`}
+          label={item.engine_name}
+          value={formatSqaScore(item.mean_score)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function SqaScoreChips({ scores }: { scores?: SqaScore[] }) {
+  if (!scores?.length) {
+    return null;
+  }
+
+  return (
+    <span className="sqa-score-chips">
+      {scores.map((item) => {
+        const failed = item.score === null || item.score === undefined || item.error;
+        const title = failed
+          ? `${item.engine_name}: ${item.error || "无有效分数"}`
+          : `${item.engine_name}: ${item.target}`;
+        return (
+          <span
+            className={`sqa-score-chip ${failed ? "failed" : ""}`}
+            key={`${item.engine_name}-${item.target}`}
+            title={title}
+          >
+            <em>{item.engine_name}</em>
+            <strong>{formatSqaScore(item.score)}</strong>
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+function MarkdownDocument({ markdown }: { markdown: string }) {
+  const blocks = useMemo(() => parseMarkdown(markdown), [markdown]);
+  return (
+    <article className="markdown-document">
+      {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
+          return (
+            <HeadingTag id={block.id} key={index}>
+              {renderInlineMarkdown(block.text)}
+            </HeadingTag>
+          );
+        }
+        if (block.type === "formula") {
+          return <LatexFormula key={index} text={block.text} displayMode />;
+        }
+        if (block.type === "code") {
+          return (
+            <pre key={index} className="markdown-code-block">
+              {block.language ? <span>{block.language}</span> : null}
+              <code>{block.text}</code>
+            </pre>
+          );
+        }
+        if (block.type === "list") {
+          return (
+            <ul key={index}>
+              {block.items.map((item, itemIndex) => (
+                <li key={itemIndex}>{renderInlineMarkdown(item)}</li>
+              ))}
+            </ul>
+          );
+        }
+        if (block.type === "table") {
+          return (
+            <div className="table-wrap markdown-table-wrap" key={index}>
+              <table>
+                <thead>
+                  <tr>
+                    {block.headers.map((header, headerIndex) => (
+                      <th key={headerIndex}>{renderInlineMarkdown(header)}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {block.headers.map((_, cellIndex) => (
+                        <td key={cellIndex}>
+                          {renderInlineMarkdown(row[cellIndex] ?? "")}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        }
+        return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
+      })}
+    </article>
+  );
+}
+
+function LatexFormula({
+  text,
+  displayMode = false,
+}: {
+  text: string;
+  displayMode?: boolean;
+}) {
+  const html = useMemo(
+    () =>
+      katex.renderToString(text, {
+        displayMode,
+        throwOnError: false,
+        strict: false,
+        trust: false,
+      }),
+    [displayMode, text],
+  );
+
+  if (displayMode) {
+    return (
+      <div
+        className="markdown-formula"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
+  return (
+    <span
+      className="markdown-inline-formula"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
+function AsrOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+  const wordAccuracy =
+    result.word_accuracy ??
+    result.accuracy ??
+    result.wer_report?.summary?.accuracy;
+  const characterAccuracy =
+    result.character_accuracy ??
+    result.cer_report?.summary?.accuracy;
+
+  return (
+    <div className="panel asr-overview-panel">
+      <div className="metric-strip asr-overview-metrics">
+        <Metric label="词正确率" value={formatPercentScale(wordAccuracy)} />
+        <Metric label="字正确率" value={formatPercentScale(characterAccuracy)} />
+        <Metric label="WER" value={formatPercentScale(result.wer)} />
+        <Metric label="CER" value={formatPercentScale(result.cer)} />
+      </div>
+      <SampleCountStrip
+        result={result}
+        fallbackCount={
+          result.wer_report?.utterances.length ??
+          result.cer_report?.utterances.length ??
+          0
+        }
+      />
     </div>
   );
 }
@@ -1127,15 +2013,78 @@ function VadOverviewMetrics({ result }: { result: EvaluationResult | null }) {
   return <VadMetricGroups metrics={result} />;
 }
 
+function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="metric-strip lid-overview-metrics">
+      <Metric label="已知语种准确率" value={formatRate(result.known_accuracy ?? result.accuracy)} />
+      <Metric label="宏平均精确率" value={formatRate(result.macro_precision ?? result.precision)} />
+      <Metric label="宏平均召回率" value={formatRate(result.macro_recall ?? result.recall)} />
+      <Metric label="未知误接收" value={formatNumber(result.unknown_false_accept_count)} />
+      <Metric label="已知被拒识" value={formatNumber(result.known_reject_count)} />
+    </div>
+  );
+}
+
+function KeywordOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="panel keyword-overview-panel">
+      <div className="metric-strip keyword-overview-metrics">
+        <Metric label="Accuracy" value={formatRate(result.accuracy)} />
+        <Metric label="Precision" value={formatRate(result.precision)} />
+        <Metric label="Recall" value={formatRate(result.recall)} />
+        <Metric label="F1" value={formatRate(result.f1)} />
+        <Metric label="Miss" value={formatNumber(result.miss_count)} />
+        <Metric label="False Alarm" value={formatNumber(result.false_alarm_count)} />
+      </div>
+      <SampleCountStrip
+        result={result}
+        fallbackCount={result.keyword_report?.samples.length ?? 0}
+      />
+    </div>
+  );
+}
+
+function DenoiseOverviewMetrics({ result }: { result: EvaluationResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="panel denoise-overview-panel">
+      <div className="metric-strip denoise-overview-metrics">
+        <Metric label="SNR Δ" value={formatSignedScore(result.mean_snr_delta)} />
+        <Metric label="MOS Δ" value={formatSignedScore(result.mean_mos_delta)} />
+        <Metric label="SNR Samples" value={formatNumber(result.scored_snr_sample_count)} />
+        <Metric label="MOS Samples" value={formatNumber(result.scored_mos_sample_count)} />
+        <Metric label="Failed" value={formatNumber(result.failed_sample_count)} />
+      </div>
+      <SampleCountStrip
+        result={result}
+        fallbackCount={result.denoise_report?.samples.length ?? 0}
+      />
+    </div>
+  );
+}
+
 function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   const frame = metrics.frame;
   const segment = metrics.segment;
+  const frameMacro = metrics.frame_macro;
+  const segmentMacro = metrics.segment_macro;
 
   return (
     <div className="vad-metric-groups">
       <section className="vad-metric-section">
         <div className="vad-metric-title">
-          <span>帧级指标</span>
+          <span>帧级指标（Micro）</span>
           <strong>{formatRate(frame?.frame_f1 ?? metrics.frame_f1)}</strong>
         </div>
         <div className="report-summary vad-summary vad-frame-summary">
@@ -1153,11 +2102,17 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
           />
           <Metric label="F1" value={formatRate(frame?.frame_f1 ?? metrics.frame_f1)} />
         </div>
+        <div className="report-summary vad-summary vad-macro-summary">
+          <Metric label="Macro Accuracy" value={formatRate(frameMacro?.frame_accuracy)} />
+          <Metric label="Macro Recall" value={formatRate(frameMacro?.frame_recall)} />
+          <Metric label="Macro Precision" value={formatRate(frameMacro?.frame_precision)} />
+          <Metric label="Macro F1" value={formatRate(frameMacro?.frame_f1)} />
+        </div>
       </section>
 
       <section className="vad-metric-section">
         <div className="vad-metric-title">
-          <span>段级指标</span>
+          <span>段级指标（Micro）</span>
           <strong>{formatRate(segment?.segment_f1)}</strong>
         </div>
         <div className="report-summary vad-summary">
@@ -1170,6 +2125,11 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
             value={formatRate(segment?.segment_precision ?? metrics.segment_precision)}
           />
           <Metric label="F1" value={formatRate(segment?.segment_f1)} />
+        </div>
+        <div className="report-summary vad-summary vad-macro-summary">
+          <Metric label="Macro Recall" value={formatRate(segmentMacro?.segment_recall)} />
+          <Metric label="Macro Precision" value={formatRate(segmentMacro?.segment_precision)} />
+          <Metric label="Macro F1" value={formatRate(segmentMacro?.segment_f1)} />
         </div>
         <div className="metric-strip vad-segment-counts">
           <Metric
@@ -1190,52 +2150,46 @@ function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
   );
 }
 
-function WerReportPanel({
-  report,
+function AsrAlignmentReportPanel({
+  werReport,
+  cerReport,
+  activeMetric,
+  onActiveMetricChange,
   result,
   sortMode,
   onSortModeChange,
   wrapAlignment,
   onWrapAlignmentChange,
-  excludedSampleIds,
-  onExcludedChange,
-  canRecalculate,
-  recalculating,
-  onRecalculate,
 }: {
-  report: WerReport | undefined;
+  werReport: WerReport | undefined;
+  cerReport: WerReport | undefined;
+  activeMetric: AlignmentMetric;
+  onActiveMetricChange: (metric: AlignmentMetric) => void;
   result: EvaluationResult | null;
   sortMode: ReportSortMode;
   onSortModeChange: (sortMode: ReportSortMode) => void;
   wrapAlignment: boolean;
   onWrapAlignmentChange: (wrapAlignment: boolean) => void;
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
-  canRecalculate: boolean;
-  recalculating: boolean;
-  onRecalculate: () => void;
 }) {
-  const summary = report?.summary;
+  const activeReport = activeMetric === "wer" ? werReport : cerReport;
+  const activeLabel: "WER" | "CER" = activeMetric === "wer" ? "WER" : "CER";
+  const sampleCount = werReport?.utterances.length ?? cerReport?.utterances.length ?? 0;
   const utterances = useMemo(
-    () => sortWerUtterances(report?.utterances ?? [], sortMode),
-    [report?.utterances, sortMode],
+    () =>
+      sortAlignmentUtterances(activeReport?.utterances ?? [], sortMode, {
+        wer: werReport,
+        cer: cerReport,
+      }),
+    [activeReport?.utterances, cerReport, sortMode, werReport],
   );
   return (
-    <div className="panel report-panel">
+    <div className="panel report-panel asr-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
-          <h2>WER 对齐报告</h2>
-          <span>{report?.utterances.length ?? 0} 个样本</span>
+          <h2>对齐报告</h2>
+          <span>{sampleCount} 个样本</span>
         </div>
         <div className="report-controls">
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={!canRecalculate}
-            onClick={onRecalculate}
-          >
-            {recalculating ? "重算中..." : "重新计算评估指标"}
-          </button>
           <label className="wrap-control">
             <input
               type="checkbox"
@@ -1256,42 +2210,81 @@ function WerReportPanel({
               <option value="index-desc">索引降序</option>
               <option value="wer-desc">WER 降序</option>
               <option value="wer-asc">WER 升序</option>
+              <option value="cer-desc">CER 降序</option>
+              <option value="cer-asc">CER 升序</option>
             </select>
           </label>
         </div>
       </div>
 
-      {summary ? (
+      {werReport?.summary || cerReport?.summary ? (
         <>
-          <div className="report-summary">
-            <Metric label="WER" value={formatRate(summary.wer)} />
-            <Metric label="Correct" value={formatNumber(summary.correct)} />
-            <Metric label="Sub" value={formatNumber(summary.substitutions)} />
-            <Metric label="Del" value={formatNumber(summary.deletions)} />
-            <Metric label="Ins" value={formatNumber(summary.insertions)} />
+          <div className="asr-summary-grid">
+            <AsrMetricSummaryCard
+              label="WER"
+              summary={werReport?.summary}
+              fallbackRate={result?.wer}
+              accuracy={result?.word_accuracy}
+              accuracyLabel="词正确率"
+            />
+            <AsrMetricSummaryCard
+              label="CER"
+              summary={cerReport?.summary}
+              fallbackRate={result?.cer}
+              accuracy={result?.character_accuracy}
+              accuracyLabel="字正确率"
+            />
           </div>
-          <SampleCountStrip result={result} fallbackCount={report?.utterances.length ?? 0} />
+          <CompactReportMeta result={result} fallbackCount={sampleCount} />
+          <SqaSummaryMetrics summary={result?.sqa_summary} />
+          <div className="alignment-metric-tabs" role="tablist" aria-label="对齐指标">
+            <button
+              type="button"
+              className={activeMetric === "wer" ? "active" : ""}
+              aria-selected={activeMetric === "wer"}
+              role="tab"
+              onClick={() => onActiveMetricChange("wer")}
+            >
+              WER
+            </button>
+            <button
+              type="button"
+              className={activeMetric === "cer" ? "active" : ""}
+              aria-selected={activeMetric === "cer"}
+              role="tab"
+              onClick={() => onActiveMetricChange("cer")}
+            >
+              CER
+            </button>
+          </div>
           <div className="utterance-list">
-            {utterances.map((utterance) => (
-              <details className="utterance" key={utterance.id}>
+            {utterances.map((utterance, index) => (
+              <details
+                className="utterance"
+                key={utterance.id}
+                open={index < 3}
+              >
                 <summary>
                   <span className="utterance-title">
-                    <ExcludeCheckbox
-                      checked={excludedSampleIds.has(utterance.id)}
-                      onChange={(checked) => onExcludedChange(utterance.id, checked)}
-                    />
                     <strong>#{utterance.index ?? "-"}</strong>
                     <span>{utterance.id || "-"}</span>
                   </span>
-                  <TokenCounts summary={utterance.summary} tokens={utterance.tokens} />
-                </summary>
-                <div className="utterance-audio-row">
-                  <AudioPlayer
-                    src={utterance.audio_url}
-                    durationSeconds={utterance.duration_seconds}
+                  <TokenCounts
+                    metricLabel={activeLabel}
+                    summary={utterance.summary}
+                    tokens={utterance.tokens}
                   />
+                  <SqaScoreChips scores={utterance.sqa_scores} />
+                </summary>
+                <div className="utterance-body">
+                  <div className="utterance-audio-row">
+                    <AudioPlayer
+                      src={utterance.audio_url}
+                      durationSeconds={utterance.duration_seconds}
+                    />
+                  </div>
+                  <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
                 </div>
-                <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
               </details>
             ))}
           </div>
@@ -1305,36 +2298,18 @@ function WerReportPanel({
 
 function VadReportPanel({
   result,
-  excludedSampleIds,
-  onExcludedChange,
-  canRecalculate,
-  recalculating,
-  onRecalculate,
 }: {
   result: EvaluationResult | null;
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
-  canRecalculate: boolean;
-  recalculating: boolean;
-  onRecalculate: () => void;
 }) {
   const samples = result?.vad_report?.samples ?? [];
   return (
-    <div className="panel report-panel">
+    <div className="panel report-panel vad-report-panel compact-report-panel">
       <div className="panel-heading compact-heading">
         <div>
           <h2>VAD 报告</h2>
           <span>{formatNumber(result?.sample_count)} 个样本</span>
         </div>
         <div className="report-controls vad-report-controls">
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={!canRecalculate}
-            onClick={onRecalculate}
-          >
-            {recalculating ? "重算中..." : "重新计算评估指标"}
-          </button>
           <div className="vad-legend report-legend">
             <LegendItem className="hit" label="命中" />
             <LegendItem className="miss" label="漏检" />
@@ -1345,12 +2320,9 @@ function VadReportPanel({
       </div>
       {result ? (
         <>
-          <SampleCountStrip result={result} fallbackCount={samples.length} />
-          <VadMaskReport
-            samples={samples}
-            excludedSampleIds={excludedSampleIds}
-            onExcludedChange={onExcludedChange}
-          />
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
+          <SqaSummaryMetrics summary={result.sqa_summary} />
+          <VadMaskReport samples={samples} />
         </>
       ) : (
         <div className="empty-state">评估完成后生成 VAD 指标</div>
@@ -1359,14 +2331,697 @@ function VadReportPanel({
   );
 }
 
-function VadMaskReport({
-  samples,
-  excludedSampleIds,
-  onExcludedChange,
+function LidReportPanel({
+  result,
 }: {
+  result: EvaluationResult | null;
+}) {
+  const samples = result?.lid_report?.samples ?? [];
+  return (
+    <div className="panel report-panel lid-report-panel compact-report-panel">
+      <div className="panel-heading compact-heading">
+        <div>
+          <h2>LID 报告</h2>
+          <span>{formatNumber(result?.sample_count)} 个样本</span>
+        </div>
+      </div>
+      {result ? (
+        <>
+          <div className="report-summary lid-summary">
+            <Metric
+              label="已知语种准确率"
+              value={formatRate(result.known_accuracy ?? result.accuracy)}
+            />
+            <Metric
+              label="宏平均精确率"
+              value={formatRate(result.macro_precision ?? result.precision)}
+            />
+            <Metric
+              label="宏平均召回率"
+              value={formatRate(result.macro_recall ?? result.recall)}
+            />
+            <Metric
+              label="未知误接收"
+              value={formatNumber(result.unknown_false_accept_count)}
+            />
+            <Metric
+              label="已知被拒识"
+              value={formatNumber(result.known_reject_count)}
+            />
+          </div>
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
+          <SqaSummaryMetrics summary={result.sqa_summary} />
+          <LidMetricsDetails result={result} />
+          <LidSampleList samples={samples} />
+        </>
+      ) : (
+        <div className="empty-state">评估完成后生成 LID 报告</div>
+      )}
+    </div>
+  );
+}
+
+function KeywordReportPanel({
+  result,
+}: {
+  result: EvaluationResult | null;
+}) {
+  const samples = result?.keyword_report?.samples ?? [];
+  const audioSamples = result?.keyword_audio_report?.samples ?? [];
+  const [viewMode, setViewMode] = useState<"keyword" | "audio">("keyword");
+  return (
+    <div className="panel report-panel keyword-report-panel compact-report-panel">
+      <div className="panel-heading compact-heading">
+        <div>
+          <h2>关键词报告</h2>
+          <span>
+            {formatNumber(result?.sample_count)} 个关键词 /{" "}
+            {formatNumber(result?.audio_sample_count ?? audioSamples.length)} 条语音
+          </span>
+        </div>
+      </div>
+      {result ? (
+        <>
+          <div className="report-summary keyword-summary">
+            <Metric label="Accuracy" value={formatRate(result.accuracy)} />
+            <Metric label="Precision" value={formatRate(result.precision)} />
+            <Metric label="Recall" value={formatRate(result.recall)} />
+            <Metric label="F1" value={formatRate(result.f1)} />
+            <Metric label="Hit" value={formatNumber(result.hit_count)} />
+            <Metric label="Miss" value={formatNumber(result.miss_count)} />
+            <Metric
+              label="False Alarm"
+              value={formatNumber(result.false_alarm_count)}
+            />
+            <Metric
+              label="Correct Reject"
+              value={formatNumber(result.correct_reject_count)}
+            />
+          </div>
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
+          <SqaSummaryMetrics summary={result.sqa_summary} />
+          {audioSamples.length ? (
+            <div className="keyword-view-tabs" role="tablist" aria-label="关键词报告视图">
+              <button
+                type="button"
+                className={viewMode === "keyword" ? "active" : ""}
+                onClick={() => setViewMode("keyword")}
+              >
+                按关键词
+              </button>
+              <button
+                type="button"
+                className={viewMode === "audio" ? "active" : ""}
+                onClick={() => setViewMode("audio")}
+              >
+                按语音
+              </button>
+            </div>
+          ) : null}
+          {viewMode === "audio" && audioSamples.length ? (
+            <KeywordAudioSampleList samples={audioSamples} />
+          ) : (
+            <KeywordSampleList samples={samples} />
+          )}
+        </>
+      ) : (
+        <div className="empty-state">评估完成后生成关键词报告</div>
+      )}
+    </div>
+  );
+}
+
+function KeywordAudioSampleList({ samples }: { samples: KeywordAudioReportSample[] }) {
+  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
+  useEffect(() => {
+    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
+  }, [samples]);
+
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成语音聚合结果</div>;
+  }
+  const visibleSamples = samples.slice(0, visibleCount);
+
+  return (
+    <>
+      <KeywordListToolbar
+        total={samples.length}
+        visible={visibleSamples.length}
+        onCollapse={
+          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
+            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
+            : undefined
+        }
+      />
+      <div className="keyword-sample-list">
+        {visibleSamples.map((sample) => (
+          <section className="keyword-sample keyword-audio-sample" key={sample.id}>
+            <div className="keyword-sample-title">
+              <span className="keyword-sample-name">
+                <strong>#{sample.index ?? "-"}</strong>
+                <span title={sample.id}>{sample.id}</span>
+              </span>
+              <span className="keyword-status">
+                {formatNumber(sample.keywords.length)} 个关键词
+              </span>
+            </div>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="keyword-token-list">
+              {sample.keywords.map((keyword) => (
+                <div
+                  className={`keyword-token ${keyword.correct ? "correct" : "incorrect"}`}
+                  key={keyword.id}
+                >
+                  <span title={keyword.id}>{keyword.keyword}</span>
+                  <small>
+                    {keyword.expected_hit ? "Expected Hit" : "Expected No Hit"} /{" "}
+                    {keyword.predicted_hit ? "Predicted Hit" : "Predicted No Hit"}
+                  </small>
+                </div>
+              ))}
+            </div>
+            <KeywordMatchTextBlock
+              matchText={sample.match_text}
+              highlights={keywordHighlightsFromAudioSample(sample)}
+            />
+          </section>
+        ))}
+        {visibleCount < samples.length ? (
+          <KeywordLoadMoreButton
+            onClick={() =>
+              setVisibleCount((current) =>
+                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
+              )
+            }
+          />
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+function KeywordSampleList({ samples }: { samples: KeywordReportSample[] }) {
+  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
+  useEffect(() => {
+    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
+  }, [samples]);
+
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成关键词结果</div>;
+  }
+  const visibleSamples = samples.slice(0, visibleCount);
+
+  return (
+    <>
+      <KeywordListToolbar
+        total={samples.length}
+        visible={visibleSamples.length}
+        onCollapse={
+          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
+            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
+            : undefined
+        }
+      />
+      <div className="keyword-sample-list">
+        {visibleSamples.map((sample) => (
+          <section
+            className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
+            key={sample.id}
+          >
+            <div className="keyword-sample-title">
+              <span className="keyword-sample-name">
+                <strong>#{sample.index ?? "-"}</strong>
+                <span title={sample.id}>{sample.id}</span>
+              </span>
+              <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
+                {sample.correct ? "正确" : "错误"}
+              </span>
+            </div>
+            <AudioPlayer
+              src={sample.audio_url}
+              durationSeconds={sample.duration_seconds}
+            />
+            <div className="keyword-sample-metrics">
+              <Metric label="Keyword" value={sample.keyword || "-"} />
+              <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
+              <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
+            </div>
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="keyword-transcript-grid">
+              <TextBlock label="Transcript" value={sample.transcript || "-"} />
+              <KeywordMatchTextBlock
+                matchText={sample.match_text}
+                highlights={keywordHighlightsFromSample(sample)}
+              />
+            </div>
+          </section>
+        ))}
+        {visibleCount < samples.length ? (
+          <KeywordLoadMoreButton
+            onClick={() =>
+              setVisibleCount((current) =>
+                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
+              )
+            }
+          />
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+function KeywordListToolbar({
+  total,
+  visible,
+  onCollapse,
+}: {
+  total: number;
+  visible: number;
+  onCollapse?: () => void;
+}) {
+  return (
+    <div className="keyword-list-toolbar">
+      <span>
+        已显示 {formatNumber(visible)} / {formatNumber(total)}
+      </span>
+      {onCollapse ? (
+        <button type="button" onClick={onCollapse}>
+          收起
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function KeywordLoadMoreButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" className="keyword-load-more" onClick={onClick}>
+      加载更多
+    </button>
+  );
+}
+
+function DenoiseReportPanel({
+  result,
+}: {
+  result: EvaluationResult | null;
+}) {
+  const samples = result?.denoise_report?.samples ?? [];
+  return (
+    <div className="panel report-panel denoise-report-panel compact-report-panel">
+      <div className="panel-heading compact-heading">
+        <div>
+          <h2>SE 报告</h2>
+          <span>{formatNumber(result?.sample_count)} 个样本</span>
+        </div>
+      </div>
+      {result ? (
+        <>
+          <div className="report-summary denoise-summary">
+            <Metric label="SNR Δ" value={formatSignedScore(result.mean_snr_delta)} />
+            <Metric label="MOS Δ" value={formatSignedScore(result.mean_mos_delta)} />
+            <Metric label="SNR Before" value={formatSqaScore(result.mean_original_snr)} />
+            <Metric label="SNR After" value={formatSqaScore(result.mean_denoised_snr)} />
+            <Metric label="MOS Before" value={formatSqaScore(result.mean_original_mos)} />
+            <Metric label="MOS After" value={formatSqaScore(result.mean_denoised_mos)} />
+          </div>
+          <CompactReportMeta result={result} fallbackCount={samples.length} />
+          <DenoiseSampleList samples={samples} />
+        </>
+      ) : (
+        <div className="empty-state">评估完成后生成 SE 报告</div>
+      )}
+    </div>
+  );
+}
+
+function DenoiseSampleList({ samples }: {
+  samples: DenoiseReportSample[];
+}) {
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成 SE 结果</div>;
+  }
+
+  return (
+    <div className="denoise-sample-list">
+      {samples.map((sample) => (
+        <section
+          className={`denoise-sample ${sample.error ? "failed" : ""}`}
+          key={sample.id}
+        >
+          <div className="denoise-sample-title">
+            <span className="denoise-sample-name">
+              <strong>#{sample.index ?? "-"}</strong>
+              <span title={sample.id}>{sample.id}</span>
+            </span>
+            {sample.error ? (
+              <span className="denoise-error" title={sample.error}>
+                {sample.error}
+              </span>
+            ) : null}
+          </div>
+          <div className="denoise-audio-grid">
+            <div>
+              <span>原始</span>
+              <AudioPlayer
+                src={sample.audio_url}
+                durationSeconds={sample.duration_seconds}
+              />
+            </div>
+            <div>
+              <span>SE</span>
+              <AudioPlayer
+                src={sample.denoised_audio_url || undefined}
+                durationSeconds={sample.duration_seconds}
+              />
+            </div>
+          </div>
+          <DenoiseSampleMetrics sample={sample} />
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function DenoiseSampleMetrics({ sample }: { sample: DenoiseReportSample }) {
+  const rows = [
+    {
+      label: "SNR",
+      before: sample.original_snr,
+      after: sample.denoised_snr,
+      delta: sample.snr_delta,
+    },
+    {
+      label: "MOS",
+      before: sample.original_mos,
+      after: sample.denoised_mos,
+      delta: sample.mos_delta,
+    },
+  ].filter(
+    (row) =>
+      hasFiniteNumber(row.before) ||
+      hasFiniteNumber(row.after) ||
+      hasFiniteNumber(row.delta),
+  );
+
+  if (!rows.length) {
+    return <div className="denoise-metric-empty">暂无质量指标</div>;
+  }
+
+  return (
+    <div className="denoise-metric-table" role="table" aria-label="SE 质量指标">
+      <div className="denoise-metric-row denoise-metric-header" role="row">
+        <span role="columnheader">指标</span>
+        <span role="columnheader">Before</span>
+        <span role="columnheader">After</span>
+        <span role="columnheader">Δ</span>
+      </div>
+      {rows.map((row) => (
+        <div className="denoise-metric-row" role="row" key={row.label}>
+          <strong role="rowheader">{row.label}</strong>
+          <span role="cell">{formatSqaScore(row.before)}</span>
+          <span role="cell">{formatSqaScore(row.after)}</span>
+          <span className="delta" role="cell">
+            {formatSignedScore(row.delta)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LidMetricsDetails({ result }: { result: EvaluationResult }) {
+  const recalls = getKnownLidLanguageRecalls(result);
+  const hasRecalls = recalls.length > 0;
+  const matrix = result.lid_confusion_matrix;
+  const hasMatrix =
+    (matrix?.rows ?? []).length > 0 && (matrix?.predicted_languages ?? []).length > 0;
+  const overallCorrect = result.overall_correct_count ?? result.correct_count;
+  const errorCount = getLidErrorCount(result);
+
+  if (!hasRecalls && !hasMatrix) {
+    return null;
+  }
+
+  return (
+    <details className="lid-metrics-details">
+      <summary>
+        <span>类别指标与混淆矩阵</span>
+        <small>
+          {recalls.length} 类 / 正确 {formatNumber(overallCorrect)} / 错误{" "}
+          {formatNumber(errorCount)} / 未知误接收{" "}
+          {formatNumber(result.unknown_false_accept_count)}
+          {" / "}
+          已知拒识 {formatNumber(result.known_reject_count)}
+        </small>
+      </summary>
+      <div className="lid-metrics-scroll">
+        <LidMetricsTables result={result} />
+      </div>
+    </details>
+  );
+}
+
+function LidMetricsTables({ result }: { result: EvaluationResult }) {
+  const recalls = getKnownLidLanguageRecalls(result);
+  const matrix = result.lid_confusion_matrix;
+  const matrixRows = matrix?.rows ?? [];
+  const predictedLanguages = matrix?.predicted_languages ?? [];
+  const hasMatrix = matrixRows.length > 0 && predictedLanguages.length > 0;
+
+  if (!recalls.length && !hasMatrix) {
+    return null;
+  }
+
+  return (
+    <div className="lid-metrics-grid">
+      {recalls.length ? (
+        <section className="metric-table-section">
+          <div className="metric-table-heading">
+            <h3>类别指标</h3>
+          </div>
+          <div className="table-wrap lid-recall-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>真实标签</th>
+                  <th>正确数</th>
+                  <th>真实总数</th>
+                  <th>预测总数</th>
+                  <th>精确率</th>
+                  <th>召回率</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recalls.map((item) => (
+                  <tr
+                    className={item.recall < 0.9 ? "low-recall" : ""}
+                    key={item.language}
+                  >
+                    <td title={item.language}>{item.language || "-"}</td>
+                    <td>{formatNumber(item.correct_count)}</td>
+                    <td>{formatNumber(item.sample_count)}</td>
+                    <td>{formatNumber(item.predicted_count)}</td>
+                    <td>{formatRate(item.precision)}</td>
+                    <td>{formatRate(item.recall)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+      {hasMatrix ? (
+        <section className="metric-table-section">
+          <div className="metric-table-heading">
+            <h3>混淆矩阵</h3>
+          </div>
+          <div className="table-wrap lid-confusion-table">
+            <table>
+              <thead>
+                <tr>
+                  <th title="真实标签 / 预测标签">真实/预测</th>
+                  {predictedLanguages.map((language) => (
+                    <th key={language} title={language}>
+                      {language || "-"}
+                    </th>
+                  ))}
+                  <th>总数</th>
+                  <th>召回率</th>
+                </tr>
+              </thead>
+              <tbody>
+                {matrixRows.map((row) => (
+                  <tr key={row.reference_language}>
+                    <th title={row.reference_language}>{row.reference_language || "-"}</th>
+                    {predictedLanguages.map((language) => (
+                      <td
+                        className={lidConfusionCellClass(
+                          row.reference_language,
+                          language,
+                          row.counts[language] ?? 0,
+                          row.total,
+                        )}
+                        key={`${row.reference_language}:${language}`}
+                        title={`${row.reference_language || "-"} -> ${language || "-"}: ${formatNumber(row.counts[language] ?? 0)}`}
+                      >
+                        {formatNumber(row.counts[language] ?? 0)}
+                      </td>
+                    ))}
+                    <td>{formatNumber(row.total)}</td>
+                    <td>{formatRate(getLidMatrixRowRecall(result, row.reference_language))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function lidConfusionCellClass(
+  referenceLanguage: string,
+  predictedLanguage: string,
+  count: number,
+  total: number,
+): string {
+  const ratio = total > 0 ? count / total : 0;
+  const level = count > 0 ? Math.max(1, Math.min(5, Math.ceil(ratio * 5))) : 0;
+  const status = referenceLanguage === predictedLanguage ? "diagonal" : "error";
+  return `confusion-cell ${status} heat-${level}`;
+}
+
+function getLidErrorCount(result: EvaluationResult): number | undefined {
+  const sampleCount = toDisplayNumber(result.sample_count);
+  const correctCount = toDisplayNumber(result.overall_correct_count ?? result.correct_count);
+  if (sampleCount === undefined || correctCount === undefined) {
+    return undefined;
+  }
+  return Math.max(0, sampleCount - correctCount);
+}
+
+function getKnownLidLanguageRecalls(result: EvaluationResult) {
+  return (result.lid_language_recalls ?? []).filter(
+    (item) => item.language !== "<others>",
+  );
+}
+
+function getLidMatrixRowRecall(
+  result: EvaluationResult,
+  referenceLanguage: string,
+): number | undefined {
+  if (referenceLanguage === "<others>") {
+    return undefined;
+  }
+  const recall = result.lid_language_recalls?.find(
+    (item) => item.language === referenceLanguage,
+  )?.recall;
+  if (typeof recall === "number") {
+    return recall;
+  }
+  const row = result.lid_confusion_matrix?.rows.find(
+    (item) => item.reference_language === referenceLanguage,
+  );
+  if (!row || row.total <= 0) {
+    return undefined;
+  }
+  return (row.counts[referenceLanguage] ?? 0) / row.total;
+}
+
+function toDisplayNumber(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function LidSampleList({ samples }: {
+  samples: LidReportSample[];
+}) {
+  if (!samples.length) {
+    return <div className="empty-state">评估完成后生成 LID 结果</div>;
+  }
+
+  return (
+    <div className="lid-sample-list">
+      {samples.map((sample) => (
+        <section
+          className={`lid-sample ${sample.correct ? "correct" : "incorrect"}`}
+          key={sample.id}
+        >
+          <div className="lid-sample-title">
+            <span className="lid-sample-name">
+              <strong>#{sample.index ?? "-"}</strong>
+              <span title={sample.id}>{sample.id}</span>
+            </span>
+            <div className="lid-result-line">
+              <span>
+                <em>真实</em>
+                <strong>{sample.reference_language || "-"}</strong>
+              </span>
+              <span>
+                <em>预测</em>
+                <strong>{sample.predicted_language || "-"}</strong>
+              </span>
+              <span>
+                <em>置信度</em>
+                <strong>{formatConfidence(sample.confidence)}</strong>
+              </span>
+            </div>
+            <SqaScoreChips scores={sample.sqa_scores} />
+            <div className="lid-sample-actions">
+              <b>{sample.correct ? "正确" : "错误"}</b>
+              <AudioPlayer
+                src={sample.audio_url}
+                durationSeconds={sample.duration_seconds}
+              />
+            </div>
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function AsrMetricSummaryCard({
+  label,
+  summary,
+  fallbackRate,
+  accuracy,
+  accuracyLabel,
+}: {
+  label: "WER" | "CER";
+  summary?: WerSummary;
+  fallbackRate?: number;
+  accuracy?: number;
+  accuracyLabel: string;
+}) {
+  return (
+    <section className="asr-summary-card">
+      <div className="asr-summary-title">
+        <span>{label}</span>
+        <strong>{formatPercentScale(summary?.wer ?? fallbackRate)}</strong>
+      </div>
+      <div className="report-summary">
+        <Metric
+          label={accuracyLabel}
+          value={formatPercentScale(accuracy ?? summary?.accuracy)}
+        />
+        <Metric label="Correct" value={formatNumber(summary?.correct)} />
+        <Metric label="Sub" value={formatNumber(summary?.substitutions)} />
+        <Metric label="Del" value={formatNumber(summary?.deletions)} />
+        <Metric label="Ins" value={formatNumber(summary?.insertions)} />
+      </div>
+    </section>
+  );
+}
+
+function VadMaskReport({ samples }: {
   samples: VadReportSample[];
-  excludedSampleIds: Set<string>;
-  onExcludedChange: (sampleId: string, excluded: boolean) => void;
 }) {
   if (!samples.length) {
     return <div className="empty-state">评估完成后生成 mask 对齐报告</div>;
@@ -1374,54 +3029,97 @@ function VadMaskReport({
 
   return (
     <div className="vad-report-list">
-      {samples.map((sample) => (
-        <details className="vad-sample" key={sample.id} open={samples.length === 1}>
-          <summary>
-            <span>
-              <ExcludeCheckbox
-                checked={excludedSampleIds.has(sample.id)}
-                onChange={(checked) => onExcludedChange(sample.id, checked)}
+      {samples.map((sample, index) => {
+        const timelineWidth = getVadTimelineWidth(sample.duration_seconds);
+        return (
+          <details className="vad-sample" key={sample.id} open={index < 3}>
+            <summary>
+              <span>
+                #{sample.index ?? "-"} {sample.id}
+              </span>
+              <AudioPlayer
+                src={sample.audio_url}
+                durationSeconds={sample.duration_seconds}
               />
-              #{sample.index ?? "-"} {sample.id}
-            </span>
-            <AudioPlayer
-              src={sample.audio_url}
-              durationSeconds={sample.duration_seconds}
-            />
-            <small>{formatSeconds(sample.duration_seconds)}</small>
-          </summary>
-          {sample.metrics ? (
-            <div className="sample-vad-metrics">
-              <VadMetricGroups metrics={sample.metrics} />
+              <SqaScoreChips scores={sample.sqa_scores} />
+              <small>{formatSeconds(sample.duration_seconds)}</small>
+            </summary>
+            <div className="vad-sample-body">
+              {sample.metrics ? (
+                <div className="sample-vad-metrics">
+                  <VadMetricGroups metrics={sample.metrics} />
+                </div>
+              ) : null}
+              <div className="vad-timeline-scroll" aria-label="VAD 时间轴">
+                <div
+                  className="vad-timeline-canvas"
+                  style={{ width: timelineWidth }}
+                >
+                  <VadTimeRuler duration={sample.duration_seconds} />
+                  <div className="mask-stack">
+                    <MaskTrack
+                      label="Reference"
+                      duration={sample.duration_seconds}
+                      segments={sample.reference_segments}
+                      regions={sample.regions}
+                      track="reference"
+                    />
+                    <MaskTrack
+                      label="Prediction"
+                      duration={sample.duration_seconds}
+                      segments={sample.prediction_segments}
+                      regions={sample.regions}
+                      track="prediction"
+                    />
+                    <div className="mask-row region-row">
+                      <span>Errors</span>
+                      <div className="region-track" aria-label="VAD 对齐区域">
+                        {sample.regions.map((region) => (
+                          <span
+                            className={`region region-${normalizeVadLabel(region.label)}`}
+                            key={`${sample.id}:${region.start_frame}:${region.end_frame}:${region.label}`}
+                            style={{
+                              left: `${toPercent(
+                                region.start,
+                                sample.duration_seconds,
+                              )}%`,
+                              width: `${toPercent(
+                                region.duration,
+                                sample.duration_seconds,
+                              )}%`,
+                            }}
+                            title={`${regionLabel(region.label)} ${formatSeconds(region.start)} - ${formatSeconds(region.end)}`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
-          ) : null}
-          <div className="mask-stack">
-            <MaskTrack
-              label="Reference"
-              duration={sample.duration_seconds}
-              segments={sample.reference_segments}
-            />
-            <MaskTrack
-              label="Prediction"
-              duration={sample.duration_seconds}
-              segments={sample.prediction_segments}
-            />
-          </div>
-          <div className="region-track" aria-label="VAD 对齐区域">
-            {sample.regions.map((region) => (
-              <span
-                className={`region region-${region.label}`}
-                key={`${sample.id}:${region.start_frame}:${region.end_frame}:${region.label}`}
-                style={{
-                  left: `${toPercent(region.start, sample.duration_seconds)}%`,
-                  width: `${toPercent(region.duration, sample.duration_seconds)}%`,
-                }}
-                title={`${regionLabel(region.label)} ${formatSeconds(region.start)} - ${formatSeconds(region.end)}`}
-              />
-            ))}
-          </div>
-        </details>
-      ))}
+          </details>
+        );
+      })}
+    </div>
+  );
+}
+
+function VadTimeRuler({ duration }: { duration: number }) {
+  const ticks = buildVadRulerTicks(duration);
+  return (
+    <div className="vad-time-ruler">
+      <span>Time</span>
+      <div className="vad-ruler-track">
+        {ticks.map((tick) => (
+          <i
+            key={tick}
+            style={{ left: `${toPercent(tick, duration)}%` }}
+            title={formatSeconds(tick)}
+          >
+            {formatSeconds(tick)}
+          </i>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1430,16 +3128,23 @@ function MaskTrack({
   label,
   duration,
   segments,
+  regions,
+  track,
 }: {
   label: string;
   duration: number;
   segments: VadReportSegment[];
+  regions: VadReportRegion[];
+  track: "reference" | "prediction";
 }) {
+  const visibleSegments =
+    regions.length > 0 ? vadRegionsToTrackSegments(regions, track) : segments;
+
   return (
     <div className="mask-row">
       <span>{label}</span>
       <div className="mask-track">
-        {segments.map((segment) => (
+        {visibleSegments.map((segment) => (
           <span
             className={`mask-segment mask-${segment.status}`}
             key={`${label}:${segment.start_frame}:${segment.end_frame}:${segment.status}`}
@@ -1455,6 +3160,27 @@ function MaskTrack({
   );
 }
 
+function vadRegionsToTrackSegments(
+  regions: VadReportRegion[],
+  track: "reference" | "prediction",
+): VadReportSegment[] {
+  return regions
+    .filter((region) => {
+      const label = normalizeVadLabel(region.label);
+      return track === "reference"
+        ? label === "hit" || label === "miss"
+        : label === "hit" || label === "false_alarm";
+    })
+    .map((region) => ({
+      start: region.start,
+      end: region.end,
+      duration: region.duration,
+      start_frame: region.start_frame,
+      end_frame: region.end_frame,
+      status: normalizeVadLabel(region.label),
+    }));
+}
+
 function LegendItem({ className, label }: { className: string; label: string }) {
   return (
     <span>
@@ -1465,15 +3191,18 @@ function LegendItem({ className, label }: { className: string; label: string }) 
 }
 
 function TokenCounts({
+  metricLabel,
   summary,
   tokens,
 }: {
+  metricLabel: "WER" | "CER";
   summary?: WerSummary;
   tokens: WerToken[];
 }) {
   const counts = tokens.reduce(
     (current, token) => {
-      current[token.label] = (current[token.label] ?? 0) + 1;
+      const label = normalizeWerTokenLabel(token.label);
+      current[label] = (current[label] ?? 0) + 1;
       return current;
     },
     { correct: 0, substitution: 0, deletion: 0, insertion: 0 } as Record<string, number>,
@@ -1481,7 +3210,7 @@ function TokenCounts({
 
   return (
     <span className="token-counts">
-      {summary ? `WER ${formatRate(summary.wer)} · ` : ""}
+      {summary ? `${metricLabel} ${formatPercentScale(summary.wer)} · ` : ""}
       C {summary?.correct ?? counts.correct ?? 0} · S{" "}
       {summary?.substitutions ?? counts.substitution ?? 0} · D{" "}
       {summary?.deletions ?? counts.deletion ?? 0} · I{" "}
@@ -1575,22 +3304,44 @@ function chunkWerTokens(tokens: WerToken[]): WerToken[][] {
 }
 
 function getWerWordClass(label: string, row: "ref" | "hyp"): string {
-  if (label === "substitution") {
+  const normalizedLabel = normalizeWerTokenLabel(label);
+  if (normalizedLabel === "substitution") {
     return "wer-word-substitution";
   }
-  if (label === "deletion" && row === "ref") {
+  if (normalizedLabel === "deletion" && row === "ref") {
     return "wer-word-deletion";
   }
-  if (label === "insertion" && row === "hyp") {
+  if (normalizedLabel === "insertion" && row === "hyp") {
     return "wer-word-insertion";
   }
-  if ((label === "deletion" && row === "hyp") || (label === "insertion" && row === "ref")) {
+  if (
+    (normalizedLabel === "deletion" && row === "hyp") ||
+    (normalizedLabel === "insertion" && row === "ref")
+  ) {
     return "wer-word-placeholder";
   }
   return "wer-word-correct";
 }
 
-function buildRequest(state: EvaluationFormState): EvaluationRequest {
+function normalizeWerTokenLabel(label: string): string {
+  const normalized = label.trim().toLowerCase();
+  if (["sub", "subst", "substitution", "s"].includes(normalized)) {
+    return "substitution";
+  }
+  if (["del", "delete", "deletion", "d"].includes(normalized)) {
+    return "deletion";
+  }
+  if (["ins", "insert", "insertion", "i"].includes(normalized)) {
+    return "insertion";
+  }
+  if (["cor", "correct", "ok", "c"].includes(normalized)) {
+    return "correct";
+  }
+  return normalized;
+}
+
+function buildRequest(rawState: EvaluationFormState): EvaluationRequest {
+  const state = normalizeFormState(rawState);
   return {
     task: state.task,
     target: state.target,
@@ -1608,49 +3359,157 @@ function buildRequest(state: EvaluationFormState): EvaluationRequest {
     connect_timeout_seconds: toOptionalNumber(state.connect_timeout_seconds),
     request_timeout_seconds: toNumber(state.request_timeout_seconds, 60),
     interim_results: state.interim_results ?? true,
+    inference_concurrency: 0,
+    asr_inference_concurrency: toNumber(state.asr_inference_concurrency, 0),
+    vad_inference_concurrency: toNumber(state.vad_inference_concurrency, 0),
+    lid_inference_concurrency: toNumber(state.lid_inference_concurrency, 0),
+    enable_mos: state.enable_mos ?? false,
+    mos_target: state.mos_target.trim(),
+    enable_snr: state.enable_snr ?? false,
+    snr_target: state.snr_target.trim(),
+    sqa_inference_concurrency: toNumber(state.sqa_inference_concurrency, 0),
+    lid_confidence_threshold: toNumber(state.lid_confidence_threshold, 0),
     remove_punctuation: state.remove_punctuation ?? false,
     mask_frame_seconds: toNumber(state.mask_frame_seconds, 0.01),
     chunk_duration_seconds: toNumber(state.chunk_duration_seconds, 0.1),
+    speech_padding_seconds: toNumber(state.speech_padding_seconds ?? "0", 0),
     hit_threshold: toNumber(state.hit_threshold, 0.9),
     streaming: state.streaming ?? false,
   };
 }
 
-function sortWerUtterances(
+function normalizeFormState(state: EvaluationFormState): EvaluationFormState {
+  const { enable_sqa: _enableSqa, sqa_engines: _sqaEngines, ...knownState } =
+    state as EvaluationFormState & {
+      enable_sqa?: unknown;
+      sqa_engines?: unknown;
+    };
+  return {
+    ...DEFAULT_FORM_STATE,
+    ...knownState,
+    enable_mos:
+      typeof state.enable_mos === "boolean"
+        ? state.enable_mos
+        : DEFAULT_FORM_STATE.enable_mos,
+    mos_target:
+      typeof state.mos_target === "string"
+        ? state.mos_target
+        : DEFAULT_FORM_STATE.mos_target,
+    enable_snr:
+      typeof state.enable_snr === "boolean"
+        ? state.enable_snr
+        : DEFAULT_FORM_STATE.enable_snr,
+    snr_target:
+      typeof state.snr_target === "string"
+        ? state.snr_target
+        : DEFAULT_FORM_STATE.snr_target,
+    sqa_inference_concurrency:
+      typeof state.sqa_inference_concurrency === "string"
+        ? state.sqa_inference_concurrency
+        : DEFAULT_FORM_STATE.sqa_inference_concurrency,
+  };
+}
+
+function sortAlignmentUtterances(
   utterances: WerUtterance[],
   sortMode: ReportSortMode,
+  reports: Record<AlignmentMetric, WerReport | undefined>,
 ): WerUtterance[] {
   return [...utterances].sort((left, right) => {
     if (sortMode === "index-desc") {
       return getUtteranceIndex(right) - getUtteranceIndex(left);
     }
-    if (sortMode === "wer-desc" || sortMode === "wer-asc") {
-      const leftWer = getUtteranceWer(left);
-      const rightWer = getUtteranceWer(right);
-      if (leftWer !== rightWer) {
-        return sortMode === "wer-desc" ? rightWer - leftWer : leftWer - rightWer;
+    if (
+      sortMode === "wer-desc" ||
+      sortMode === "wer-asc" ||
+      sortMode === "cer-desc" ||
+      sortMode === "cer-asc"
+    ) {
+      const metric: AlignmentMetric = sortMode.startsWith("cer") ? "cer" : "wer";
+      const leftRate = getUtteranceRate(left, reports[metric]);
+      const rightRate = getUtteranceRate(right, reports[metric]);
+      if (leftRate !== rightRate) {
+        return sortMode.endsWith("desc") ? rightRate - leftRate : leftRate - rightRate;
       }
     }
     return getUtteranceIndex(left) - getUtteranceIndex(right);
   });
 }
 
-function getUtteranceWer(utterance: WerUtterance): number {
-  if (typeof utterance.summary?.wer === "number") {
-    return utterance.summary.wer;
+function getUtteranceRate(
+  utterance: WerUtterance,
+  report: WerReport | undefined,
+): number {
+  const metricUtterance = report?.utterances.find(
+    (item) => item.id === utterance.id,
+  );
+  const summary = metricUtterance?.summary ?? utterance.summary;
+  if (typeof summary?.wer === "number") {
+    return summary.wer;
   }
-  const referenceWords = utterance.tokens.filter(
-    (token) => token.label !== "insertion",
+  const tokens = metricUtterance?.tokens ?? utterance.tokens;
+  const referenceWords = tokens.filter(
+    (token) => normalizeWerTokenLabel(token.label) !== "insertion",
   ).length;
   if (referenceWords === 0) {
     return 0;
   }
-  const errors = utterance.tokens.filter((token) => token.label !== "correct").length;
+  const errors = tokens.filter(
+    (token) => normalizeWerTokenLabel(token.label) !== "correct",
+  ).length;
   return (errors / referenceWords) * 100;
 }
 
 function getUtteranceIndex(utterance: WerUtterance): number {
   return utterance.index ?? Number.MAX_SAFE_INTEGER;
+}
+
+function evaluationTaskShortLabel(task: EvaluationTask): string {
+  if (task === "vad") {
+    return "VAD";
+  }
+  if (task === "lid") {
+    return "LID";
+  }
+  if (task === "keyword") {
+    return "Keyword";
+  }
+  if (task === "denoise") {
+    return "SE";
+  }
+  return "ASR";
+}
+
+function evaluationTaskEnglishLabel(task: EvaluationTask): string {
+  if (task === "denoise") {
+    return "SE Evaluation";
+  }
+  return `${evaluationTaskShortLabel(task)} Evaluation`;
+}
+
+function evaluationTaskTitle(task: EvaluationTask): string {
+  if (task === "vad") {
+    return "VAD 评估";
+  }
+  if (task === "lid") {
+    return "LID 评估";
+  }
+  if (task === "keyword") {
+    return "关键词评估";
+  }
+  if (task === "denoise") {
+    return "SE 评估";
+  }
+  return "ASR 评估";
+}
+
+function pickTaskRememberedFields(
+  state: EvaluationFormState,
+): TaskRememberedFields {
+  return {
+    target: state.target,
+    dataset_path: state.dataset_path,
+  };
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -1683,6 +3542,12 @@ function formatRate(value: unknown): string {
   return `${percentage.toFixed(2)}%`;
 }
 
+function formatPercentScale(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(2)}%`
+    : "-";
+}
+
 function formatNumber(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "0";
 }
@@ -1693,6 +3558,271 @@ function formatSeconds(value: unknown): string {
     : "-";
 }
 
+function formatRealtimeFactor(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(2)}x`
+    : "-";
+}
+
+function formatConfidence(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(4)
+    : "-";
+}
+
+function formatSqaScore(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(2)
+    : "-";
+}
+
+function hasFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function formatSignedScore(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "-";
+  }
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+}
+
+function parseMarkdown(markdown: string): MarkdownBlock[] {
+  const blocks: MarkdownBlock[] = [];
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  let paragraph: string[] = [];
+  let listItems: string[] = [];
+  let codeLines: string[] = [];
+  let formulaLines: string[] = [];
+  let codeLanguage = "";
+  let inCode = false;
+  let inFormula = false;
+
+  function flushParagraph() {
+    if (paragraph.length) {
+      blocks.push({ type: "paragraph", text: paragraph.join(" ") });
+      paragraph = [];
+    }
+  }
+
+  function flushList() {
+    if (listItems.length) {
+      blocks.push({ type: "list", items: listItems });
+      listItems = [];
+    }
+  }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed === "$$") {
+      if (inFormula) {
+        blocks.push({ type: "formula", text: formulaLines.join("\n") });
+        formulaLines = [];
+        inFormula = false;
+      } else {
+        flushParagraph();
+        flushList();
+        inFormula = true;
+      }
+      continue;
+    }
+
+    if (inFormula) {
+      formulaLines.push(line);
+      continue;
+    }
+
+    if (line.startsWith("```")) {
+      if (inCode) {
+        const text = codeLines.join("\n");
+        blocks.push(
+          codeLanguage === "math" || codeLanguage === "formula"
+            ? { type: "formula", text }
+            : { type: "code", language: codeLanguage, text },
+        );
+        codeLines = [];
+        codeLanguage = "";
+        inCode = false;
+      } else {
+        flushParagraph();
+        flushList();
+        codeLanguage = line.slice(3).trim();
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const text = heading[2];
+      blocks.push({
+        type: "heading",
+        level: heading[1].length as 1 | 2 | 3,
+        text,
+        id: slugifyHeading(text),
+      });
+      continue;
+    }
+
+    if (isMarkdownTableStart(lines, index)) {
+      flushParagraph();
+      flushList();
+      const parsedTable = parseMarkdownTable(lines, index);
+      blocks.push(parsedTable.block);
+      index = parsedTable.nextIndex - 1;
+      continue;
+    }
+
+    if (trimmed.startsWith("- ")) {
+      flushParagraph();
+      listItems.push(trimmed.slice(2));
+      continue;
+    }
+
+    flushList();
+    paragraph.push(trimmed);
+  }
+
+  if (inCode) {
+    const text = codeLines.join("\n");
+    blocks.push(
+      codeLanguage === "math" || codeLanguage === "formula"
+        ? { type: "formula", text }
+        : { type: "code", language: codeLanguage, text },
+    );
+  }
+  if (inFormula) {
+    blocks.push({ type: "formula", text: formulaLines.join("\n") });
+  }
+  flushParagraph();
+  flushList();
+  return blocks;
+}
+
+function isMarkdownTableStart(lines: string[], index: number): boolean {
+  const current = lines[index]?.trim() ?? "";
+  const next = lines[index + 1]?.trim() ?? "";
+  return (
+    current.startsWith("|") &&
+    current.endsWith("|") &&
+    /^\|[\s:\-|]+\|$/.test(next)
+  );
+}
+
+function parseMarkdownTable(
+  lines: string[],
+  startIndex: number,
+): { block: MarkdownBlock; nextIndex: number } {
+  const headers = splitMarkdownTableRow(lines[startIndex]);
+  const rows: string[][] = [];
+  let index = startIndex + 2;
+  while (index < lines.length) {
+    const line = lines[index].trim();
+    if (!line.startsWith("|") || !line.endsWith("|")) {
+      break;
+    }
+    rows.push(splitMarkdownTableRow(line));
+    index += 1;
+  }
+  return { block: { type: "table", headers, rows }, nextIndex: index };
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  return line
+    .trim()
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /(`([^`]+)`|\[([^\]]+)\]\((#[^)]+)\)|\$([^$]+)\$)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    if (match[2]) {
+      nodes.push(<code key={`code-${match.index}`}>{match[2]}</code>);
+    } else if (match[3] && match[4]) {
+      nodes.push(
+        <a href={match[4]} key={`link-${match.index}`}>
+          {match[3]}
+        </a>,
+      );
+    } else if (match[5]) {
+      nodes.push(
+        <LatexFormula key={`math-${match.index}`} text={match[5]} />,
+      );
+    }
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
+}
+
+function slugifyHeading(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/`/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/[^\p{L}\p{N}\-_]/gu, "");
+}
+
+function getVadTimelineWidth(duration: number): number {
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return VAD_TIMELINE_MIN_WIDTH;
+  }
+  return Math.max(
+    VAD_TIMELINE_MIN_WIDTH,
+    Math.ceil(
+      VAD_TIMELINE_LABEL_WIDTH + duration * VAD_TIMELINE_PIXELS_PER_SECOND,
+    ),
+  );
+}
+
+function buildVadRulerTicks(duration: number): number[] {
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return [0];
+  }
+  const targetTickCount = Math.max(4, Math.ceil(duration / 12));
+  const roughStep = duration / targetTickCount;
+  const step = pickRulerStep(roughStep);
+  const ticks: number[] = [];
+  for (let tick = 0; tick < duration; tick += step) {
+    ticks.push(Number(tick.toFixed(3)));
+  }
+  if (ticks[ticks.length - 1] !== duration) {
+    ticks.push(duration);
+  }
+  return ticks;
+}
+
+function pickRulerStep(roughStep: number): number {
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  return steps.find((step) => step >= roughStep) ?? steps[steps.length - 1];
+}
+
 function toPercent(value: number, total: number): number {
   if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) {
     return 0;
@@ -1701,30 +3831,53 @@ function toPercent(value: number, total: number): number {
 }
 
 function segmentStatusLabel(status: string): string {
-  if (status === "hit") {
+  const normalizedStatus = normalizeVadLabel(status);
+  if (normalizedStatus === "hit") {
     return "命中";
   }
-  if (status === "miss") {
+  if (normalizedStatus === "miss") {
     return "漏检";
   }
-  if (status === "false_alarm") {
+  if (normalizedStatus === "false_alarm") {
     return "虚警";
   }
   return status;
 }
 
 function regionLabel(label: string): string {
-  if (label === "hit") {
+  const normalizedLabel = normalizeVadLabel(label);
+  if (normalizedLabel === "hit") {
     return "命中";
   }
-  if (label === "miss") {
+  if (normalizedLabel === "miss") {
     return "漏检";
   }
-  if (label === "false_alarm") {
+  if (normalizedLabel === "false_alarm") {
     return "虚警";
   }
-  if (label === "correct_reject") {
+  if (normalizedLabel === "correct_reject") {
     return "静音正确";
   }
   return label;
+}
+
+function normalizeVadLabel(label: string): string {
+  const normalized = label.trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (["falsealarm", "false_alarm", "fa", "fp"].includes(normalized)) {
+    return "false_alarm";
+  }
+  if (["miss", "missed", "fn"].includes(normalized)) {
+    return "miss";
+  }
+  if (["hit", "tp", "speech_correct"].includes(normalized)) {
+    return "hit";
+  }
+  if (
+    ["correctreject", "correct_reject", "tn", "silence_correct"].includes(
+      normalized,
+    )
+  ) {
+    return "correct_reject";
+  }
+  return normalized;
 }

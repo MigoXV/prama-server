@@ -14,6 +14,7 @@ class VadGrpcInferencerTest(unittest.TestCase):
         self.inferencer.sample_rate = 16000
         self.inferencer.mask_frame_seconds = 0.01
         self.inferencer.chunk_duration_seconds = 0.1
+        self.inferencer.speech_padding_seconds = 0.0
 
     def test_float_audio_to_linear16(self) -> None:
         audio = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float32)
@@ -60,6 +61,18 @@ class VadGrpcInferencerTest(unittest.TestCase):
         mask = self.inferencer._results_to_mask([result], audio_sample_count=1600)
 
         np.testing.assert_array_equal(mask, np.zeros(10, dtype=bool))
+
+    def test_mark_segment_expands_with_padding_and_clamps_to_mask(self) -> None:
+        self.inferencer.speech_padding_seconds = 0.02
+        mask = np.zeros(6, dtype=bool)
+
+        self.inferencer._mark_segment(
+            mask,
+            Duration(seconds=0, nanos=10_000_000),
+            Duration(seconds=0, nanos=45_000_000),
+        )
+
+        np.testing.assert_array_equal(mask, np.ones(6, dtype=bool))
 
 
 if __name__ == "__main__":

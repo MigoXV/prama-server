@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import shutil
 import threading
 import tempfile
+import time
 import unicodedata
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,14 +19,15 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import librosa
+import grpc
 import numpy as np
 import pandas as pd
 import soundfile as sf
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
-from prama.evaluator.evaluator import get_wer
+from pydantic import BaseModel, Field, model_validator
+from prama.evaluator.evaluator import get_cer, get_wer
 
 from prama_server.evaluator import (
     EvaluationInferenceResult,
@@ -29,6 +36,10 @@ from prama_server.evaluator import (
 )
 from prama_server.evaluator.vad import VadEvaluator
 from prama_server.inferencers.asr import AsrGrpcInferencer
+from prama_server.inferencers.denoise import DenoiseGrpcInferencer
+from prama_server.inferencers.grpc_options import create_insecure_channel
+from prama_server.inferencers.lid import LidGrpcInferencer
+from prama_server.inferencers.sqa import SqaGrpcInferencer
 from prama_server.inferencers.vad import VadGrpcInferencer
 from prama_server.metrics.prama_warpper import get_cer_pd, get_wer_pd
 from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, MessageManager
@@ -36,7 +47,8 @@ from prama_server.message_manager import MESSAGE_SENTINEL, ManagedMessage, Messa
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "completed", "failed"]
-EvaluationTask = Literal["asr", "vad"]
+EvaluationTask = Literal["asr", "vad", "lid", "denoise", "keyword"]
+LID_UNKNOWN_LANGUAGE = "<others>"
 
 
 class EvaluationRequest(BaseModel):
@@ -53,11 +65,51 @@ class EvaluationRequest(BaseModel):
     connect_timeout_seconds: float | None = Field(10.0, gt=0, description="连接超时")
     request_timeout_seconds: float = Field(60.0, gt=0, description="单次请求超时")
     interim_results: bool = Field(True, description="是否请求 ASR 临时结果")
+    inference_concurrency: int = Field(
+        0,
+        ge=0,
+        description="兼容旧字段；样本级推理并发数，0 表示串行",
+    )
+    asr_inference_concurrency: int = Field(0, ge=0, description="ASR 样本级推理并发数")
+    vad_inference_concurrency: int = Field(0, ge=0, description="VAD 样本级推理并发数")
+    lid_inference_concurrency: int = Field(0, ge=0, description="LID 样本级推理并发数")
+    enable_mos: bool = Field(False, description="是否启用 MOS 语音质量评估")
+    mos_target: str = Field("", description="MOS gRPC 服务地址")
+    enable_snr: bool = Field(False, description="是否启用 SNR 语音质量评估")
+    snr_target: str = Field("", description="SNR gRPC 服务地址")
+    sqa_inference_concurrency: int = Field(
+        0,
+        ge=0,
+        description="MOS/SNR 推理并发数，0 表示串行",
+    )
+    lid_confidence_threshold: float = Field(
+        0.0,
+        ge=0,
+        le=1,
+        description="LID 置信度阈值；低于阈值的预测按 <others> 处理",
+    )
     remove_punctuation: bool = Field(False, description="ASR 评估时是否移除标点")
     mask_frame_seconds: float = Field(0.01, gt=0, description="VAD mask 帧长秒数")
     chunk_duration_seconds: float = Field(0.1, gt=0, description="VAD 流式分块秒数")
+    speech_padding_seconds: float = Field(
+        0.0,
+        ge=0,
+        description="VAD 检出语音段前后扩展秒数",
+    )
     hit_threshold: float = Field(0.9, ge=0, le=1, description="VAD 段命中阈值")
     streaming: bool = Field(False, description="是否使用 VAD 流式接口")
+
+    @model_validator(mode="after")
+    def validate_sqa_config(self) -> EvaluationRequest:
+        self.mos_target = self.mos_target.strip()
+        self.snr_target = self.snr_target.strip()
+        if self.task == "denoise" and not self.enable_mos and not self.enable_snr:
+            raise ValueError("SE 评估必须至少启用 MOS 或 SNR")
+        if self.enable_mos and not self.mos_target:
+            raise ValueError("启用 MOS 时 MOS 引擎地址不能为空")
+        if self.enable_snr and not self.snr_target:
+            raise ValueError("启用 SNR 时 SNR 引擎地址不能为空")
+        return self
 
 
 class EvaluationCreated(BaseModel):
@@ -65,11 +117,144 @@ class EvaluationCreated(BaseModel):
     status: JobStatus
 
 
-class RecalculateMetricsRequest(BaseModel):
-    excluded_sample_ids: list[str] = Field(
-        default_factory=list,
-        description="不参与指标重算的样本 ID",
-    )
+class EngineConnectivityRequest(BaseModel):
+    target: str = Field(..., description="gRPC 服务地址")
+    timeout_seconds: float = Field(3.0, gt=0, description="连接超时秒数")
+
+
+class EngineConnectivityResult(BaseModel):
+    ok: bool
+    target: str
+    message: str
+
+
+class HelpDocument(BaseModel):
+    title: str
+    markdown: str
+
+
+class DirectoryEntry(BaseModel):
+    name: str
+    path: str
+    kind: Literal["directory", "file"]
+
+
+class DirectoryListing(BaseModel):
+    currentPath: str
+    parentPath: str | None
+    entries: list[DirectoryEntry]
+
+
+class DatasetUploadResult(BaseModel):
+    dataset_path: str
+    imported_count: int
+    skipped_count: int = 0
+    message: str | None = None
+
+
+@dataclass
+class SqaRuntimeEngine:
+    name: str
+    target: str
+    inferencer: SqaGrpcInferencer | None = None
+    error: str | None = None
+
+
+class SqaAssessor:
+    def __init__(self, request: EvaluationRequest) -> None:
+        self.concurrency = request.sqa_inference_concurrency
+        engine_configs = _sqa_engine_configs(request)
+        self.enabled = bool(engine_configs)
+        self.semaphore = (
+            threading.Semaphore(self.concurrency)
+            if self.enabled and self.concurrency > 0
+            else None
+        )
+        self.engines: list[SqaRuntimeEngine] = []
+        if not self.enabled:
+            return
+        for name, target in engine_configs:
+            try:
+                inferencer = SqaGrpcInferencer(
+                    target=target,
+                    sample_rate=request.sample_rate,
+                    request_timeout_seconds=request.request_timeout_seconds,
+                    connect_timeout_seconds=request.connect_timeout_seconds,
+                )
+                self.engines.append(
+                    SqaRuntimeEngine(name=name, target=target, inferencer=inferencer)
+                )
+            except Exception as exc:  # noqa: BLE001 - SQA 不应拖垮主评估
+                logger.exception(
+                    "SQA 引擎初始化失败，将记录为空分: name=%s target=%s",
+                    name,
+                    target,
+                )
+                self.engines.append(
+                    SqaRuntimeEngine(name=name, target=target, error=str(exc))
+                )
+
+    def assess(self, audio_array: np.ndarray) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        if self.concurrency <= 0 or len(self.engines) <= 1:
+            return [self._assess_engine(engine, audio_array) for engine in self.engines]
+
+        max_workers = min(self.concurrency, len(self.engines))
+        results: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._assess_engine, engine, audio_array): index
+                for index, engine in enumerate(self.engines)
+            }
+            for future in as_completed(futures):
+                results.append((futures[future], future.result()))
+        return [result for _, result in sorted(results, key=lambda item: item[0])]
+
+    def close(self) -> None:
+        for engine in self.engines:
+            if engine.inferencer is not None:
+                engine.inferencer.close()
+
+    def _assess_engine(
+        self,
+        engine: SqaRuntimeEngine,
+        audio_array: np.ndarray,
+    ) -> dict[str, Any]:
+        payload = {
+            "engine_name": engine.name,
+            "target": engine.target,
+            "score": None,
+            "error": engine.error,
+        }
+        if engine.inferencer is None:
+            return payload
+
+        try:
+            if self.semaphore is None:
+                result = engine.inferencer.infer(audio_array)
+            else:
+                with self.semaphore:
+                    result = engine.inferencer.infer(audio_array)
+            payload["score"] = result.score
+            payload["error"] = None
+        except Exception as exc:  # noqa: BLE001 - 单个 SQA 分数失败不影响主评估
+            logger.exception(
+                "SQA 评估失败: name=%s target=%s",
+                engine.name,
+                engine.target,
+            )
+            payload["error"] = str(exc)
+        return payload
+
+
+def _sqa_engine_configs(request: EvaluationRequest) -> list[tuple[str, str]]:
+    configs: list[tuple[str, str]] = []
+    if request.enable_mos:
+        configs.append(("MOS", request.mos_target))
+    if request.enable_snr:
+        configs.append(("SNR", request.snr_target))
+    return configs
 
 
 @dataclass
@@ -82,6 +267,9 @@ class EvaluationJob:
     error: str | None = None
     sample_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     asr_inference_rows: list[dict[str, Any]] = field(default_factory=list)
+    denoise_report_samples: list[dict[str, Any]] = field(default_factory=list)
+    keyword_report_samples: list[dict[str, Any]] = field(default_factory=list)
+    lid_report_samples: list[dict[str, Any]] = field(default_factory=list)
     vad_metric_rows: list[dict[str, Any]] = field(default_factory=list)
     vad_report_samples: list[dict[str, Any]] = field(default_factory=list)
     temp_dir: Path | None = None
@@ -105,10 +293,130 @@ jobs: dict[str, EvaluationJob] = {}
 jobs_lock = threading.Lock()
 message_manager = MessageManager()
 
+ALLOWED_UPLOAD_SUFFIXES = {
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".json",
+    ".jsonl",
+    ".csv",
+    ".parquet",
+    ".txt",
+}
+FRONTEND_DIST_ENV = "PRAMA_SERVER_WEB_DIST"
+FRONTEND_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+FRONTEND_DOCUMENT_CACHE_CONTROL = "no-cache"
 
-@app.get("/")
-def index() -> dict[str, str]:
+
+@app.get("/api/health")
+def get_health() -> dict[str, str]:
     return {"name": "Prama ASR Evaluation Service", "status": "ok"}
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return _serve_frontend_path("")
+
+
+@app.get("/api/help", response_model=HelpDocument)
+def get_help_document() -> HelpDocument:
+    help_path = Path(__file__).resolve().parents[1] / "help" / "datasets.md"
+    if not help_path.exists():
+        raise HTTPException(status_code=404, detail="帮助文档不存在")
+    return HelpDocument(
+        title="数据集与评估指标说明",
+        markdown=help_path.read_text(encoding="utf-8"),
+    )
+
+
+@app.get("/api/files/directories", response_model=DirectoryListing)
+def list_directory(
+    path: str | None = Query(None, description="要浏览的工作目录内路径"),
+) -> DirectoryListing:
+    root = _workspace_root()
+    current_path = _resolve_under_root(path, root=root)
+    if not current_path.exists() or not current_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"目录不存在: {path or root}")
+
+    entries = [
+        DirectoryEntry(
+            name=item.name,
+            path=_display_path(item),
+            kind="directory" if item.is_dir() else "file",
+        )
+        for item in sorted(
+            current_path.iterdir(),
+            key=lambda candidate: (not candidate.is_dir(), candidate.name.lower()),
+        )
+        if not item.name.startswith(".")
+    ]
+    parent_path = None
+    if current_path != root:
+        parent_path = _display_path(current_path.parent)
+    return DirectoryListing(
+        currentPath=_display_path(current_path),
+        parentPath=parent_path,
+        entries=entries,
+    )
+
+
+@app.post("/api/datasets/upload", response_model=DatasetUploadResult)
+async def upload_dataset(
+    files: list[UploadFile] = File(..., description="要上传的数据集文件"),
+) -> DatasetUploadResult:
+    if not files:
+        raise HTTPException(status_code=400, detail="没有收到上传文件")
+
+    upload_root = _upload_root()
+    upload_root.mkdir(parents=True, exist_ok=True)
+    prepared_files: list[tuple[UploadFile, Path]] = []
+    skipped_count = 0
+
+    for upload_file in files:
+        raw_name = upload_file.filename or ""
+        relative_path = _safe_relative_upload_path(raw_name)
+        if relative_path is None:
+            skipped_count += 1
+            continue
+        prepared_files.append((upload_file, relative_path))
+
+    if not prepared_files:
+        for upload_file in files:
+            await upload_file.close()
+        raise HTTPException(status_code=400, detail="没有可导入的支持文件")
+
+    upload_plan = _build_upload_plan([path for _, path in prepared_files])
+    upload_dir = _allocate_upload_directory(
+        upload_root,
+        preferred_name=upload_plan.root_directory_name,
+    )
+    imported_count = 0
+
+    try:
+        for upload_file, relative_path in prepared_files:
+            target_relative_path = upload_plan.to_target_relative_path(relative_path)
+            target_path = upload_dir / target_relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with target_path.open("wb") as output:
+                shutil.copyfileobj(upload_file.file, output)
+            imported_count += 1
+    finally:
+        for upload_file in files:
+            await upload_file.close()
+
+    logger.info(
+        "数据集文件已上传: path=%s imported=%s skipped=%s",
+        upload_dir,
+        imported_count,
+        skipped_count,
+    )
+    return DatasetUploadResult(
+        dataset_path=_display_path(upload_dir),
+        imported_count=imported_count,
+        skipped_count=skipped_count,
+        message=f"已上传 {imported_count} 个文件",
+    )
 
 
 @app.post("/api/evaluations", response_model=EvaluationCreated)
@@ -123,6 +431,27 @@ def create_evaluation(request: EvaluationRequest) -> EvaluationCreated:
     thread.start()
     logger.info("评估任务已创建: job_id=%s target=%s", job_id, request.target)
     return EvaluationCreated(job_id=job_id, status=job.status)
+
+
+@app.post("/api/engines/connectivity", response_model=EngineConnectivityResult)
+def test_engine_connectivity(
+    request: EngineConnectivityRequest,
+) -> EngineConnectivityResult:
+    target = request.target.strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="引擎地址不能为空")
+    channel = create_insecure_channel(target)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=request.timeout_seconds)
+    except Exception as exc:  # noqa: BLE001 - 返回连通性错误详情给前端
+        return EngineConnectivityResult(
+            ok=False,
+            target=target,
+            message=str(exc) or "连接失败",
+        )
+    finally:
+        channel.close()
+    return EngineConnectivityResult(ok=True, target=target, message="连接成功")
 
 
 @app.get("/api/evaluations/{job_id}")
@@ -149,35 +478,23 @@ def get_sample_audio(job_id: str, sample_id: str) -> FileResponse:
     )
 
 
-@app.post("/api/evaluations/{job_id}/metrics/recalculate")
-def recalculate_evaluation_metrics(
-    job_id: str,
-    request: RecalculateMetricsRequest,
-) -> dict[str, Any]:
+@app.get("/api/evaluations/{job_id}/samples/{sample_id}/denoised-audio")
+def get_sample_denoised_audio(job_id: str, sample_id: str) -> FileResponse:
     job = _get_job(job_id)
     with job.lock:
-        if job.status != "completed":
-            raise HTTPException(status_code=409, detail="只能在评估完成后重新计算指标")
-        excluded_sample_ids = set(request.excluded_sample_ids)
-        unknown_ids = sorted(excluded_sample_ids - set(job.sample_records))
-        if unknown_ids:
-            raise HTTPException(
-                status_code=404,
-                detail=f"样本不存在: {', '.join(unknown_ids)}",
-            )
+        record = job.sample_records.get(sample_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"样本不存在: {sample_id}")
 
-        if job.request.task == "vad":
-            result = _recalculate_vad_result(job, excluded_sample_ids)
-        else:
-            result = _recalculate_asr_result(job, excluded_sample_ids)
-        job.result = result
+    audio_path = Path(str(record.get("denoised_audio_path") or ""))
+    if not audio_path.exists() or not audio_path.is_file():
+        raise HTTPException(status_code=404, detail=f"SE 音频不存在: {sample_id}")
 
-    logger.info(
-        "评估指标已重算: job_id=%s excluded=%s",
-        job_id,
-        len(excluded_sample_ids),
+    return FileResponse(
+        audio_path,
+        media_type=_audio_media_type(audio_path),
+        filename=audio_path.name,
     )
-    return result
 
 
 @app.get("/api/evaluations/{job_id}/events")
@@ -222,6 +539,154 @@ def _get_job(job_id: str) -> EvaluationJob:
     return job
 
 
+def _file_root() -> Path:
+    return _workspace_root()
+
+
+def _upload_root() -> Path:
+    configured_upload_root = os.environ.get("PRAMA_UPLOAD_ROOT")
+    if configured_upload_root:
+        return Path(configured_upload_root).resolve()
+    return _workspace_root()
+
+
+def _frontend_dist_path() -> Path:
+    configured_dist = os.environ.get(FRONTEND_DIST_ENV, "").strip()
+    if configured_dist:
+        return Path(configured_dist).expanduser().resolve()
+    return (Path(__file__).resolve().parents[2] / "web" / "dist").resolve()
+
+
+def _serve_frontend_path(frontend_path: str) -> FileResponse:
+    dist_path = _frontend_dist_path()
+    index_path = dist_path / "index.html"
+    if not index_path.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Web 前端尚未构建；请先执行前端构建，"
+                f"或通过 {FRONTEND_DIST_ENV} 指定构建产物目录"
+            ),
+        )
+
+    requested_path = (dist_path / frontend_path).resolve()
+    if requested_path != dist_path and dist_path not in requested_path.parents:
+        raise HTTPException(status_code=404, detail="前端资源不存在")
+
+    if requested_path.is_file():
+        cache_control = (
+            FRONTEND_ASSET_CACHE_CONTROL
+            if requested_path.parent == dist_path / "assets"
+            or dist_path / "assets" in requested_path.parents
+            else FRONTEND_DOCUMENT_CACHE_CONTROL
+        )
+        return FileResponse(
+            requested_path,
+            headers={"Cache-Control": cache_control},
+        )
+
+    if Path(frontend_path).suffix:
+        raise HTTPException(status_code=404, detail="前端资源不存在")
+
+    return FileResponse(
+        index_path,
+        headers={"Cache-Control": FRONTEND_DOCUMENT_CACHE_CONTROL},
+    )
+
+
+def _workspace_root() -> Path:
+    return Path(
+        os.environ.get("PRAMA_WORKDIR")
+        or os.environ.get("PRAMA_FILE_ROOT")
+        or "data-bin"
+    ).resolve()
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _resolve_under_root(path: str | None, *, root: Path) -> Path:
+    root = root.resolve()
+    target = root if not path else Path(path).expanduser().resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise HTTPException(status_code=403, detail="路径不在允许访问的目录内") from error
+    return target
+
+
+def _safe_relative_upload_path(raw_name: str) -> Path | None:
+    cleaned = raw_name.replace("\\", "/").lstrip("/")
+    if not cleaned:
+        return None
+    relative_path = Path(cleaned)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return None
+    if relative_path.suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
+        return None
+    safe_parts = [
+        "".join(
+            char if char.isalnum() or char in ("-", "_", ".", " ") else "_"
+            for char in part
+        ).strip()
+        for part in relative_path.parts
+    ]
+    safe_parts = [part for part in safe_parts if part]
+    if not safe_parts:
+        return None
+    return Path(*safe_parts)
+
+
+@dataclass(frozen=True)
+class UploadPlan:
+    root_directory_name: str
+    strip_top_level_directory: bool = False
+
+    def to_target_relative_path(self, relative_path: Path) -> Path:
+        if self.strip_top_level_directory:
+            return Path(*relative_path.parts[1:])
+        return relative_path
+
+
+def _build_upload_plan(relative_paths: list[Path]) -> UploadPlan:
+    top_level_parts = {path.parts[0] for path in relative_paths if path.parts}
+    should_preserve_directory = (
+        len(top_level_parts) == 1
+        and any(len(path.parts) > 1 for path in relative_paths)
+    )
+    if should_preserve_directory:
+        return UploadPlan(
+            root_directory_name=next(iter(top_level_parts)),
+            strip_top_level_directory=True,
+        )
+    return UploadPlan(root_directory_name="upload")
+
+
+def _allocate_upload_directory(upload_root: Path, *, preferred_name: str) -> Path:
+    safe_name = _safe_directory_name(preferred_name) or "upload"
+    candidate = upload_root / safe_name
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+
+    suffix = uuid4().hex[:8]
+    candidate = upload_root / f"{safe_name}-{suffix}"
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def _safe_directory_name(value: str) -> str:
+    sanitized = "".join(
+        char if char.isalnum() or char in ("-", "_", ".", " ") else "_"
+        for char in value
+    ).strip()
+    return sanitized
+
+
 def _run_evaluation(job: EvaluationJob) -> None:
     request = job.request
     with job.lock:
@@ -237,7 +702,17 @@ def _run_evaluation(job: EvaluationJob) -> None:
         if request.task == "vad":
             _run_vad_evaluation(job)
             return
+        if request.task == "lid":
+            _run_lid_evaluation(job)
+            return
+        if request.task == "denoise":
+            _run_denoise_evaluation(job)
+            return
+        if request.task == "keyword":
+            _run_keyword_evaluation(job)
+            return
 
+        sqa_assessor = SqaAssessor(request)
         inferencer = AsrGrpcInferencer(
             target=request.target,
             sample_rate=request.sample_rate,
@@ -255,9 +730,11 @@ def _run_evaluation(job: EvaluationJob) -> None:
             sample_rate=request.sample_rate,
             min_reference_words=request.min_reference_words,
         )
-        _register_asr_sample_records(job, dataset)
+        inference_start_time = time.perf_counter()
+        _register_asr_sample_records(job, dataset, sqa_assessor=sqa_assessor)
         total = len(dataset)
         evaluated = 0
+        progress_lock = threading.Lock()
         inference_rows: list[dict[str, Any]] = []
 
         def publish_partial_infer_result(
@@ -265,12 +742,14 @@ def _run_evaluation(job: EvaluationJob) -> None:
         ) -> None:
             if result.is_final:
                 return
+            with progress_lock:
+                current_evaluated = evaluated
             payload = {
                 "status": "running",
                 "tag": result.tag,
                 "total": total,
-                "processed": evaluated,
-                "evaluated": evaluated,
+                "processed": current_evaluated,
+                "evaluated": current_evaluated,
                 "id": result.id,
                 "current_id": result.id,
                 "reference": result.reference,
@@ -289,28 +768,31 @@ def _run_evaluation(job: EvaluationJob) -> None:
 
         def publish_infer_result(result: EvaluationInferenceResult) -> None:
             nonlocal evaluated
-            evaluated += 1
+            with progress_lock:
+                evaluated += 1
+                current_evaluated = evaluated
             sample_record = _get_sample_record_for_result(
                 job,
                 sample_id=result.id,
-                index=evaluated,
+                index=current_evaluated,
             )
-            inference_rows.append(
-                {
-                    "id": result.id,
-                    "index": evaluated,
-                    "reference": result.reference,
-                    "hypothesis": result.hypothesis,
-                    "audio_url": sample_record.get("audio_url"),
-                    "duration_seconds": sample_record.get("duration_seconds"),
-                }
-            )
+            row = {
+                "id": result.id,
+                "index": current_evaluated,
+                "reference": result.reference,
+                "hypothesis": result.hypothesis,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": sample_record.get("sqa_scores", []),
+            }
+            with progress_lock:
+                inference_rows.append(row)
             payload = {
                 "status": "running",
                 "tag": result.tag,
                 "total": total,
-                "processed": evaluated,
-                "evaluated": evaluated,
+                "processed": current_evaluated,
+                "evaluated": current_evaluated,
                 "id": result.id,
                 "current_id": result.id,
                 "reference": result.reference,
@@ -318,6 +800,7 @@ def _run_evaluation(job: EvaluationJob) -> None:
                 "is_final": True,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": sample_record.get("sqa_scores", []),
             }
             with job.lock:
                 job.latest_progress = payload
@@ -339,22 +822,35 @@ def _run_evaluation(job: EvaluationJob) -> None:
             hypothesis_postprocess=(
                 remove_punctuation if request.remove_punctuation else None
             ),
+            inference_concurrency=_task_inference_concurrency(request, "asr"),
         ) as evaluator:
             metrics = evaluator.iter_evaluate(
                 inferencer,
                 on_infer_result=publish_infer_result,
                 on_partial_infer_result=publish_partial_infer_result,
             )
+        processing_elapsed_seconds = time.perf_counter() - inference_start_time
 
-        report = _build_wer_report(inference_rows)
+        wer_report = _build_wer_report(inference_rows)
+        cer_report = _build_cer_report(inference_rows)
+        word_accuracy = _asr_accuracy_from_report(wer_report)
+        character_accuracy = _asr_accuracy_from_report(cer_report)
         result = {
             **metrics,
-            "wer_report": report,
+            "accuracy": word_accuracy,
+            "word_accuracy": word_accuracy,
+            "character_accuracy": character_accuracy,
+            "wer_report": wer_report,
+            "cer_report": cer_report,
+            **_performance_payload(
+                audio_duration_seconds=_sum_row_duration(inference_rows),
+                processing_elapsed_seconds=processing_elapsed_seconds,
+            ),
             **_sample_count_payload(
                 included_count=len(inference_rows),
-                excluded_sample_ids=set(),
                 total_count=len(inference_rows),
             ),
+            **_sqa_summary_payload(inference_rows),
         }
         with job.lock:
             job.status = "completed"
@@ -374,7 +870,213 @@ def _run_evaluation(job: EvaluationJob) -> None:
             )
         )
     finally:
+        if request.task == "asr" and "sqa_assessor" in locals():
+            sqa_assessor.close()
         message_manager.close_job(job.job_id)
+
+
+def _run_keyword_evaluation(job: EvaluationJob) -> None:
+    request = job.request
+    sqa_assessor = SqaAssessor(request)
+    inferencer = AsrGrpcInferencer(
+        target=request.target,
+        sample_rate=request.sample_rate,
+        language_code=request.language_code,
+        hotwords=request.hotwords,
+        hotword_bias=request.hotword_bias,
+        request_timeout_seconds=request.request_timeout_seconds,
+        connect_timeout_seconds=request.connect_timeout_seconds,
+        interim_results=request.interim_results,
+    )
+    dataset = _load_keyword_dataset(
+        Path(request.dataset_path),
+        split=request.split,
+        limit=None,
+        sample_rate=request.sample_rate,
+    )
+    audio_samples = _group_keyword_audio_samples(dataset, limit=request.limit)
+    total = sum(len(sample["keyword_entries"]) for sample in audio_samples)
+    report_samples: list[dict[str, Any]] = []
+    audio_report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
+
+    def evaluate_audio_sample(group: dict[str, Any]) -> dict[str, Any]:
+        index = int(group["index"])
+        sample = group["sample"]
+        audio_sample_id = str(group["id"])
+        audio_array, audio_sample_rate = _decode_sample_audio(sample["audio"])
+        if audio_sample_rate != request.sample_rate:
+            raise ValueError(
+                f"样本采样率与关键词评估配置不一致: id={audio_sample_id} "
+                f"audio_sample_rate={audio_sample_rate} sample_rate={request.sample_rate}"
+            )
+        audio_array = _prepare_audio_for_export(audio_array)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=audio_sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=audio_sample_rate,
+        )
+        transcript = _infer_final_transcript(inferencer, audio_array)
+        match_text = _normalize_keyword_text(transcript)
+        sqa_scores = sqa_assessor.assess(audio_array)
+        keyword_results: list[dict[str, Any]] = []
+        keyword_report_samples: list[dict[str, Any]] = []
+        payloads: list[dict[str, Any]] = []
+
+        for entry in group["keyword_entries"]:
+            sample_id = str(entry["id"])
+            keyword = str(entry["keyword"])
+            expected_hit = bool(entry["expected_hit"])
+            predicted_hit = _keyword_matches(transcript, keyword)
+            correct = predicted_hit == expected_hit
+            keyword_result = {
+                "id": sample_id,
+                "index": int(entry["index"]),
+                "keyword": keyword,
+                "expected_hit": expected_hit,
+                "predicted_hit": predicted_hit,
+                "correct": correct,
+            }
+            report_sample = {
+                **keyword_result,
+                "audio_id": audio_sample_id,
+                "audio_index": index,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+                "transcript": transcript,
+                "match_text": match_text,
+                "sqa_scores": sqa_scores,
+            }
+            keyword_results.append(keyword_result)
+            keyword_report_samples.append(report_sample)
+            payloads.append(
+                {
+                    "status": "running",
+                    "tag": job.job_id,
+                    "total": total,
+                    "id": sample_id,
+                    "current_id": sample_id,
+                    "reference": f"{keyword}: {'hit' if expected_hit else 'no hit'}",
+                    "hypothesis": "hit" if predicted_hit else "no hit",
+                    "is_final": True,
+                    "result": report_sample,
+                    "audio_url": sample_record.get("audio_url"),
+                    "duration_seconds": sample_record.get("duration_seconds"),
+                    "sqa_scores": sqa_scores,
+                }
+            )
+
+        return {
+            "audio_report_sample": {
+                "id": audio_sample_id,
+                "index": index,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+                "transcript": transcript,
+                "match_text": match_text,
+                "sqa_scores": sqa_scores,
+                "keywords": keyword_results,
+            },
+            "report_samples": keyword_report_samples,
+            "payloads": payloads,
+        }
+
+    def publish_sample_result(item: dict[str, Any], processed: int) -> int:
+        audio_report_samples.append(item["audio_report_sample"])
+        for report_sample, payload in zip(
+            item["report_samples"],
+            item["payloads"],
+            strict=True,
+        ):
+            processed += 1
+            report_samples.append(report_sample)
+            progress_payload = {
+                **payload,
+                "processed": processed,
+                "evaluated": processed,
+            }
+            with job.lock:
+                job.latest_progress = progress_payload
+            message_manager.put(
+                ManagedMessage(
+                    job_id=job.job_id,
+                    event_name="inference_result",
+                    payload=progress_payload,
+                )
+            )
+        return processed
+
+    try:
+        inference_concurrency = _task_inference_concurrency(request, "keyword")
+        processed = 0
+        if inference_concurrency > 0 and audio_samples:
+            max_workers = min(inference_concurrency, len(audio_samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_audio_sample, sample)
+                    for sample in audio_samples
+                ]
+                for future in as_completed(futures):
+                    processed = publish_sample_result(future.result(), processed)
+        else:
+            for sample in audio_samples:
+                processed = publish_sample_result(
+                    evaluate_audio_sample(sample),
+                    processed,
+                )
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        audio_report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        with job.lock:
+            job.status = "completed"
+            job.keyword_report_samples = report_samples
+            job.result = {
+                **_build_keyword_report(report_samples),
+                "keyword_audio_report": {"samples": audio_report_samples},
+                "audio_sample_count": len(audio_report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(audio_report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
+                **_sample_count_payload(
+                    included_count=len(report_samples),
+                    total_count=len(report_samples),
+                ),
+                **_sqa_summary_payload(audio_report_samples),
+            }
+        logger.info("关键词评估任务完成: job_id=%s", job.job_id)
+    finally:
+        sqa_assessor.close()
+        inferencer.close()
+
+
+def _load_dataset_source(dataset_path: Path, *, split: str) -> Dataset:
+    if _is_audiofolder_dataset_dir(dataset_path):
+        return load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
+    if _is_saved_to_disk_dataset_dir(dataset_path):
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            if split not in loaded:
+                available_splits = ", ".join(loaded.keys())
+                raise ValueError(
+                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
+                )
+            return loaded[split]
+        return loaded
+    return load_dataset(str(dataset_path), split=split)
+
+
+def _is_saved_to_disk_dataset_dir(dataset_path: Path) -> bool:
+    if not dataset_path.exists() or not dataset_path.is_dir():
+        return False
+    return (dataset_path / "dataset_dict.json").is_file() or (
+        (dataset_path / "state.json").is_file()
+        and (dataset_path / "dataset_info.json").is_file()
+    )
 
 
 def _load_evaluation_dataset(
@@ -386,10 +1088,10 @@ def _load_evaluation_dataset(
     min_reference_words: int | None,
 ) -> Dataset:
     logger.info("加载数据集: path=%s split=%s", dataset_path, split)
-    if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
+    missing = sorted({"audio", "text"} - set(dataset.column_names))
+    if missing:
+        raise ValueError(f"ASR 数据集缺少必要字段: {', '.join(missing)}")
     dataset = dataset.cast_column(
         "audio",
         Audio(sampling_rate=sample_rate),
@@ -414,6 +1116,304 @@ def _load_evaluation_dataset(
     return dataset
 
 
+def _load_keyword_dataset(
+    dataset_path: Path,
+    *,
+    split: str,
+    limit: int | None,
+    sample_rate: int,
+) -> Dataset:
+    logger.info("加载关键词数据集: path=%s split=%s", dataset_path, split)
+    audio_file_names: list[str] | None = None
+    if _is_audiofolder_dataset_dir(dataset_path):
+        audio_file_names = _read_keyword_audio_file_names(dataset_path, split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
+
+    column_names = set(dataset.column_names)
+    if "audio" not in column_names:
+        raise ValueError("关键词数据集缺少必要字段: audio")
+    if "keywords" not in column_names and not {"keyword", "expected_hit"} <= column_names:
+        raise ValueError("关键词数据集缺少必要字段: keywords 或 keyword, expected_hit")
+
+    if audio_file_names is not None and len(audio_file_names) == len(dataset):
+        dataset = dataset.add_column("_keyword_audio_file_name", audio_file_names)
+    elif audio_file_names is not None:
+        logger.warning(
+            "关键词 audiofolder 元数据行数与数据集行数不一致，跳过音频路径分组字段: "
+            "metadata=%s dataset=%s",
+            len(audio_file_names),
+            len(dataset),
+        )
+
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+    normalized_keywords = _keyword_dataset_normalized_keywords(dataset)
+    if not normalized_keywords:
+        raise ValueError("关键词数据集必须提供非空 keyword")
+
+    logger.info(
+        "关键词数据集已加载: row_count=%s keyword_count=%s limit=%s",
+        len(dataset),
+        len(normalized_keywords),
+        limit,
+    )
+    return dataset
+
+
+def _read_keyword_audio_file_names(dataset_path: Path, *, split: str) -> list[str] | None:
+    metadata_candidates = [
+        dataset_path / split / "metadata.jsonl",
+        dataset_path / "metadata.jsonl",
+    ]
+    metadata_path = next(
+        (path for path in metadata_candidates if path.exists() and path.is_file()),
+        None,
+    )
+    if metadata_path is None:
+        return None
+
+    audio_file_names: list[str] = []
+    with metadata_path.open("r", encoding="utf-8") as file_obj:
+        for line_number, line in enumerate(file_obj, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"关键词元数据 JSON 无效: {metadata_path}:{line_number}"
+                ) from exc
+            file_name = payload.get("file_name")
+            audio_file_names.append(str(file_name) if file_name else "")
+    return audio_file_names
+
+
+def _keyword_dataset_normalized_keywords(dataset: Dataset) -> set[str]:
+    normalized_keywords: set[str] = set()
+    for index, sample in enumerate(dataset, start=1):
+        audio_sample_id = _keyword_audio_sample_id(sample, index)
+        entries = _keyword_entries_for_sample(
+            sample,
+            index=index,
+            audio_sample_id=audio_sample_id,
+        )
+        normalized_keywords.update(
+            _normalize_keyword_text(entry["keyword"])
+            for entry in entries
+            if entry["keyword"]
+        )
+    return normalized_keywords
+
+
+def _group_keyword_audio_samples(
+    dataset: Dataset,
+    *,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for row_index, sample in enumerate(dataset, start=1):
+        group_key = _keyword_audio_group_key(sample, row_index)
+        group = groups.get(group_key)
+        if group is None:
+            group = {
+                "sample": sample,
+                "base_id": _keyword_audio_sample_id(sample, row_index),
+                "raw_entries": [],
+            }
+            groups[group_key] = group
+        group["raw_entries"].extend(
+            _keyword_entries_for_sample(
+                sample,
+                index=row_index,
+                audio_sample_id=str(group["base_id"]),
+            )
+        )
+
+    selected_groups = list(groups.values())
+    if limit is not None:
+        selected_groups = selected_groups[:limit]
+
+    used_audio_ids: set[str] = set()
+    used_keyword_ids: set[str] = set()
+    keyword_index = 0
+    result: list[dict[str, Any]] = []
+    for audio_index, group in enumerate(selected_groups, start=1):
+        audio_id = _unique_keyword_id(
+            str(group["base_id"]) or str(audio_index),
+            used_audio_ids,
+        )
+        entries: list[dict[str, Any]] = []
+        for raw_entry in group["raw_entries"]:
+            keyword_index += 1
+            entry = dict(raw_entry)
+            entry["id"] = _unique_keyword_id(str(entry["id"]), used_keyword_ids)
+            entry["index"] = keyword_index
+            entries.append(entry)
+        result.append(
+            {
+                "id": audio_id,
+                "index": audio_index,
+                "sample": group["sample"],
+                "keyword_entries": entries,
+            }
+        )
+    return result
+
+
+def _keyword_audio_group_key(sample: dict[str, Any], index: int) -> str:
+    for key in ("_keyword_audio_file_name", "file_name", "path"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return f"path:{value}"
+    audio = sample.get("audio")
+    if isinstance(audio, dict):
+        audio_path = audio.get("path")
+        if isinstance(audio_path, str) and audio_path:
+            return f"path:{audio_path}"
+    # 嵌套结构天然是一音频一行；缺少路径时不能安全合并旧格式的不同音频。
+    return f"row:{index}"
+
+
+def _unique_keyword_id(value: str, used: set[str]) -> str:
+    candidate = value
+    suffix = 2
+    while candidate in used:
+        candidate = f"{value}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _keyword_entries_for_sample(
+    sample: dict[str, Any],
+    *,
+    index: int,
+    audio_sample_id: str,
+) -> list[dict[str, Any]]:
+    if "keywords" in sample and sample["keywords"] is not None:
+        raw_entries = sample["keywords"]
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"keywords 必须是列表: id={audio_sample_id}")
+        if not raw_entries:
+            raise ValueError(f"keywords 不能为空: id={audio_sample_id}")
+
+        entries = []
+        for keyword_index, raw_entry in enumerate(raw_entries, start=1):
+            if not isinstance(raw_entry, dict):
+                raise ValueError(f"keywords 条目必须是对象: id={audio_sample_id}")
+            keyword = str(raw_entry.get("keyword") or "").strip()
+            if not keyword:
+                raise ValueError(f"keyword 不能为空: id={audio_sample_id}")
+            expected_hit = _as_bool(raw_entry.get("expected_hit"))
+            entry_id = str(
+                raw_entry.get("id")
+                or (
+                    f"{audio_sample_id}__kw_"
+                    f"{_keyword_slug(keyword, keyword_index)}_{keyword_index}"
+                )
+            )
+            entries.append(
+                {
+                    "id": entry_id,
+                    "index": index,
+                    "keyword": keyword,
+                    "expected_hit": expected_hit,
+                }
+            )
+        return entries
+
+    if "keyword" not in sample or "expected_hit" not in sample:
+        raise ValueError(f"关键词样本缺少 keywords 或 keyword, expected_hit: id={audio_sample_id}")
+    keyword = str(sample["keyword"]).strip()
+    if not keyword:
+        raise ValueError(f"keyword 不能为空: id={audio_sample_id}")
+    return [
+        {
+            "id": str(sample.get("id") or sample.get("utt_id") or index),
+            "index": index,
+            "keyword": keyword,
+            "expected_hit": _as_bool(sample["expected_hit"]),
+        }
+    ]
+
+
+def _keyword_slug(keyword: str, index: int) -> str:
+    normalized = _normalize_keyword_text(keyword)
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return slug or str(index)
+
+
+def _keyword_audio_sample_id(sample: dict[str, Any], index: int) -> str:
+    for key in ("_keyword_audio_file_name", "file_name", "path"):
+        value = sample.get(key)
+        if isinstance(value, str) and value:
+            return Path(value).stem or str(index)
+
+    audio = sample.get("audio")
+    if isinstance(audio, dict):
+        audio_path = audio.get("path")
+        if isinstance(audio_path, str) and audio_path:
+            return Path(audio_path).stem or str(index)
+
+    return str(sample.get("id") or sample.get("utt_id") or index)
+
+
+def _infer_final_transcript(
+    inferencer: AsrGrpcInferencer,
+    audio_array: np.ndarray,
+) -> str:
+    latest_transcript = ""
+    final_transcript = ""
+    for transcript, is_final in inferencer.infer(audio_array):
+        latest_transcript = transcript
+        if is_final:
+            final_transcript = transcript
+    return final_transcript or latest_transcript
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        if int(value) in (0, 1):
+            return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "hit"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "miss", "none"}:
+            return False
+    raise ValueError(f"expected_hit 必须是布尔值: {value!r}")
+
+
+def _normalize_keyword_text(text: str) -> str:
+    normalized = "".join(
+        " " if unicodedata.category(char).startswith("P") else char.lower()
+        for char in text
+    )
+    return " ".join(normalized.split())
+
+
+def _keyword_matches(transcript: str, keyword: str) -> bool:
+    normalized_transcript = _normalize_keyword_text(transcript)
+    normalized_keyword = _normalize_keyword_text(keyword)
+    if not normalized_keyword:
+        return False
+    if _is_word_keyword(normalized_keyword):
+        transcript_tokens = normalized_transcript.split()
+        keyword_tokens = normalized_keyword.split()
+        if not keyword_tokens or len(keyword_tokens) > len(transcript_tokens):
+            return False
+        return any(
+            transcript_tokens[index:index + len(keyword_tokens)] == keyword_tokens
+            for index in range(len(transcript_tokens) - len(keyword_tokens) + 1)
+        )
+    return normalized_keyword in normalized_transcript
+
+
+def _is_word_keyword(normalized_keyword: str) -> bool:
+    return re.fullmatch(r"[a-z0-9]+(?: [a-z0-9]+)*", normalized_keyword) is not None
+
+
 def remove_punctuation(text: str) -> str:
     without_punctuation = "".join(
         " " if unicodedata.category(char).startswith("P") else char
@@ -422,7 +1422,12 @@ def remove_punctuation(text: str) -> str:
     return " ".join(without_punctuation.split())
 
 
-def _register_asr_sample_records(job: EvaluationJob, dataset: Dataset) -> None:
+def _register_asr_sample_records(
+    job: EvaluationJob,
+    dataset: Dataset,
+    *,
+    sqa_assessor: SqaAssessor,
+) -> None:
     request = job.request
     for index, sample in enumerate(dataset, start=1):
         sample_id = str(sample.get("id") or sample.get("utt_id") or index)
@@ -432,7 +1437,7 @@ def _register_asr_sample_records(job: EvaluationJob, dataset: Dataset) -> None:
                 f"样本采样率与 ASR 配置不一致: id={sample_id} "
                 f"audio_sample_rate={audio_sample_rate} sample_rate={request.sample_rate}"
             )
-        _register_sample_record(
+        sample_record = _register_sample_record(
             job=job,
             sample=sample,
             sample_id=sample_id,
@@ -440,6 +1445,7 @@ def _register_asr_sample_records(job: EvaluationJob, dataset: Dataset) -> None:
             audio_array=audio_array,
             sample_rate=audio_sample_rate,
         )
+        sample_record["sqa_scores"] = sqa_assessor.assess(audio_array)
 
 
 def _register_sample_record(
@@ -538,20 +1544,31 @@ def _write_job_audio_file(
     sample_id: str,
     audio_array: np.ndarray,
     sample_rate: int,
+    name_suffix: str = "",
 ) -> Path:
-    if job.temp_dir is None:
-        job.temp_dir = Path(tempfile.mkdtemp(prefix=f"prama-{job.job_id}-"))
+    with job.lock:
+        if job.temp_dir is None:
+            job.temp_dir = Path(tempfile.mkdtemp(prefix=f"prama-{job.job_id}-"))
+        temp_dir = job.temp_dir
     safe_name = "".join(
         char if char.isalnum() or char in ("-", "_", ".") else "_"
         for char in sample_id
     )
-    audio_path = job.temp_dir / f"{safe_name or 'sample'}.wav"
+    suffix = f"-{name_suffix}" if name_suffix else ""
+    audio_path = temp_dir / f"{safe_name or 'sample'}{suffix}.wav"
     sf.write(audio_path, audio_array, sample_rate)
     return audio_path
 
 
 def _sample_audio_url(job_id: str, sample_id: str) -> str:
     return f"/api/evaluations/{job_id}/samples/{quote(sample_id, safe='')}/audio"
+
+
+def _sample_denoised_audio_url(job_id: str, sample_id: str) -> str:
+    return (
+        f"/api/evaluations/{job_id}/samples/"
+        f"{quote(sample_id, safe='')}/denoised-audio"
+    )
 
 
 def _audio_media_type(audio_path: Path) -> str:
@@ -567,11 +1584,13 @@ def _audio_media_type(audio_path: Path) -> str:
 
 def _run_vad_evaluation(job: EvaluationJob) -> None:
     request = job.request
+    sqa_assessor = SqaAssessor(request)
     inferencer = VadGrpcInferencer(
         target=request.target,
         sample_rate=request.sample_rate,
         mask_frame_seconds=request.mask_frame_seconds,
         chunk_duration_seconds=request.chunk_duration_seconds,
+        speech_padding_seconds=request.speech_padding_seconds,
         request_timeout_seconds=request.request_timeout_seconds,
         connect_timeout_seconds=request.connect_timeout_seconds,
     )
@@ -585,61 +1604,64 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
     total = len(dataset)
     rows: list[dict[str, Any]] = []
     report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
 
-    try:
-        for index, sample in enumerate(dataset, start=1):
-            sample_id = str(sample.get("id") or sample.get("utt_id") or index)
-            audio = sample["audio"]
-            audio_array = _prepare_vad_audio(audio, sample_rate=request.sample_rate)
-            sample_record = _register_sample_record(
-                job=job,
-                sample=sample,
-                sample_id=sample_id,
-                index=index,
-                audio_array=audio_array,
-                sample_rate=request.sample_rate,
-            )
-            prediction_mask = (
-                inferencer.stream_infer(audio_array)
-                if request.streaming
-                else inferencer.infer(audio_array)
-            )
-            reference_mask = _seconds_to_mask(
-                sample["seconds"],
-                length=len(prediction_mask),
-                frame_seconds=request.mask_frame_seconds,
-            )
-            result = evaluator.evaluate(reference_mask, prediction_mask)
-            result_dict = asdict(result)
-            rows.append({"id": sample_id, **result_dict})
-            report_sample = _build_vad_sample_report(
-                sample_id=sample_id,
-                index=index,
-                reference_mask=reference_mask,
-                prediction_mask=prediction_mask,
-                frame_seconds=request.mask_frame_seconds,
-                hit_threshold=request.hit_threshold,
-                metrics=result_dict,
-            )
-            report_sample.update(
-                {
-                    "audio_url": sample_record.get("audio_url"),
-                    "duration_seconds": sample_record.get(
-                        "duration_seconds",
-                        report_sample["duration_seconds"],
-                    ),
-                }
-            )
-            report_samples.append(report_sample)
-            payload = {
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        audio = sample["audio"]
+        audio_array = _prepare_vad_audio(audio, sample_rate=request.sample_rate)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=request.sample_rate,
+        )
+        prediction_mask = (
+            inferencer.stream_infer(audio_array)
+            if request.streaming
+            else inferencer.infer(audio_array)
+        )
+        reference_mask = _seconds_to_mask(
+            sample["seconds"],
+            length=len(prediction_mask),
+            frame_seconds=request.mask_frame_seconds,
+        )
+        result = evaluator.evaluate(reference_mask, prediction_mask)
+        result_dict = asdict(result)
+        report_sample = _build_vad_sample_report(
+            sample_id=sample_id,
+            index=index,
+            reference_mask=reference_mask,
+            prediction_mask=prediction_mask,
+            frame_seconds=request.mask_frame_seconds,
+            hit_threshold=request.hit_threshold,
+            metrics=result_dict,
+        )
+        report_sample.update(
+            {
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get(
+                    "duration_seconds",
+                    report_sample["duration_seconds"],
+                ),
+                "sqa_scores": sqa_assessor.assess(audio_array),
+            }
+        )
+        return {
+            "row": {"id": sample_id, "index": index, **result_dict},
+            "report_sample": report_sample,
+            "payload": {
                 "status": "running",
                 "tag": job.job_id,
                 "total": total,
-                "processed": index,
-                "evaluated": index,
                 "id": sample_id,
                 "current_id": sample_id,
-                "reference": _format_vad_segments(reference_mask, request.mask_frame_seconds),
+                "reference": _format_vad_segments(
+                    reference_mask,
+                    request.mask_frame_seconds,
+                ),
                 "hypothesis": _format_vad_segments(
                     prediction_mask,
                     request.mask_frame_seconds,
@@ -648,32 +1670,368 @@ def _run_vad_evaluation(job: EvaluationJob) -> None:
                 "result": result_dict,
                 "audio_url": sample_record.get("audio_url"),
                 "duration_seconds": sample_record.get("duration_seconds"),
-            }
-            with job.lock:
-                job.latest_progress = payload
-            message_manager.put(
-                ManagedMessage(
-                    job_id=job.job_id,
-                    event_name="inference_result",
-                    payload=payload,
-                )
-            )
+                "sqa_scores": report_sample.get("sqa_scores", []),
+            },
+        }
 
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        rows.append(item["row"])
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        inference_concurrency = _task_inference_concurrency(request, "vad")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        rows.sort(key=lambda row: int(row.get("index") or 0))
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
         with job.lock:
             job.status = "completed"
             job.vad_metric_rows = rows
             job.vad_report_samples = report_samples
             job.result = {
                 **_build_vad_report(rows, samples=report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
                 **_sample_count_payload(
                     included_count=len(rows),
-                    excluded_sample_ids=set(),
                     total_count=len(rows),
                 ),
+                **_sqa_summary_payload(report_samples),
             }
         logger.info("VAD 评估任务完成: job_id=%s", job.job_id)
     finally:
+        sqa_assessor.close()
         inferencer.close()
+
+
+def _run_lid_evaluation(job: EvaluationJob) -> None:
+    request = job.request
+    sqa_assessor = SqaAssessor(request)
+    inferencer = LidGrpcInferencer(
+        target=request.target,
+        sample_rate=request.sample_rate,
+        request_timeout_seconds=request.request_timeout_seconds,
+        connect_timeout_seconds=request.connect_timeout_seconds,
+    )
+    dataset = _load_lid_dataset(
+        Path(request.dataset_path),
+        split=request.split,
+        limit=request.limit,
+        sample_rate=request.sample_rate,
+    )
+    total = len(dataset)
+    report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
+
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        reference_language = str(sample["language_id"])
+        audio_array = _prepare_vad_audio(sample["audio"], sample_rate=request.sample_rate)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=request.sample_rate,
+        )
+        prediction = inferencer.infer(audio_array)
+        predicted_language = _lid_predicted_language(
+            prediction.lang,
+            prediction.score,
+            request.lid_confidence_threshold,
+        )
+        correct = predicted_language == reference_language
+        report_sample = {
+            "id": sample_id,
+            "index": index,
+            "audio_url": sample_record.get("audio_url"),
+            "duration_seconds": sample_record.get("duration_seconds"),
+            "reference_language": reference_language,
+            "predicted_language": predicted_language,
+            "raw_language": prediction.lang,
+            "confidence": prediction.score,
+            "correct": correct,
+            "sqa_scores": sqa_assessor.assess(audio_array),
+        }
+        return {
+            "report_sample": report_sample,
+            "payload": {
+                "status": "running",
+                "tag": job.job_id,
+                "total": total,
+                "id": sample_id,
+                "current_id": sample_id,
+                "reference": reference_language,
+                "hypothesis": f"{predicted_language} ({prediction.score:.4f})",
+                "is_final": True,
+                "result": report_sample,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+                "sqa_scores": report_sample.get("sqa_scores", []),
+            },
+        }
+
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        inference_concurrency = _task_inference_concurrency(request, "lid")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        with job.lock:
+            job.status = "completed"
+            job.lid_report_samples = report_samples
+            job.result = {
+                **_build_lid_report(report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
+                **_sample_count_payload(
+                    included_count=len(report_samples),
+                    total_count=len(report_samples),
+                ),
+                **_sqa_summary_payload(report_samples),
+            }
+        logger.info("LID 评估任务完成: job_id=%s", job.job_id)
+    finally:
+        sqa_assessor.close()
+        inferencer.close()
+
+
+def _run_denoise_evaluation(job: EvaluationJob) -> None:
+    request = job.request
+    sqa_assessor = SqaAssessor(request)
+    inferencer = DenoiseGrpcInferencer(
+        target=request.target,
+        sample_rate=request.sample_rate,
+        request_timeout_seconds=request.request_timeout_seconds,
+        connect_timeout_seconds=request.connect_timeout_seconds,
+    )
+    dataset = _load_denoise_dataset(
+        Path(request.dataset_path),
+        split=request.split,
+        limit=request.limit,
+        sample_rate=request.sample_rate,
+    )
+    total = len(dataset)
+    report_samples: list[dict[str, Any]] = []
+    evaluation_start_time = time.perf_counter()
+
+    def evaluate_sample(index: int, sample: dict[str, Any]) -> dict[str, Any]:
+        sample_id = str(sample.get("id") or sample.get("utt_id") or index)
+        audio_array = _prepare_vad_audio(sample["audio"], sample_rate=request.sample_rate)
+        sample_record = _register_sample_record(
+            job=job,
+            sample=sample,
+            sample_id=sample_id,
+            index=index,
+            audio_array=audio_array,
+            sample_rate=request.sample_rate,
+        )
+        original_scores = sqa_assessor.assess(audio_array)
+        denoised_scores: list[dict[str, Any]] = []
+        denoised_audio_url = None
+        error = None
+
+        try:
+            denoised_audio = inferencer.infer(audio_array)
+            denoised_audio = _prepare_audio_for_export(denoised_audio)
+            denoised_audio_path = _write_job_audio_file(
+                job=job,
+                sample_id=sample_id,
+                audio_array=denoised_audio,
+                sample_rate=request.sample_rate,
+                name_suffix="denoised",
+            )
+            denoised_audio_url = _sample_denoised_audio_url(job.job_id, sample_id)
+            with job.lock:
+                sample_record["denoised_audio_path"] = str(denoised_audio_path)
+                sample_record["denoised_audio_url"] = denoised_audio_url
+            denoised_scores = sqa_assessor.assess(denoised_audio)
+        except Exception as exc:  # noqa: BLE001 - 单样本失败要进入报告
+            logger.exception("SE 样本处理失败: job_id=%s id=%s", job.job_id, sample_id)
+            error = str(exc)
+
+        sample_payload = _build_denoise_sample_payload(
+            sample_id=sample_id,
+            index=index,
+            audio_url=sample_record.get("audio_url"),
+            denoised_audio_url=denoised_audio_url,
+            duration_seconds=sample_record.get("duration_seconds"),
+            original_scores=original_scores,
+            denoised_scores=denoised_scores,
+            error=error,
+        )
+        return {
+            "report_sample": sample_payload,
+            "payload": {
+                "status": "running",
+                "tag": job.job_id,
+                "total": total,
+                "id": sample_id,
+                "current_id": sample_id,
+                "reference": "原始音频",
+                "hypothesis": "SE 完成" if error is None else "SE 失败",
+                "is_final": True,
+                "result": sample_payload,
+                "audio_url": sample_record.get("audio_url"),
+                "duration_seconds": sample_record.get("duration_seconds"),
+            },
+        }
+
+    def publish_sample_result(item: dict[str, Any], processed: int) -> None:
+        report_samples.append(item["report_sample"])
+        payload = {
+            **item["payload"],
+            "processed": processed,
+            "evaluated": processed,
+        }
+        with job.lock:
+            job.latest_progress = payload
+        message_manager.put(
+            ManagedMessage(
+                job_id=job.job_id,
+                event_name="inference_result",
+                payload=payload,
+            )
+        )
+
+    try:
+        samples = list(enumerate(dataset, start=1))
+        inference_concurrency = _task_inference_concurrency(request, "denoise")
+        if inference_concurrency > 0 and samples:
+            max_workers = min(inference_concurrency, len(samples))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(evaluate_sample, index, sample)
+                    for index, sample in samples
+                ]
+                for processed, future in enumerate(as_completed(futures), start=1):
+                    publish_sample_result(future.result(), processed)
+        else:
+            for index, sample in samples:
+                publish_sample_result(evaluate_sample(index, sample), index)
+
+        processing_elapsed_seconds = time.perf_counter() - evaluation_start_time
+        report_samples.sort(key=lambda sample: int(sample.get("index") or 0))
+        with job.lock:
+            job.status = "completed"
+            job.denoise_report_samples = report_samples
+            job.result = {
+                **_build_denoise_report(report_samples),
+                **_performance_payload(
+                    audio_duration_seconds=_sum_sample_duration(report_samples),
+                    processing_elapsed_seconds=processing_elapsed_seconds,
+                ),
+                **_sample_count_payload(
+                    included_count=len(report_samples),
+                    total_count=len(report_samples),
+                ),
+            }
+        logger.info("SE 评估任务完成: job_id=%s", job.job_id)
+    finally:
+        sqa_assessor.close()
+        inferencer.close()
+
+
+def _load_denoise_dataset(
+    dataset_path: Path,
+    *,
+    split: str,
+    limit: int | None,
+    sample_rate: int,
+) -> Dataset:
+    logger.info("加载 SE 数据集: path=%s split=%s", dataset_path, split)
+    dataset = _load_dataset_source(dataset_path, split=split)
+
+    if "audio" not in dataset.column_names:
+        raise ValueError("SE 数据集缺少必要字段: audio")
+
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+    if limit is not None:
+        dataset = dataset.select(range(min(limit, len(dataset))))
+    logger.info("SE 数据集已加载: size=%s", len(dataset))
+    return dataset
+
+
+def _load_lid_dataset(
+    dataset_path: Path,
+    *,
+    split: str,
+    limit: int | None,
+    sample_rate: int,
+) -> Dataset:
+    logger.info("加载 LID 数据集: path=%s split=%s", dataset_path, split)
+    dataset = _load_dataset_source(dataset_path, split=split)
+
+    missing = sorted({"audio", "language_id"} - set(dataset.column_names))
+    if missing:
+        raise ValueError(f"LID 数据集缺少必要字段: {', '.join(missing)}")
+
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sample_rate))
+    if limit is not None:
+        dataset = dataset.select(range(min(limit, len(dataset))))
+    logger.info("LID 数据集已加载: size=%s", len(dataset))
+    return dataset
 
 
 def _load_vad_dataset(
@@ -684,21 +2042,7 @@ def _load_vad_dataset(
     sample_rate: int,
 ) -> Dataset:
     logger.info("加载 VAD 数据集: path=%s split=%s", dataset_path, split)
-    if _is_audiofolder_dataset_dir(dataset_path):
-        dataset = load_dataset("audiofolder", data_dir=str(dataset_path), split=split)
-    elif dataset_path.exists() and dataset_path.is_dir():
-        loaded = load_from_disk(str(dataset_path))
-        if isinstance(loaded, DatasetDict):
-            if split not in loaded:
-                available_splits = ", ".join(loaded.keys())
-                raise ValueError(
-                    f"数据集不包含 split '{split}'，可用 split: {available_splits}"
-                )
-            dataset = loaded[split]
-        else:
-            dataset = loaded
-    else:
-        dataset = load_dataset(str(dataset_path), split=split)
+    dataset = _load_dataset_source(dataset_path, split=split)
 
     missing = sorted({"audio", "seconds"} - set(dataset.column_names))
     if missing:
@@ -794,23 +2138,7 @@ def _build_vad_report(
     *,
     samples: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if not rows:
-        return {
-            "frame_accuracy": 0.0,
-            "frame_recall": 0.0,
-            "frame_precision": 0.0,
-            "frame_f1": 0.0,
-            "frame": {},
-            "segment": {},
-            "vad_report": {"samples": []},
-            "segment_recall": 0.0,
-            "segment_precision": 0.0,
-            "reference_segment_count": 0,
-            "prediction_segment_count": 0,
-            "sample_count": 0,
-        }
-
-    frame_average_keys = [
+    frame_rate_keys = [
         "frame_accuracy",
         "frame_recall",
         "frame_precision",
@@ -820,7 +2148,7 @@ def _build_vad_report(
         "frame_miss_rate",
         "frame_balanced_accuracy",
     ]
-    segment_average_keys = [
+    segment_rate_keys = [
         "segment_recall",
         "segment_precision",
         "segment_f1",
@@ -843,21 +2171,99 @@ def _build_vad_report(
         "segment_miss_count",
         "segment_false_alarm_count",
     ]
-    frame_metrics = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in frame_average_keys
+
+    frame_counts = {
+        key: int(sum(int(row.get(key, 0)) for row in rows))
+        for key in frame_count_keys
     }
-    frame_metrics.update({key: int(sum(row[key] for row in rows)) for key in frame_count_keys})
-    segment_metrics = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in segment_average_keys
+    segment_counts = {
+        key: int(sum(int(row.get(key, 0)) for row in rows))
+        for key in segment_count_keys
     }
-    segment_metrics.update(
-        {key: int(sum(row[key] for row in rows)) for key in segment_count_keys}
+
+    true_positive = frame_counts["frame_true_positive"]
+    true_negative = frame_counts["frame_true_negative"]
+    false_positive = frame_counts["frame_false_positive"]
+    false_negative = frame_counts["frame_false_negative"]
+    frame_precision = _safe_divide_float(
+        true_positive,
+        true_positive + false_positive,
     )
+    frame_recall = _safe_divide_float(
+        true_positive,
+        true_positive + false_negative,
+    )
+    frame_specificity = _safe_divide_float(
+        true_negative,
+        true_negative + false_positive,
+    )
+    frame_metrics = {
+        "frame_accuracy": _safe_divide_float(
+            true_positive + true_negative,
+            frame_counts["frame_total"],
+        ),
+        "frame_recall": frame_recall,
+        "frame_precision": frame_precision,
+        "frame_f1": _f1_from_precision_recall(frame_precision, frame_recall),
+        "frame_specificity": frame_specificity,
+        "frame_false_alarm_rate": _safe_divide_float(
+            false_positive,
+            false_positive + true_negative,
+        ),
+        "frame_miss_rate": _safe_divide_float(
+            false_negative,
+            false_negative + true_positive,
+        ),
+        "frame_balanced_accuracy": (frame_recall + frame_specificity) / 2,
+        **frame_counts,
+    }
+
+    reference_segments = segment_counts["reference_segment_count"]
+    prediction_segments = segment_counts["prediction_segment_count"]
+    segment_recall = _safe_divide_float(
+        segment_counts["segment_hit_count"],
+        reference_segments,
+    )
+    # 段召回要求参考段达到覆盖阈值；段精确率沿用既有定义，只要预测段与
+    # 任一参考段有重叠即算命中，因此用“预测段数 - 无重叠段数”作为分子。
+    segment_precision = _safe_divide_float(
+        prediction_segments - segment_counts["segment_false_alarm_count"],
+        prediction_segments,
+    )
+    segment_metrics = {
+        "segment_recall": segment_recall,
+        "segment_precision": segment_precision,
+        "segment_f1": _f1_from_precision_recall(
+            segment_precision,
+            segment_recall,
+        ),
+        "segment_miss_rate": _safe_divide_float(
+            segment_counts["segment_miss_count"],
+            reference_segments,
+        ),
+        "segment_false_alarm_rate": _safe_divide_float(
+            segment_counts["segment_false_alarm_count"],
+            prediction_segments,
+        ),
+        **segment_counts,
+    }
+    frame_macro = {
+        key: float(np.mean([float(row.get(key, 0.0)) for row in rows]))
+        if rows
+        else 0.0
+        for key in frame_rate_keys
+    }
+    segment_macro = {
+        key: float(np.mean([float(row.get(key, 0.0)) for row in rows]))
+        if rows
+        else 0.0
+        for key in segment_rate_keys
+    }
     report = {
         "frame": frame_metrics,
         "segment": segment_metrics,
+        "frame_macro": frame_macro,
+        "segment_macro": segment_macro,
         "vad_report": {"samples": samples},
     }
     report.update(frame_metrics)
@@ -866,44 +2272,240 @@ def _build_vad_report(
     return report
 
 
-def _recalculate_asr_result(
-    job: EvaluationJob,
-    excluded_sample_ids: set[str],
-) -> dict[str, Any]:
-    rows = [
-        _with_sample_audio_payload(job, row)
-        for row in job.asr_inference_rows
-        if str(row["id"]) not in excluded_sample_ids
+def _f1_from_precision_recall(precision: float, recall: float) -> float:
+    if precision + recall <= 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def _build_lid_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    sample_count = len(samples)
+    language_totals: dict[str, int] = {}
+    language_hits: dict[str, int] = {}
+    predicted_totals: dict[str, int] = {}
+    confusion_counts: dict[str, dict[str, int]] = {}
+    known_correct_count = 0
+    known_sample_count = 0
+    overall_correct_count = 0
+    unknown_false_accept_count = 0
+    known_reject_count = 0
+
+    for sample in samples:
+        reference_language = str(sample.get("reference_language") or "")
+        predicted_language = str(sample.get("predicted_language") or "")
+        correct = predicted_language == reference_language
+        known_reference = reference_language != LID_UNKNOWN_LANGUAGE
+
+        language_totals[reference_language] = language_totals.get(reference_language, 0) + 1
+        predicted_totals[predicted_language] = (
+            predicted_totals.get(predicted_language, 0) + 1
+        )
+        confusion_counts.setdefault(reference_language, {})
+        confusion_counts[reference_language][predicted_language] = (
+            confusion_counts[reference_language].get(predicted_language, 0) + 1
+        )
+        if correct:
+            language_hits[reference_language] = language_hits.get(reference_language, 0) + 1
+            overall_correct_count += 1
+        if known_reference:
+            known_sample_count += 1
+            if correct:
+                known_correct_count += 1
+            if predicted_language == LID_UNKNOWN_LANGUAGE:
+                known_reject_count += 1
+        elif predicted_language != LID_UNKNOWN_LANGUAGE:
+            unknown_false_accept_count += 1
+
+    reference_languages = _sort_lid_languages(language_totals)
+    predicted_languages = _sort_lid_languages(
+        {
+            predicted_language: 1
+            for predictions in confusion_counts.values()
+            for predicted_language in predictions
+        }
+    )
+    all_language_recalls = [
+        {
+            "language": language,
+            "correct_count": language_hits.get(language, 0),
+            "sample_count": language_totals[language],
+            "predicted_count": predicted_totals.get(language, 0),
+            "precision": _safe_divide_float(
+                language_hits.get(language, 0),
+                predicted_totals.get(language, 0),
+            ),
+            "recall": _safe_divide_float(
+                language_hits.get(language, 0),
+                language_totals[language],
+            ),
+        }
+        for language in reference_languages
     ]
-    metrics = _build_asr_metrics(rows)
-    report = _build_wer_report(rows)
+    known_language_recalls = [
+        item
+        for item in all_language_recalls
+        if item["language"] != LID_UNKNOWN_LANGUAGE
+    ]
+    macro_recall = (
+        sum(item["recall"] for item in known_language_recalls)
+        / len(known_language_recalls)
+        if known_language_recalls
+        else 0.0
+    )
+    macro_precision = (
+        sum(item["precision"] for item in known_language_recalls)
+        / len(known_language_recalls)
+        if known_language_recalls
+        else 0.0
+    )
+    known_accuracy = _safe_divide_float(known_correct_count, known_sample_count)
     return {
-        **metrics,
-        "wer_report": report,
-        **_sample_count_payload(
-            included_count=len(rows),
-            excluded_sample_ids=excluded_sample_ids,
-            total_count=len(job.asr_inference_rows),
-        ),
+        "accuracy": known_accuracy,
+        "precision": macro_precision,
+        "recall": macro_recall,
+        "known_accuracy": known_accuracy,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "known_correct_count": known_correct_count,
+        "known_sample_count": known_sample_count,
+        "overall_correct_count": overall_correct_count,
+        "unknown_false_accept_count": unknown_false_accept_count,
+        "known_reject_count": known_reject_count,
+        "lid_language_recalls": known_language_recalls,
+        "lid_confusion_matrix": {
+            "reference_languages": reference_languages,
+            "predicted_languages": predicted_languages,
+            "rows": [
+                {
+                    "reference_language": reference_language,
+                    "total": language_totals[reference_language],
+                    "counts": {
+                        predicted_language: confusion_counts.get(
+                            reference_language,
+                            {},
+                        ).get(predicted_language, 0)
+                        for predicted_language in predicted_languages
+                    },
+                }
+                for reference_language in reference_languages
+            ],
+        },
+        "correct_count": overall_correct_count,
+        "sample_count": sample_count,
+        "lid_report": {"samples": samples},
     }
 
 
-def _with_sample_audio_payload(
-    job: EvaluationJob,
-    row: dict[str, Any],
-) -> dict[str, Any]:
-    record = _get_sample_record_for_result(
-        job,
-        sample_id=str(row["id"]),
-        index=int(row.get("index") or 0),
+def _build_keyword_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    hit_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is True and sample.get("predicted_hit") is True
     )
-    if not record:
-        return row
+    miss_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is True and sample.get("predicted_hit") is False
+    )
+    false_alarm_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is False and sample.get("predicted_hit") is True
+    )
+    correct_reject_count = sum(
+        1
+        for sample in samples
+        if sample.get("expected_hit") is False and sample.get("predicted_hit") is False
+    )
+    positive_sample_count = hit_count + miss_count
+    negative_sample_count = false_alarm_count + correct_reject_count
+    correct_count = hit_count + correct_reject_count
+    precision = _safe_divide_float(hit_count, hit_count + false_alarm_count)
+    recall = _safe_divide_float(hit_count, positive_sample_count)
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall > 0
+        else 0.0
+    )
+    sample_count = len(samples)
     return {
-        **row,
-        "audio_url": row.get("audio_url") or record.get("audio_url"),
-        "duration_seconds": row.get("duration_seconds")
-        or record.get("duration_seconds"),
+        "accuracy": _safe_divide_float(correct_count, sample_count),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "hit_count": hit_count,
+        "miss_count": miss_count,
+        "false_alarm_count": false_alarm_count,
+        "correct_reject_count": correct_reject_count,
+        "positive_sample_count": positive_sample_count,
+        "negative_sample_count": negative_sample_count,
+        "correct_count": correct_count,
+        "sample_count": sample_count,
+        "keyword_report": {"samples": samples},
+    }
+
+
+def _sort_lid_languages(language_counts: dict[str, int]) -> list[str]:
+    languages = sorted(language for language in language_counts if language)
+    if LID_UNKNOWN_LANGUAGE in languages:
+        languages = [
+            language for language in languages if language != LID_UNKNOWN_LANGUAGE
+        ] + [LID_UNKNOWN_LANGUAGE]
+    return languages
+
+
+def _build_denoise_sample_payload(
+    *,
+    sample_id: str,
+    index: int,
+    audio_url: str | None,
+    denoised_audio_url: str | None,
+    duration_seconds: Any,
+    original_scores: list[dict[str, Any]],
+    denoised_scores: list[dict[str, Any]],
+    error: str | None,
+) -> dict[str, Any]:
+    original_snr = _score_for_engine(original_scores, "SNR")
+    denoised_snr = _score_for_engine(denoised_scores, "SNR")
+    original_mos = _score_for_engine(original_scores, "MOS")
+    denoised_mos = _score_for_engine(denoised_scores, "MOS")
+    return {
+        "id": sample_id,
+        "index": index,
+        "audio_url": audio_url,
+        "denoised_audio_url": denoised_audio_url,
+        "duration_seconds": duration_seconds,
+        "original_sqa_scores": original_scores,
+        "denoised_sqa_scores": denoised_scores,
+        "original_snr": original_snr,
+        "denoised_snr": denoised_snr,
+        "snr_delta": _score_delta(original_snr, denoised_snr),
+        "original_mos": original_mos,
+        "denoised_mos": denoised_mos,
+        "mos_delta": _score_delta(original_mos, denoised_mos),
+        "error": error,
+    }
+
+
+def _build_denoise_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    snr_deltas = _finite_values(sample.get("snr_delta") for sample in samples)
+    mos_deltas = _finite_values(sample.get("mos_delta") for sample in samples)
+    original_snrs = _finite_values(sample.get("original_snr") for sample in samples)
+    denoised_snrs = _finite_values(sample.get("denoised_snr") for sample in samples)
+    original_moss = _finite_values(sample.get("original_mos") for sample in samples)
+    denoised_moss = _finite_values(sample.get("denoised_mos") for sample in samples)
+    return {
+        "mean_snr_delta": _mean_or_none(snr_deltas),
+        "mean_mos_delta": _mean_or_none(mos_deltas),
+        "mean_original_snr": _mean_or_none(original_snrs),
+        "mean_denoised_snr": _mean_or_none(denoised_snrs),
+        "mean_original_mos": _mean_or_none(original_moss),
+        "mean_denoised_mos": _mean_or_none(denoised_moss),
+        "sample_count": len(samples),
+        "scored_snr_sample_count": len(snr_deltas),
+        "scored_mos_sample_count": len(mos_deltas),
+        "failed_sample_count": sum(1 for sample in samples if sample.get("error")),
+        "denoise_report": {"samples": samples},
     }
 
 
@@ -926,42 +2528,184 @@ def _build_asr_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
-def _recalculate_vad_result(
-    job: EvaluationJob,
-    excluded_sample_ids: set[str],
-) -> dict[str, Any]:
-    rows = [
-        row
-        for row in job.vad_metric_rows
-        if str(row["id"]) not in excluded_sample_ids
-    ]
-    samples = [
-        sample
-        for sample in job.vad_report_samples
-        if str(sample["id"]) not in excluded_sample_ids
-    ]
-    return {
-        **_build_vad_report(rows, samples=samples),
-        **_sample_count_payload(
-            included_count=len(rows),
-            excluded_sample_ids=excluded_sample_ids,
-            total_count=len(job.vad_metric_rows),
-        ),
-    }
-
-
 def _sample_count_payload(
     *,
     included_count: int,
-    excluded_sample_ids: set[str],
     total_count: int,
 ) -> dict[str, Any]:
     return {
         "included_sample_count": included_count,
-        "excluded_sample_count": len(excluded_sample_ids),
-        "excluded_sample_ids": sorted(excluded_sample_ids),
         "total_sample_count": total_count,
     }
+
+
+def _performance_payload(
+    *,
+    audio_duration_seconds: float,
+    processing_elapsed_seconds: float,
+) -> dict[str, float]:
+    realtime_factor = _safe_divide_float(
+        audio_duration_seconds,
+        processing_elapsed_seconds,
+    )
+    return {
+        "audio_duration_seconds": audio_duration_seconds,
+        "processing_elapsed_seconds": processing_elapsed_seconds,
+        "realtime_factor": realtime_factor,
+    }
+
+
+def _sum_row_duration(rows: list[dict[str, Any]]) -> float:
+    return sum(
+        _as_float(row.get("duration_seconds")) or 0.0
+        for row in rows
+    )
+
+
+def _sum_sample_duration(samples: list[dict[str, Any]]) -> float:
+    return sum(
+        _as_float(sample.get("duration_seconds")) or 0.0
+        for sample in samples
+    )
+
+
+def _sqa_summary_payload(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _build_sqa_summary(samples)
+    return {"sqa_summary": summary} if summary else {}
+
+
+def _build_sqa_summary(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary_by_engine: dict[tuple[str, str], dict[str, Any]] = {}
+    for sample in samples:
+        scores = sample.get("sqa_scores")
+        if not isinstance(scores, list):
+            continue
+        for score_item in scores:
+            if not isinstance(score_item, dict):
+                continue
+            engine_name = str(score_item.get("engine_name") or "")
+            target = str(score_item.get("target") or "")
+            if not engine_name:
+                continue
+            key = (engine_name, target)
+            summary = summary_by_engine.setdefault(
+                key,
+                {
+                    "engine_name": engine_name,
+                    "target": target,
+                    "scores": [],
+                    "failed_count": 0,
+                },
+            )
+            score = _as_float(score_item.get("score"))
+            if score is None:
+                summary["failed_count"] += 1
+            else:
+                summary["scores"].append(score)
+
+    payload: list[dict[str, Any]] = []
+    for summary in summary_by_engine.values():
+        scores = summary["scores"]
+        payload.append(
+            {
+                "engine_name": summary["engine_name"],
+                "target": summary["target"],
+                "mean_score": float(np.mean(scores)) if scores else None,
+                "scored_count": len(scores),
+                "failed_count": summary["failed_count"],
+            }
+        )
+    return payload
+
+
+def _score_for_engine(scores: list[dict[str, Any]], engine_name: str) -> float | None:
+    for score_item in scores:
+        if not isinstance(score_item, dict):
+            continue
+        if str(score_item.get("engine_name") or "").upper() != engine_name:
+            continue
+        return _as_float(score_item.get("score"))
+    return None
+
+
+def _score_delta(
+    original_score: float | None,
+    denoised_score: float | None,
+) -> float | None:
+    if original_score is None or denoised_score is None:
+        return None
+    return denoised_score - original_score
+
+
+def _finite_values(values: Any) -> list[float]:
+    return [
+        value
+        for value in (_as_float(item) for item in values)
+        if value is not None
+    ]
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    return float(np.mean(values)) if values else None
+
+
+def _normalize_lid_language(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    if normalized in {"en", "eng", "en-us", "en-gb", "english"}:
+        return "en"
+    if normalized in {
+        "cn",
+        "zh",
+        "zho",
+        "chi",
+        "zh-cn",
+        "zh-tw",
+        "zh-hans",
+        "zh-hant",
+        "chinese",
+    }:
+        return "zh"
+    return normalized
+
+
+def _lid_predicted_language(
+    raw_language: str,
+    confidence: float,
+    threshold: float,
+) -> str:
+    if confidence < threshold:
+        return LID_UNKNOWN_LANGUAGE
+    return str(raw_language)
+
+def _task_inference_concurrency(
+    request: EvaluationRequest,
+    task: EvaluationTask,
+) -> int:
+    if task == "asr":
+        return request.asr_inference_concurrency or request.inference_concurrency
+    if task == "keyword":
+        return request.asr_inference_concurrency or request.inference_concurrency
+    if task == "vad":
+        return request.vad_inference_concurrency or request.inference_concurrency
+    if task == "lid":
+        return request.lid_inference_concurrency or request.inference_concurrency
+    if task == "denoise":
+        return request.inference_concurrency
+    return request.inference_concurrency
+
+
+def _safe_divide_float(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return float(value)
+    return None
 
 
 def _build_vad_sample_report(
@@ -1135,6 +2879,24 @@ def _region_to_payload(
 
 
 def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return _build_asr_alignment_report(rows, metric_fn=get_wer)
+
+
+def _build_cer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return _build_asr_alignment_report(rows, metric_fn=get_cer)
+
+
+def _asr_accuracy_from_report(report: dict[str, Any]) -> float:
+    summary = report.get("summary") if isinstance(report, dict) else None
+    accuracy = summary.get("accuracy") if isinstance(summary, dict) else None
+    return float(accuracy) if isinstance(accuracy, int | float) else 0.0
+
+
+def _build_asr_alignment_report(
+    rows: list[dict[str, Any]],
+    *,
+    metric_fn: Callable[..., Any],
+) -> dict[str, Any]:
     if not rows:
         return {
             "summary": {
@@ -1152,14 +2914,15 @@ def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "utterances": [],
         }
 
-    wer_result = get_wer(
+    alignment_result = metric_fn(
         [row["reference"] for row in rows],
         [row["hypothesis"] for row in rows],
         [row["id"] for row in rows],
+        include_details=True,
     )
-    summary = wer_result.summary
+    summary = alignment_result.summary
     utterance_summaries = {
-        group.name.strip("()"): group.counts for group in wer_result.groups
+        group.name.strip("()"): group.counts for group in alignment_result.groups
     }
     row_by_id = {str(row["id"]): row for row in rows}
     row_by_index = {
@@ -1189,7 +2952,7 @@ def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 or row_by_index.get(index)
                 or {},
             )
-            for index, utterance in enumerate(wer_result.utterances, start=1)
+            for index, utterance in enumerate(alignment_result.utterances, start=1)
         ],
     }
 
@@ -1206,6 +2969,7 @@ def _wer_utterance_to_payload(
         "index": row.get("index", fallback_index),
         "audio_url": row.get("audio_url"),
         "duration_seconds": row.get("duration_seconds"),
+        "sqa_scores": row.get("sqa_scores", []),
         "summary": _wer_counts_to_payload(summary),
         "tokens": [
             {
@@ -1236,3 +3000,10 @@ def _wer_counts_to_payload(counts: Any) -> dict[str, Any]:
 def _format_sse(event_name: str, payload: dict[str, Any]) -> str:
     data = json.dumps(payload, ensure_ascii=False)
     return f"event: {event_name}\ndata: {data}\n\n"
+
+
+@app.get("/{frontend_path:path}", include_in_schema=False)
+def get_frontend(frontend_path: str) -> FileResponse:
+    if frontend_path == "api" or frontend_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API 接口不存在")
+    return _serve_frontend_path(frontend_path)
