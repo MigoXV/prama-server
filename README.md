@@ -11,6 +11,10 @@ poetry install
 pnpm --dir src/web install
 ```
 
+可选的服务与前端开发配置见 [`.env.example`](.env.example)。复制为 `.env` 后，可在启动
+Python 服务前执行 `set -a; . ./.env; set +a` 加载变量；Vite 会自动读取其中的
+`VITE_API_PROXY_TARGET`。
+
 标准运行前先构建前端，随后由 FastAPI 统一托管 `src/web/dist` 和 API：
 
 ```bash
