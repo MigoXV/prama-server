@@ -1,20 +1,15 @@
 import {
   Activity,
-  BarChart3,
   BookOpen,
-  CheckCircle2,
   CircleDashed,
   Clipboard,
   Download,
   Upload,
-  Moon,
   Pause,
   Play,
   Server,
   Settings,
-  Sun,
   TriangleAlert,
-  Monitor,
 } from "lucide-react";
 import katex from "katex";
 import "katex/dist/katex.min.css";
@@ -25,15 +20,14 @@ import {
   Field,
   GhostButton,
   MetricTile,
-  ServerDirectoryBrowserDialog,
   SidebarPane,
   StatusChip,
-  SvaraThemeProvider,
   WorkbenchShell,
   WorkspacePane,
-} from "svara-ui";
+} from "./components/ui";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { DirectoryBrowserDialog } from "./components/DirectoryBrowserDialog";
 import { usePersistentState } from "./hooks/usePersistentState";
-import { useThemeMode } from "./hooks/useThemeMode";
 import packageJson from "../package.json";
 import {
   createEvaluation,
@@ -59,7 +53,6 @@ import type {
   LidReportSample,
   SqaScore,
   SqaSummary,
-  ThemeMode,
   VadReportRegion,
   VadReportSample,
   VadReportSegment,
@@ -250,7 +243,6 @@ function createTaskEventClosers(): TaskEventClosers {
 }
 
 export default function App() {
-  const { themeMode, effectiveTheme, setThemeMode } = useThemeMode();
   const [storedFormState, setFormState] = usePersistentState<EvaluationFormState>(
     "prama.evaluationForm",
     DEFAULT_FORM_STATE,
@@ -283,6 +275,8 @@ export default function App() {
   const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
     formState.dataset_path,
   );
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [liveNotice, setLiveNotice] = useState("");
   const eventClosersRef = useRef<TaskEventClosers>(createTaskEventClosers());
   const datasetUploadInputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
@@ -403,6 +397,14 @@ export default function App() {
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
   }, [busy]);
+
+  useEffect(() => {
+    if (!liveNotice) {
+      return;
+    }
+    const timeout = window.setTimeout(() => setLiveNotice(""), 2400);
+    return () => window.clearTimeout(timeout);
+  }, [liveNotice]);
 
   const progressPercent = useMemo(() => {
     const total = progress?.total ?? 0;
@@ -622,6 +624,8 @@ export default function App() {
     setFormState(DEFAULT_FORM_STATE);
     setTaskRememberedFields(TASK_REMEMBERED_DEFAULTS);
     setDirectoryBrowserPath(DEFAULT_FORM_STATE.dataset_path);
+    setResetDialogOpen(false);
+    setLiveNotice("已恢复默认值");
   }
 
   async function copyText(value: string) {
@@ -629,6 +633,7 @@ export default function App() {
       return;
     }
     await navigator.clipboard.writeText(value);
+    setLiveNotice("任务 ID 已复制");
   }
 
   function downloadResult() {
@@ -647,13 +652,10 @@ export default function App() {
   }
 
   return (
-    <SvaraThemeProvider
-      mode={effectiveTheme}
-      applyBackground={false}
-      className="app-theme-root"
-    >
-      <WorkbenchShell className="console-frame" sidebarWidth={232} variant="bare">
-        <SidebarPane className="sidebar" variant="bare">
+    <div className="app-theme-root">
+      <a className="skip-link" href="#main-content">跳到主内容</a>
+      <WorkbenchShell className="console-frame">
+        <SidebarPane className="sidebar">
         <div className="sidebar-brand">
           <div className="brand-symbol">
             <Server size={19} />
@@ -671,7 +673,7 @@ export default function App() {
           {MODULES.map((item) => {
             const Icon = item.icon;
             return (
-              <div className="module-group" key={item.id}>
+              <div className={`module-group module-group-${item.id}`} key={item.id}>
                 <button
                   type="button"
                   className={`module-item ${activeModule === item.id ? "active" : ""}`}
@@ -745,92 +747,85 @@ export default function App() {
           className={`workspace ${
             activeModule === "evaluation" ? "" : "workspace-compact"
           }`}
-          variant="bare"
         >
         {activeModule === "evaluation" ? (
           <header className="workspace-header">
-            <div>
-              <p className="eyebrow">{evaluationTaskEnglishLabel(formState.task)}</p>
+            <div className="workspace-title-row">
               <h1>{evaluationTaskTitle(formState.task)}</h1>
+              <div
+                className="page-tabs"
+                role="tablist"
+                aria-label="评估视图"
+                onKeyDown={(event) => {
+                  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+                    return;
+                  }
+                  event.preventDefault();
+                  const nextTab =
+                    event.key === "ArrowLeft" || event.key === "Home" ? "overview" : "report";
+                  setActiveTab(nextTab);
+                  window.requestAnimationFrame(() => {
+                    document.getElementById(`evaluation-${nextTab}-tab`)?.focus();
+                  });
+                }}
+              >
+                <TabButton
+                  id="evaluation-overview-tab"
+                  controls="evaluation-overview-panel"
+                  active={activeTab === "overview"}
+                  label="运行概览"
+                  onClick={() => setActiveTab("overview")}
+                />
+                <TabButton
+                  id="evaluation-report-tab"
+                  controls="evaluation-report-panel"
+                  active={activeTab === "report"}
+                  label={
+                    isVad
+                      ? "VAD 指标"
+                      : isLid
+                        ? "LID 报告"
+                        : isKeyword
+                          ? "关键词报告"
+                          : isDenoise
+                            ? "SE 报告"
+                            : "对齐报告"
+                  }
+                  onClick={() => setActiveTab("report")}
+                />
+              </div>
             </div>
             <div className="header-actions">
               <StatusPill status={status} />
               <button
                 type="button"
-                className="icon-action"
-                title="复制任务 ID"
-                aria-label="复制任务 ID"
-                disabled={!jobId}
-                onClick={() => void copyText(jobId)}
-              >
-                <Clipboard size={16} />
-              </button>
-              <button
-                type="button"
-                className="icon-action"
+                className="export-action"
                 title="下载结果 JSON"
-                aria-label="下载结果 JSON"
                 disabled={!canExport}
                 onClick={downloadResult}
               >
                 <Download size={16} />
+                <span>导出</span>
               </button>
             </div>
           </header>
         ) : null}
 
-        {activeModule === "evaluation" ? (
-          <div className="page-tabs" role="tablist" aria-label="评估视图">
-            <TabButton
-              active={activeTab === "overview"}
-              label="运行概览"
-              meta={STATUS_LABELS[status]}
-              onClick={() => setActiveTab("overview")}
-            />
-            <TabButton
-              active={activeTab === "report"}
-              label={
-                isVad
-                  ? "VAD 指标"
-                  : isLid
-                    ? "LID 报告"
-                    : isKeyword
-                      ? "关键词报告"
-                      : isDenoise
-                        ? "SE 报告"
-                        : "对齐报告"
-              }
-              meta={
-                isVad
-                  ? `${formatNumber(finalResult?.sample_count)} 个样本`
-                  : isLid
-                    ? `${lidReport?.samples.length ?? 0} 个样本`
-                    : isKeyword
-                      ? `${keywordReport?.samples.length ?? 0} 个样本`
-                      : isDenoise
-                        ? `${denoiseReport?.samples.length ?? 0} 个样本`
-                        : `${werReport?.utterances.length ?? cerReport?.utterances.length ?? 0} 个样本`
-              }
-              onClick={() => setActiveTab("report")}
-            />
-          </div>
-        ) : null}
-
         <section
           className={`work-grid ${
             activeModule === "evaluation" ? "" : "single-column"
-          }`}
+          } ${activeModule === "evaluation" && activeTab === "report" ? "report-full" : ""}`}
         >
-          {activeModule === "evaluation" ? (
+          {activeModule === "evaluation" && activeTab === "overview" ? (
             <form
               ref={formRef}
-              className="panel evaluation-form svara-surface svara-surface-padded"
+              className="panel evaluation-form"
               onSubmit={handleSubmit}
             >
               <div className="panel-heading">
                 <div>
-                  <h2>{evaluationTaskShortLabel(formState.task)} 在线评估</h2>
-                  <span>Job {jobId || "-"}</span>
+                  <h2>评估配置</h2>
+                  <span>设置引擎、数据集与运行范围</span>
                 </div>
               </div>
 
@@ -852,10 +847,11 @@ export default function App() {
                     }
                   />
                 </div>
-                <label className="field dataset-path-field">
-                  <span>数据集路径</span>
+                <div className="field dataset-path-field">
+                  <label htmlFor="evaluation-dataset-path">数据集路径</label>
                   <div className="dataset-path-controls">
                     <input
+                      id="evaluation-dataset-path"
                       value={formState.dataset_path}
                       required
                       disabled={busy || datasetUploading}
@@ -888,7 +884,7 @@ export default function App() {
                       浏览
                     </GhostButton>
                   </div>
-                </label>
+                </div>
                 <div className="dataset-options-grid">
                   <TextField
                     label="Split"
@@ -922,37 +918,12 @@ export default function App() {
                   <h2>设置</h2>
                   <span>ASR、VAD、LID 与 SE 的高级评估参数</span>
                 </div>
-                <button type="button" className="ghost-button" onClick={resetForm}>
+                <button type="button" className="ghost-button" onClick={() => setResetDialogOpen(true)}>
                   重置
                 </button>
               </div>
+              <p className="settings-save-note">更改会自动保存到当前浏览器</p>
               <div className="settings-stack">
-                <section className="settings-section">
-                  <div className="settings-section-heading">
-                    <h3>界面设置</h3>
-                  </div>
-                  <div className="theme-switcher settings-theme-switcher" aria-label="主题切换">
-                    <ThemeButton
-                      label="系统"
-                      active={themeMode === "system"}
-                      mode="system"
-                      onClick={setThemeMode}
-                    />
-                    <ThemeButton
-                      label="白色"
-                      active={themeMode === "light"}
-                      mode="light"
-                      onClick={setThemeMode}
-                    />
-                    <ThemeButton
-                      label="黑色"
-                      active={themeMode === "dark"}
-                      mode="dark"
-                      onClick={setThemeMode}
-                    />
-                  </div>
-                </section>
-
                 <section className="settings-section">
                   <div className="settings-section-heading">
                     <h3>通用设置</h3>
@@ -1243,27 +1214,85 @@ export default function App() {
 
           {activeModule === "evaluation" ? (
           <section
+            id={`evaluation-${activeTab}-panel`}
+            role="tabpanel"
+            aria-labelledby={`evaluation-${activeTab}-tab`}
             className={`run-column ${
               activeTab === "report" ? "report-column" : "overview-column"
-            }`}
+            } status-${status}`}
           >
             {activeTab === "overview" ? (
               <>
                 <div className="panel progress-panel">
-                  <div className="panel-heading">
+                  <div className="panel-heading run-status-heading">
                     <div>
-                      <h2>任务进度</h2>
-                      <span>{jobId || "等待启动"}</span>
+                      <h2>运行状态</h2>
+                      <span>{jobId ? `任务 ${jobId}` : "等待启动"}</span>
                     </div>
-                    <strong className="progress-percent">{progressPercent.toFixed(0)}%</strong>
+                    <div className="run-status-actions">
+                      {jobId ? (
+                        <button
+                          type="button"
+                          className="copy-job-action"
+                          title="复制任务 ID"
+                          aria-label="复制任务 ID"
+                          onClick={() => void copyText(jobId)}
+                        >
+                          <Clipboard size={15} />
+                          <span>复制 ID</span>
+                        </button>
+                      ) : null}
+                      {status === "running" || status === "completed" ? (
+                        <strong className="progress-percent">
+                          {`${progressPercent.toFixed(0)}%`}
+                        </strong>
+                      ) : null}
+                    </div>
                   </div>
-                  <div className="progress-track" aria-label="评估进度">
-                    <div className="progress-bar" style={{ width: `${progressPercent}%` }} />
-                  </div>
-                  <div className="metric-strip progress-metrics">
-                    <Metric label="已处理" value={`${progress?.processed ?? 0} / ${progress?.total ?? 0}`} />
-                    <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
-                  </div>
+                  {status === "idle" ? (
+                    <div className="idle-run-state">
+                      <div className="idle-run-state-content">
+                        <Activity size={22} aria-hidden="true" />
+                        <div>
+                          <strong>尚未开始评估</strong>
+                          <span>配置完成后启动评估</span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : status === "queued" || status === "started" ? (
+                    <div className="lifecycle-run-state queued-run-state">
+                      <CircleDashed size={22} aria-hidden="true" />
+                      <div>
+                        <strong>任务已进入队列</strong>
+                        <span>服务正在准备评估，开始处理后将在这里显示进度。</span>
+                      </div>
+                    </div>
+                  ) : status === "failed" ? (
+                    <div className="lifecycle-run-state failed-run-state">
+                      <TriangleAlert size={22} aria-hidden="true" />
+                      <div>
+                        <strong>评估未完成</strong>
+                        <span>{errorMessage || "检查左侧配置后重新启动评估。"}</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div
+                        className="progress-track"
+                        role="progressbar"
+                        aria-label="评估进度"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={Math.round(progressPercent)}
+                      >
+                        <div className="progress-bar" style={{ width: `${progressPercent}%` }} />
+                      </div>
+                      <div className="metric-strip progress-metrics">
+                        <Metric label="已处理" value={`${progress?.processed ?? 0} / ${progress?.total ?? 0}`} />
+                        <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
+                      </div>
+                    </>
+                  )}
                   <PerformanceMetrics result={finalResult} />
                   <SqaSummaryMetrics summary={finalResult?.sqa_summary} />
                   {connectionWarning ? (
@@ -1272,7 +1301,7 @@ export default function App() {
                       {connectionWarning}
                     </div>
                   ) : null}
-                  {errorMessage ? (
+                  {errorMessage && status !== "failed" ? (
                     <div className="error-box">
                       <TriangleAlert size={16} />
                       <span>{errorMessage}</span>
@@ -1287,7 +1316,9 @@ export default function App() {
                   <AsrOverviewMetrics result={finalResult} />
                 ) : null}
 
-                {!isVad && !isDenoise ? (
+                {!isVad &&
+                !isDenoise &&
+                (status === "running" || status === "started" || status === "completed") ? (
                   <div className="panel sample-panel">
                     <div className="panel-heading compact-heading">
                       <div>
@@ -1352,7 +1383,7 @@ export default function App() {
           </section>
           ) : null}
         </section>
-        <ServerDirectoryBrowserDialog
+        <DirectoryBrowserDialog
           isOpen={directoryBrowserOpen}
           initialPath={directoryBrowserPath}
           listDirectory={listServerDirectory}
@@ -1363,76 +1394,61 @@ export default function App() {
             setDirectoryBrowserOpen(false);
           }}
         />
+        <ConfirmDialog
+          isOpen={resetDialogOpen}
+          title="恢复全部默认设置？"
+          description="这会恢复所有任务的引擎地址、数据集路径和高级评估参数。该操作不会删除已有评估结果。"
+          confirmLabel="恢复默认值"
+          onClose={() => setResetDialogOpen(false)}
+          onConfirm={resetForm}
+        />
+        <div className="live-notice" role="status" aria-live="polite">
+          {liveNotice}
+        </div>
         </WorkspacePane>
       </WorkbenchShell>
-    </SvaraThemeProvider>
+    </div>
   );
 }
 
 function TabButton({
+  id,
+  controls,
   active,
   label,
-  meta,
   onClick,
 }: {
+  id: string;
+  controls: string;
   active: boolean;
   label: string;
-  meta: string;
   onClick: () => void;
 }) {
   return (
     <button
+      id={id}
       type="button"
       className={`page-tab ${active ? "active" : ""}`}
       role="tab"
       aria-selected={active}
+      aria-controls={controls}
+      tabIndex={active ? 0 : -1}
       onClick={onClick}
     >
-      <span>{label}</span>
-      <small>{meta}</small>
-    </button>
-  );
-}
-
-function ThemeButton({
-  label,
-  mode,
-  active,
-  onClick,
-}: {
-  label: string;
-  mode: ThemeMode;
-  active: boolean;
-  onClick: (mode: ThemeMode) => void;
-}) {
-  const Icon = mode === "system" ? Monitor : mode === "light" ? Sun : Moon;
-  return (
-    <button
-      type="button"
-      className={`theme-button ${active ? "active" : ""}`}
-      title={label}
-      aria-label={label}
-      onClick={() => onClick(mode)}
-    >
-      <Icon size={15} />
       <span>{label}</span>
     </button>
   );
 }
 
 function StatusPill({ status }: { status: JobStatus | "idle" | "started" }) {
-  const Icon =
-    status === "completed"
-      ? CheckCircle2
-      : status === "failed"
-        ? TriangleAlert
-        : status === "running" || status === "started"
-          ? CircleDashed
-          : BarChart3;
   return (
-    <StatusChip className={`status-pill status-${status}`}>
-      <Icon size={15} />
-      {STATUS_LABELS[status]}
+    <StatusChip
+      className={`status-pill status-${status}`}
+      role="status"
+      aria-live="polite"
+    >
+      <span className="status-dot" aria-hidden="true" />
+      <span>{STATUS_LABELS[status]}</span>
     </StatusChip>
   );
 }
@@ -1451,8 +1467,8 @@ function ConnectivityButton({
       : state === "ok"
         ? "已连接"
         : state === "failed"
-          ? "失败"
-          : "测试";
+          ? "连接失败"
+          : "测试连接";
   return (
     <button
       type="button"
@@ -1876,9 +1892,38 @@ function SqaScoreChips({ scores }: { scores?: SqaScore[] }) {
 
 function MarkdownDocument({ markdown }: { markdown: string }) {
   const blocks = useMemo(() => parseMarkdown(markdown), [markdown]);
+  const headings = blocks.filter(
+    (block): block is Extract<MarkdownBlock, { type: "heading" }> =>
+      block.type === "heading" && block.level === 2 && block.text !== "目录",
+  );
+  const contentBlocks = blocks.filter((block, index) => {
+    if (block.type === "heading" && block.level === 1) {
+      return false;
+    }
+    if (block.type === "heading" && block.text === "目录") {
+      return false;
+    }
+    const previous = blocks[index - 1];
+    return !(
+      block.type === "list" &&
+      previous?.type === "heading" &&
+      previous.text === "目录"
+    );
+  });
   return (
-    <article className="markdown-document">
-      {blocks.map((block, index) => {
+    <div className="help-document-layout">
+      {headings.length ? (
+        <details className="markdown-toc" open>
+          <summary>本文目录</summary>
+          <nav aria-label="帮助文档目录">
+            {headings.map((heading) => (
+              <a href={`#${heading.id}`} key={heading.id}>{heading.text}</a>
+            ))}
+          </nav>
+        </details>
+      ) : null}
+      <article className="markdown-document">
+      {contentBlocks.map((block, index) => {
         if (block.type === "heading") {
           const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
           return (
@@ -1935,7 +1980,8 @@ function MarkdownDocument({ markdown }: { markdown: string }) {
         }
         return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
       })}
-    </article>
+      </article>
+    </div>
   );
 }
 
@@ -3478,13 +3524,6 @@ function evaluationTaskShortLabel(task: EvaluationTask): string {
     return "SE";
   }
   return "ASR";
-}
-
-function evaluationTaskEnglishLabel(task: EvaluationTask): string {
-  if (task === "denoise") {
-    return "SE Evaluation";
-  }
-  return `${evaluationTaskShortLabel(task)} Evaluation`;
 }
 
 function evaluationTaskTitle(task: EvaluationTask): string {

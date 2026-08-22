@@ -1,6 +1,5 @@
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 
-export type ThemeMode = "system" | "light" | "dark";
 export type EvaluationTask = "asr" | "vad" | "lid" | "denoise" | "keyword";
 
 export interface HelpDocument {

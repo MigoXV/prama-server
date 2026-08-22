@@ -90,16 +90,14 @@ class HttpFrontendTest(unittest.TestCase):
         )
         self.assertEqual(response.json(), {"detail": "API 接口不存在"})
 
-    def test_missing_frontend_dist_keeps_api_available(self) -> None:
+    def test_missing_frontend_dist_prevents_server_startup(self) -> None:
         with patch.dict(
             os.environ,
             {"PRAMA_SERVER_WEB_DIST": str(self.temp_path / "missing")},
         ):
-            frontend_response = client.get("/")
-            health_response = client.get("/api/health")
-
-        self.assertEqual(frontend_response.status_code, 503)
-        self.assertEqual(health_response.status_code, 200)
+            with self.assertRaisesRegex(RuntimeError, "Web 前端尚未构建"):
+                with TestClient(app):
+                    pass
 
     def test_frontend_does_not_follow_symlink_outside_dist(self) -> None:
         secret_path = self.temp_path / "secret.txt"

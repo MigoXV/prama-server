@@ -8,9 +8,10 @@
             "name": "prama server",
             "type": "debugpy",
             "request": "launch",
-            "program": "src/prama_server/commands/app.py",
+            "module": "prama_server.commands.app",
             "console": "integratedTerminal",
             "envFile": "${workspaceFolder}/.env",
+            "preLaunchTask": "web: build",
             "args": ["serve-http"]
         },
         {
@@ -29,14 +30,14 @@
             "module": "uvicorn",
             "console": "integratedTerminal",
             "envFile": "${workspaceFolder}/.env",
+            "preLaunchTask": "web: build",
             "justMyCode": false,
             "args": [
                 "prama_server.servicer.http:app",
                 "--host",
                 "0.0.0.0",
                 "--port",
-                "8000",
-                "--reload"
+                "8000"
             ]
         }
     ]

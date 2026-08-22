@@ -33,8 +33,7 @@ RUN mkdir -p src/prama_server && \
 COPY . .
 
 # 拷贝前端构建产物，运行时不再依赖 Node.js 或 Nginx
-COPY --from=frontend-build /app/src/web/dist /app/web-dist
-ENV PRAMA_SERVER_WEB_DIST=/app/web-dist
+COPY --from=frontend-build /app/src/web/dist /app/src/web/dist
 
 # 安装当前包
 RUN poetry install

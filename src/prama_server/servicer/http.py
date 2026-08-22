@@ -309,6 +309,17 @@ FRONTEND_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 FRONTEND_DOCUMENT_CACHE_CONTROL = "no-cache"
 
 
+@app.on_event("startup")
+def check_frontend_build() -> None:
+    """确保服务启动时已具备可托管的前端构建产物。"""
+    index_path = _frontend_dist_path() / "index.html"
+    if not index_path.is_file():
+        raise RuntimeError(
+            "Web 前端尚未构建；请先执行 `pnpm --dir src/web run build`，"
+            f"或通过 {FRONTEND_DIST_ENV} 指定构建产物目录"
+        )
+
+
 @app.get("/api/health")
 def get_health() -> dict[str, str]:
     return {"name": "Prama ASR Evaluation Service", "status": "ok"}
