@@ -1,0 +1,14 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "web: build",
+            "type": "shell",
+            "command": "pnpm run build",
+            "options": {
+                "cwd": "${workspaceFolder}/src/web"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

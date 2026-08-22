@@ -4,10 +4,21 @@ Prama Server 是面向语音服务的评估工具，支持 ASR、关键词、VAD
 
 ## 安装与运行
 
-项目使用 Poetry 管理依赖：
+项目的开发依赖为 Node.js、pnpm 和 Poetry。首次安装依赖：
 
 ```bash
 poetry install
+pnpm --dir src/web install
+```
+
+可选的服务与前端开发配置见 [`.env.example`](.env.example)。复制为 `.env` 后，可在启动
+Python 服务前执行 `set -a; . ./.env; set +a` 加载变量；Vite 会自动读取其中的
+`VITE_API_PROXY_TARGET`。
+
+标准运行前先构建前端，随后由 FastAPI 统一托管 `src/web/dist` 和 API：
+
+```bash
+pnpm --dir src/web run build
 poetry run prama-server serve-http --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -21,7 +32,17 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Vite 开发服务器会把 `/api` 请求代理到本机的 `8000` 端口。
+Vite 开发服务器会把 `/api` 请求代理到本机的 `8000` 端口。VS Code 启动 HTTP 后端调试前会自动执行一次前端构建。
+
+前端类型检查、构建与浏览器回归测试：
+
+```bash
+pnpm --dir src/web run lint
+pnpm --dir src/web run build
+pnpm --dir src/web run test:e2e
+```
+
+浏览器测试优先使用 `PLAYWRIGHT_CHROMIUM_PATH` 指定的 Chromium，未指定时会探测系统 Chromium，再回退到 Playwright 自带浏览器。
 
 ## Docker 部署
 

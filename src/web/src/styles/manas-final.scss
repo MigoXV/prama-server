@@ -1,0 +1,818 @@
+/* Final workspace rules stay last so the migrated shell has one predictable source of truth. */
+
+body,
+.app-theme-root,
+.console-frame {
+  background: var(--bg);
+}
+
+.console-frame {
+  grid-template-columns: 204px minmax(0, 1fr);
+  column-gap: 0;
+}
+
+.sidebar {
+  padding: 18px 12px;
+  background: var(--surface);
+}
+
+.sidebar-brand {
+  padding: 0 8px 20px;
+
+  strong {
+    font-size: 16px;
+  }
+}
+
+.brand-symbol {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.module-item,
+.task-nav button {
+  position: relative;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+
+  &:hover:not(:disabled) {
+    background: var(--surface-soft);
+    color: var(--text);
+  }
+}
+
+.module-item.active {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent-hover);
+}
+
+.module-item.active::before {
+  content: none;
+}
+
+.task-nav {
+  padding-left: 24px;
+
+  button {
+    min-height: 34px;
+    font-weight: 650;
+  }
+
+  button.active,
+  button.active:hover:not(:disabled) {
+    border-color: transparent;
+    background: var(--accent-soft);
+    color: var(--accent-hover);
+  }
+
+  button.active::before {
+    position: absolute;
+    top: 7px;
+    bottom: 7px;
+    left: 0;
+    width: 3px;
+    border-radius: 2px;
+    background: var(--accent);
+    content: "";
+  }
+}
+
+.module-group:not(.module-group-evaluation) .module-item.active {
+  background: var(--accent-soft);
+}
+
+.module-group:not(.module-group-evaluation) .module-item.active::before {
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  content: "";
+}
+
+.workspace {
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 18px clamp(18px, 2.2vw, 32px) 24px;
+}
+
+.workspace-compact {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.workspace-header {
+  min-height: 64px;
+  margin-bottom: 14px;
+}
+
+.workspace-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: clamp(24px, 3vw, 40px);
+
+  h1 {
+    flex: 0 0 auto;
+    margin: 0;
+    font-size: clamp(22px, 1.8vw, 26px);
+    letter-spacing: -0.02em;
+  }
+}
+
+.page-tabs {
+  display: flex;
+  width: auto;
+  min-width: 0;
+  gap: 22px;
+  margin: 0;
+  border: 0;
+}
+
+.page-tab {
+  position: relative;
+  min-width: auto;
+  min-height: 40px;
+  padding: 0 1px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 650;
+
+  &:hover:not(:disabled) {
+    color: var(--text);
+  }
+
+  &.active {
+    border-color: transparent;
+    background: transparent;
+    color: var(--accent-hover);
+  }
+
+  &.active::after {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: var(--accent);
+    content: "";
+  }
+}
+
+.header-actions {
+  flex-wrap: nowrap;
+}
+
+.status-pill {
+  min-width: auto;
+  height: 32px;
+  border-color: transparent;
+  background: transparent;
+  padding-inline: 9px;
+  color: var(--muted);
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--border-strong);
+  }
+
+  &.status-queued .status-dot,
+  &.status-started .status-dot {
+    background: var(--amber);
+  }
+
+  &.status-running .status-dot,
+  &.status-completed .status-dot {
+    background: var(--green);
+  }
+
+  &.status-failed .status-dot {
+    background: var(--red);
+  }
+}
+
+.export-action,
+.copy-job-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+
+  &:hover:not(:disabled) {
+    border-color: var(--border);
+    background: var(--surface);
+    color: var(--text);
+  }
+
+  &:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+  }
+}
+
+.work-grid {
+  grid-template-columns: 376px minmax(0, 1fr);
+  gap: 0;
+  align-items: stretch;
+}
+
+.work-grid.report-full,
+.work-grid.single-column {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.panel {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.evaluation-form,
+.overview-column {
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.evaluation-form {
+  display: flex;
+  max-height: none;
+  flex-direction: column;
+  overflow: auto;
+  padding: 18px 28px 18px 0;
+}
+
+.evaluation-form .form-action-bar {
+  margin-top: 22px;
+  padding-top: 0;
+}
+
+.overview-column {
+  display: block;
+  overflow: auto;
+  padding: 0 0 0 28px;
+  border-left: 1px solid var(--border);
+  scrollbar-gutter: stable;
+}
+
+.overview-column > .panel {
+  padding: 20px 0 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.overview-column > .panel:last-child {
+  border-bottom: 0;
+}
+
+.overview-column.status-idle,
+.overview-column.status-queued,
+.overview-column.status-started,
+.overview-column.status-failed {
+  overflow: hidden;
+}
+
+.overview-column.status-idle .progress-panel,
+.overview-column.status-queued .progress-panel,
+.overview-column.status-started .progress-panel,
+.overview-column.status-failed .progress-panel {
+  display: flex;
+  height: 100%;
+  min-height: 420px;
+  flex-direction: column;
+  border-bottom: 0;
+}
+
+.configuration-panel,
+.help-panel {
+  width: 100%;
+  height: 100%;
+  max-width: 1000px;
+  margin-inline: auto;
+  padding: 8px 0 64px;
+}
+
+.settings-panel {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 8px 0 64px;
+}
+
+.settings-panel .panel-heading {
+  margin-bottom: 0;
+  padding: 0 0 20px;
+}
+
+.settings-save-note {
+  margin: 18px 0 0;
+}
+
+.settings-section {
+  display: grid;
+  grid-template-columns: minmax(150px, 210px) minmax(0, 1fr);
+  column-gap: clamp(32px, 5vw, 72px);
+  row-gap: 16px;
+  padding: 30px 0;
+}
+
+.settings-section-heading {
+  grid-column: 1;
+  grid-row: 1 / span 4;
+  align-items: flex-start;
+}
+
+.settings-section > :not(.settings-section-heading) {
+  grid-column: 2;
+}
+
+.settings-panel .advanced-grid {
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 16px 20px;
+}
+
+.settings-panel .sqa-fixed-list {
+  gap: 12px;
+}
+
+.settings-panel .sqa-fixed-row {
+  grid-template-columns: 100px minmax(240px, 1fr) 82px;
+  gap: 16px;
+}
+
+.report-panel {
+  padding: 18px 0 24px;
+  border-bottom: 0;
+}
+
+.panel-heading {
+  margin-bottom: 18px;
+
+  h2 {
+    font-size: 18px;
+  }
+
+  span {
+    color: var(--muted);
+  }
+}
+
+.run-status-heading {
+  gap: 16px;
+}
+
+.run-status-heading > div:first-child {
+  min-width: 0;
+
+  span {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.run-status-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.copy-job-action {
+  min-height: 32px;
+  padding-inline: 8px;
+}
+
+.field input,
+.jump-control input,
+.sort-control select {
+  height: 44px;
+  border-color: var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+
+  &:hover:not(:disabled) {
+    border-color: var(--border-strong);
+  }
+
+  &:focus,
+  &:focus-visible {
+    border-color: var(--accent);
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+    box-shadow: none;
+  }
+}
+
+.engine-target-row {
+  grid-template-columns: minmax(0, 1fr) 82px;
+}
+
+.connectivity-button,
+.dataset-action-button,
+.ui-button-secondary,
+.ui-button-ghost,
+.ghost-button {
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--muted);
+
+  &:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    background: var(--surface-soft);
+    color: var(--text);
+  }
+
+  &:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+  }
+}
+
+.connectivity-button,
+.dataset-action-button {
+  height: 44px;
+  min-height: 44px;
+}
+
+.dataset-options-grid {
+  grid-template-columns: minmax(150px, 1fr) minmax(110px, 140px);
+}
+
+.form-action-bar {
+  position: static;
+  margin: 22px 0 0;
+  padding: 0;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+.primary-action,
+.ui-button-primary {
+  min-height: 44px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+
+  &:hover:not(:disabled) {
+    border-color: var(--accent-hover);
+    background: var(--accent-hover);
+  }
+}
+
+.idle-run-state,
+.lifecycle-run-state {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 300px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 13px;
+  padding: 40px 24px 64px;
+  text-align: center;
+
+  strong {
+    color: var(--text);
+    font-size: 16px;
+  }
+
+  span {
+    max-width: 48ch;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.55;
+  }
+}
+
+.idle-run-state {
+  justify-content: center;
+  padding-bottom: calc(64px + 16vh);
+}
+
+.idle-run-state-content {
+  display: grid;
+  justify-items: center;
+  gap: 13px;
+
+  > div {
+    display: grid;
+    gap: 7px;
+  }
+}
+
+.lifecycle-run-state > div {
+  display: grid;
+  gap: 7px;
+}
+
+.idle-run-state,
+.queued-run-state {
+  color: var(--accent);
+}
+
+.failed-run-state {
+  color: var(--red);
+}
+
+.progress-percent {
+  color: var(--text);
+  font-size: 20px;
+}
+
+.progress-track {
+  height: 7px;
+  border: 0;
+  background: var(--surface-soft);
+}
+
+.progress-bar {
+  background: var(--accent);
+}
+
+.metric {
+  min-height: 54px;
+  padding: 11px 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+
+.compact-report-panel .metric,
+.vad-metric-section .metric {
+  min-height: 44px;
+  padding: 8px 0;
+}
+
+.utterance,
+.vad-sample,
+.keyword-sample,
+.denoise-sample,
+.lid-sample,
+.asr-summary-card,
+.lid-metrics-details {
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.help-panel {
+  max-width: 1040px;
+}
+
+.help-document-layout {
+  display: grid;
+  grid-template-columns: minmax(150px, 190px) minmax(0, 75ch);
+  gap: clamp(28px, 4vw, 56px);
+  align-items: start;
+}
+
+.markdown-toc {
+  position: sticky;
+  top: 0;
+  padding: 4px 0 14px;
+  border-bottom: 1px solid var(--border);
+
+  summary {
+    cursor: pointer;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 750;
+  }
+
+  nav {
+    display: grid;
+    gap: 9px;
+    margin-top: 14px;
+  }
+
+  a {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.35;
+    text-decoration: none;
+
+    &:hover,
+    &:focus-visible {
+      color: var(--accent-hover);
+    }
+  }
+}
+
+.markdown-document {
+  gap: 16px;
+  font-size: 15px;
+  line-height: 1.72;
+}
+
+.markdown-code-block,
+.markdown-formula,
+.table-wrap {
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+@media (max-width: 1080px) {
+  .workspace {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .work-grid,
+  .work-grid.report-full {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+    align-content: start;
+  }
+
+  .evaluation-form,
+  .run-column,
+  .overview-column {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .evaluation-form {
+    padding: 20px 0 28px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .overview-column {
+    padding: 0;
+    border-left: 0;
+  }
+
+  .evaluation-form .form-action-bar {
+    margin-top: 22px;
+    padding-top: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .console-frame {
+    display: block;
+    overflow: auto;
+  }
+
+  .sidebar {
+    position: static;
+    display: block;
+    height: auto;
+  }
+
+  .module-item.active::before {
+    content: none;
+  }
+
+  .module-group:not(.module-group-evaluation) .module-item.active::before {
+    top: 7px;
+    right: auto;
+    bottom: 7px;
+    left: 0;
+    width: 3px;
+    height: auto;
+  }
+
+  .task-nav button.active::before {
+    inset: auto 10px 0;
+    width: auto;
+    height: 2px;
+  }
+
+  .workspace {
+    min-height: 0;
+    padding: 14px;
+  }
+
+  .workspace-header {
+    gap: 12px;
+  }
+
+  .workspace-title-row {
+    width: 100%;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .page-tabs {
+    display: flex;
+    width: 100%;
+    gap: 20px;
+    overflow-x: auto;
+    scrollbar-width: none;
+
+    &::-webkit-scrollbar {
+      display: none;
+    }
+  }
+
+  .page-tab {
+    flex: 0 0 auto;
+    min-width: auto;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .status-pill {
+    flex: 0 0 auto;
+  }
+
+  .evaluation-form,
+  .overview-column {
+    padding-inline: 0;
+  }
+
+  .overview-column.status-idle .progress-panel,
+  .overview-column.status-queued .progress-panel,
+  .overview-column.status-started .progress-panel,
+  .overview-column.status-failed .progress-panel {
+    min-height: 360px;
+  }
+
+  .idle-run-state,
+  .lifecycle-run-state {
+    min-height: 240px;
+    padding-inline: 12px;
+  }
+
+  .idle-run-state {
+    padding-bottom: calc(40px + 12vh);
+  }
+
+  .run-status-heading {
+    align-items: flex-start;
+  }
+
+  .copy-job-action span {
+    display: none;
+  }
+
+  .help-document-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 22px;
+  }
+
+  .markdown-toc {
+    position: static;
+  }
+
+  .metric-strip,
+  .report-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-section {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+    padding: 26px 0;
+  }
+
+  .settings-section-heading,
+  .settings-section > :not(.settings-section-heading) {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .settings-panel .advanced-grid,
+  .settings-panel .sqa-fixed-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 520px) {
+  .engine-target-row,
+  .dataset-options-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

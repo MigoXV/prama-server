@@ -7,16 +7,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lint": "tsc --noEmit",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "katex": "^0.17.0",
     "lucide-react": "^0.468.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "svara-ui": "0.1.0"
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
     "@vitejs/plugin-react": "^4.3.4",
