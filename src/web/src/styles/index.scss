@@ -2320,6 +2320,10 @@ a {
   width: min(480px, 100%);
 }
 
+.directory-dialog {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
 .dialog-header,
 .dialog-footer,
 .directory-toolbar {
@@ -2358,7 +2362,30 @@ a {
 }
 
 .directory-toolbar {
+  flex-wrap: wrap;
   padding: 16px 22px;
+}
+
+.directory-path-form {
+  display: grid;
+  flex: 1 0 100%;
+  min-width: 0;
+  gap: 5px;
+
+  > label {
+    color: var(--muted);
+    font-size: 12px;
+  }
+}
+
+.directory-path-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+
+  input {
+    min-width: 0;
+  }
 }
 
 .directory-current-path {
@@ -2379,10 +2406,18 @@ a {
   }
 }
 
+.directory-content {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .directory-list {
-  min-height: 180px;
-  overflow: auto;
+  min-height: 0;
+  overflow-y: scroll;
+  overscroll-behavior: contain;
   padding: 0 12px 12px;
+  scrollbar-gutter: stable;
 }
 
 .directory-row {
@@ -2562,6 +2597,10 @@ a {
   .directory-toolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .directory-path-controls {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .dialog-footer .ui-button {

@@ -1,5 +1,7 @@
 import type {
   EvaluationCreated,
+  EvaluationResult,
+  MetricProgress,
   DatasetUploadResult,
   EvaluationProgress,
   EvaluationRequest,
@@ -11,6 +13,8 @@ import type {
 export interface EvaluationEventHandlers {
   onProgress: (progress: EvaluationProgress) => void;
   onPartialProgress: (progress: EvaluationProgress) => void;
+  onMetric: (progress: MetricProgress) => void;
+  onMetricSnapshot: (result: EvaluationResult) => void;
   onDone: (snapshot: EvaluationSnapshot) => void;
   onError: (message: string) => void;
   onConnectionError?: () => void;
@@ -88,6 +92,13 @@ export function subscribeEvaluationEvents(
 
   eventSource.addEventListener("partial_inference_result", (event) => {
     handlers.onPartialProgress(parseEventData<EvaluationProgress>(event));
+  });
+
+  eventSource.addEventListener("metric_result", (event) => {
+    handlers.onMetric(parseEventData<MetricProgress>(event));
+  });
+  eventSource.addEventListener("metric_snapshot", (event) => {
+    handlers.onMetricSnapshot(parseEventData<EvaluationResult>(event));
   });
 
   eventSource.addEventListener("error", (event) => {

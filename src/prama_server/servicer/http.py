@@ -27,7 +27,7 @@ from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
-from prama.evaluator.evaluator import get_cer, get_wer
+from prama.evaluator import iter_cer, iter_wer
 
 from prama_server.evaluator import (
     EvaluationInferenceResult,
@@ -530,6 +530,9 @@ def stream_evaluation_events(job_id: str) -> StreamingResponse:
             yield _format_sse("done", snapshot)
             return
 
+        if snapshot["result"] is not None and job.request.task == "asr":
+            yield _format_sse("metric_snapshot", snapshot["result"])
+
         while True:
             item = event_queue.get()
             if item is MESSAGE_SENTINEL:
@@ -822,6 +825,8 @@ def _run_evaluation(job: EvaluationJob) -> None:
                     payload=payload,
                 )
             )
+
+            _publish_asr_metrics(job, row)
 
         with Evaluator(
             dataset=dataset,
@@ -2890,11 +2895,11 @@ def _region_to_payload(
 
 
 def _build_wer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return _build_asr_alignment_report(rows, metric_fn=get_wer)
+    return _build_asr_alignment_report(rows, metric_fn=iter_wer)
 
 
 def _build_cer_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return _build_asr_alignment_report(rows, metric_fn=get_cer)
+    return _build_asr_alignment_report(rows, metric_fn=iter_cer)
 
 
 def _asr_accuracy_from_report(report: dict[str, Any]) -> float:
@@ -2925,47 +2930,64 @@ def _build_asr_alignment_report(
             "utterances": [],
         }
 
-    alignment_result = metric_fn(
+    row_by_id = {str(row["id"]): row for row in rows}
+    utterances = []
+    with metric_fn(
         [row["reference"] for row in rows],
         [row["hypothesis"] for row in rows],
         [row["id"] for row in rows],
-        include_details=True,
-    )
-    summary = alignment_result.summary
-    utterance_summaries = {
-        group.name.strip("()"): group.counts for group in alignment_result.groups
-    }
-    row_by_id = {str(row["id"]): row for row in rows}
-    row_by_index = {
-        int(row["index"]): row
-        for row in rows
-        if isinstance(row.get("index"), int)
-    }
-    return {
-        "summary": {
-            "ref_words": summary.ref_words,
-            "hyp_words": summary.hyp_words,
-            "correct": summary.correct,
-            "substitutions": summary.substitutions,
-            "deletions": summary.deletions,
-            "insertions": summary.insertions,
-            "sentence_count": summary.sentence_count,
-            "sentence_errors": summary.sentence_errors,
-            "wer": summary.wer,
-            "accuracy": summary.accuracy,
-        },
-        "utterances": [
-            _wer_utterance_to_payload(
-                utterance=utterance,
-                fallback_index=index,
-                summary=utterance_summaries[utterance.id.strip("()")],
-                row=row_by_id.get(utterance.id.strip("()"))
-                or row_by_index.get(index)
-                or {},
+    ) as stream:
+        for record in stream:
+            utterances.append(
+                _wer_utterance_to_payload(
+                    utterance=record.utterance,
+                    fallback_index=record.sequence + 1,
+                    summary=record.counts,
+                    row=row_by_id.get(record.utterance.id.strip("()"), {}),
+                )
             )
-            for index, utterance in enumerate(alignment_result.utterances, start=1)
-        ],
-    }
+        summary = stream.result().summary
+    return {"summary": _wer_counts_to_payload(summary), "utterances": utterances}
+
+
+def _publish_asr_metrics(job: EvaluationJob, row: dict[str, Any]) -> None:
+    """每条识别完成即对齐；仅发送增量，快照保留当前完整报告。"""
+    for metric, build_report in (("wer", _build_wer_report), ("cer", _build_cer_report)):
+        report = build_report([row])
+        utterance = report["utterances"][0]
+        with job.lock:
+            result = dict(job.result or {})
+            previous = result.get(f"{metric}_report", {})
+            counts = report["summary"]
+            old_counts = previous.get("summary", {})
+            summary = {
+                key: value + old_counts.get(key, 0)
+                for key, value in counts.items()
+                if key not in ("wer", "accuracy")
+            }
+            errors = summary["substitutions"] + summary["deletions"] + summary["insertions"]
+            # 与 sclite 的 pct 保持相同运算顺序，避免浮点末位差异。
+            summary["wer"] = (
+                errors / summary["ref_words"] * 100.0 if summary["ref_words"] else 0.0
+            )
+            summary["accuracy"] = 100.0 - summary["wer"]
+            result[f"{metric}_report"] = {
+                "summary": summary,
+                "utterances": [*previous.get("utterances", []), utterance],
+            }
+            result[metric] = summary["wer"]
+            accuracy_key = "word_accuracy" if metric == "wer" else "character_accuracy"
+            result[accuracy_key] = summary["accuracy"]
+            if metric == "wer":
+                result["accuracy"] = summary["accuracy"]
+            job.result = result
+            message_manager.put(
+                ManagedMessage(
+                    job_id=job.job_id,
+                    event_name="metric_result",
+                    payload={"metric": metric, "utterance": utterance, "summary": summary},
+                )
+            )
 
 
 def _wer_utterance_to_payload(

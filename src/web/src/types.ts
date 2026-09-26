@@ -76,6 +76,12 @@ export interface EvaluationProgress {
   sqa_scores?: SqaScore[];
 }
 
+export interface MetricProgress {
+  metric: "wer" | "cer";
+  utterance: WerReport["utterances"][number];
+  summary: WerReport["summary"];
+}
+
 export interface EvaluationSnapshot {
   job_id: string;
   status: JobStatus;

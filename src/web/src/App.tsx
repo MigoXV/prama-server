@@ -7,6 +7,7 @@ import {
   Upload,
   Pause,
   Play,
+  RefreshCw,
   Server,
   Settings,
   TriangleAlert,
@@ -27,6 +28,13 @@ import {
 } from "./components/ui";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DirectoryBrowserDialog } from "./components/DirectoryBrowserDialog";
+import {
+  deriveVadEvent,
+  VadEvaluationReport,
+  VadRunInformationDrawer,
+  VadRunWorkspace,
+  type VadDiagnosisFilter,
+} from "./components/VadEvaluationReport";
 import { usePersistentState } from "./hooks/usePersistentState";
 import packageJson from "../package.json";
 import {
@@ -198,6 +206,8 @@ type EvaluationRunState = {
   errorMessage: string;
   connectionWarning: string;
   busy: boolean;
+  request: EvaluationRequest | null;
+  events: string[];
 };
 type TaskEventClosers = Record<EvaluationTask, (() => void) | null>;
 type MarkdownBlock =
@@ -216,6 +226,8 @@ const EMPTY_RUN_STATE: EvaluationRunState = {
   errorMessage: "",
   connectionWarning: "",
   busy: false,
+  request: null,
+  events: [],
 };
 
 function createRunState(): EvaluationRunState {
@@ -264,6 +276,10 @@ export default function App() {
   const [datasetUploading, setDatasetUploading] = useState(false);
   const [activeModule, setActiveModule] = useState<ConsoleModule>("evaluation");
   const [activeTab, setActiveTab] = useState<"overview" | "report">("overview");
+  const [vadDiagnosisFilter, setVadDiagnosisFilter] =
+    useState<VadDiagnosisFilter>("all");
+  const [vadConfigOpen, setVadConfigOpen] = useState(false);
+  const [runInformationOpen, setRunInformationOpen] = useState(false);
   const [activeAlignmentMetric, setActiveAlignmentMetric] =
     useState<AlignmentMetric>("wer");
   const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
@@ -288,6 +304,8 @@ export default function App() {
   const errorMessage = activeRunState.errorMessage;
   const connectionWarning = activeRunState.connectionWarning;
   const busy = activeRunState.busy;
+  const runRequest = activeRunState.request;
+  const runEvents = activeRunState.events;
 
   function updateTaskRunState(
     task: EvaluationTask,
@@ -441,6 +459,8 @@ export default function App() {
       task,
     }));
     setDirectoryBrowserPath(nextTaskRemembered.dataset_path);
+    setVadConfigOpen(false);
+    setRunInformationOpen(false);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -465,7 +485,13 @@ export default function App() {
         errorMessage: "",
         connectionWarning: "",
         busy: true,
+        request,
+        events: ["任务已创建，等待服务处理"],
       });
+      if (request.task === "vad") {
+        setVadConfigOpen(false);
+        setActiveTab("overview");
+      }
       subscribeToEvaluation(created.job_id, request.task);
     } catch (error) {
       updateTaskRunState(requestTask, (current) => ({
@@ -521,7 +547,12 @@ export default function App() {
       finalResult: snapshot.result,
       errorMessage: snapshot.error ?? "",
       busy: snapshot.status === "queued" || snapshot.status === "running",
+      request: snapshot.request,
     });
+    if (snapshot.request.task === "vad" && snapshot.status === "completed") {
+      setVadConfigOpen(false);
+      setActiveTab("overview");
+    }
   }
 
   function subscribeToEvaluation(nextJobId: string, task: EvaluationTask) {
@@ -534,7 +565,31 @@ export default function App() {
           progress: nextProgress,
           status: nextProgress.status ?? "running",
           finalResult: nextProgress.result ?? current.finalResult,
+          events: appendRunEvent(current.events, deriveVadEvent(nextProgress)),
         }));
+      },
+      onMetricSnapshot: (result) => {
+        updateTaskRunState(task, (current) => ({ ...current, finalResult: result }));
+      },
+      onMetric: ({ metric, utterance, summary }) => {
+        updateTaskRunState(task, (current) => {
+          const result = current.finalResult ?? {};
+          const key = metric === "wer" ? "wer_report" : "cer_report";
+          const previous = result[key];
+          if (previous && previous.summary.sentence_count >= summary.sentence_count) {
+            return current;
+          }
+          return {
+            ...current,
+            finalResult: {
+              ...result,
+              [metric]: summary.wer,
+              [metric === "wer" ? "word_accuracy" : "character_accuracy"]: summary.accuracy,
+              ...(metric === "wer" ? { accuracy: summary.accuracy } : {}),
+              [key]: { summary, utterances: [...(previous?.utterances ?? []), utterance] },
+            },
+          };
+        });
       },
       onPartialProgress: (nextProgress) => {
         updateTaskRunState(task, (current) => ({
@@ -542,6 +597,7 @@ export default function App() {
           connectionWarning: "",
           progress: nextProgress,
           status: nextProgress.status ?? "running",
+          events: appendRunEvent(current.events, deriveVadEvent(nextProgress)),
         }));
       },
       onDone: (snapshot) => {
@@ -626,6 +682,16 @@ export default function App() {
     setDirectoryBrowserPath(DEFAULT_FORM_STATE.dataset_path);
     setResetDialogOpen(false);
     setLiveNotice("已恢复默认值");
+  }
+
+  function openVadReevaluation() {
+    if (runRequest) {
+      setFormState((current) => mergeReevaluationFormState(current, runRequest));
+      setDirectoryBrowserPath(runRequest.dataset_path);
+    }
+    setRunInformationOpen(false);
+    setVadConfigOpen(true);
+    setActiveTab("overview");
   }
 
   async function copyText(value: string) {
@@ -749,10 +815,15 @@ export default function App() {
           }`}
         >
         {activeModule === "evaluation" ? (
-          <header className="workspace-header">
+          <header className={`workspace-header ${isVad && status === "completed" && !vadConfigOpen ? "vad-report-header" : ""}`}>
             <div className="workspace-title-row">
-              <h1>{evaluationTaskTitle(formState.task)}</h1>
-              <div
+              <div className="workspace-title-copy">
+                <h1>{isVad && status === "completed" && !vadConfigOpen ? "VAD 评估报告" : evaluationTaskTitle(formState.task)}</h1>
+                {isVad && status === "completed" && !vadConfigOpen ? (
+                  <p>{runRequest?.target || formState.target} · {runRequest?.dataset_path || formState.dataset_path} / {runRequest?.split || formState.split} · {formatNumber(finalResult?.included_sample_count ?? finalResult?.sample_count ?? finalResult?.vad_report?.samples.length)} 条</p>
+                ) : null}
+              </div>
+              {!isVad || (status === "completed" && !vadConfigOpen) ? <div
                 className="page-tabs"
                 role="tablist"
                 aria-label="评估视图"
@@ -773,7 +844,7 @@ export default function App() {
                   id="evaluation-overview-tab"
                   controls="evaluation-overview-panel"
                   active={activeTab === "overview"}
-                  label="运行概览"
+                  label={isVad ? "评估总览" : "运行概览"}
                   onClick={() => setActiveTab("overview")}
                 />
                 <TabButton
@@ -782,7 +853,7 @@ export default function App() {
                   active={activeTab === "report"}
                   label={
                     isVad
-                      ? "VAD 指标"
+                      ? "样本诊断"
                       : isLid
                         ? "LID 报告"
                         : isKeyword
@@ -793,10 +864,16 @@ export default function App() {
                   }
                   onClick={() => setActiveTab("report")}
                 />
-              </div>
+              </div> : null}
             </div>
             <div className="header-actions">
               <StatusPill status={status} />
+              {isVad && status === "completed" && !vadConfigOpen ? (
+                <button type="button" className="vad-reevaluate-action" onClick={openVadReevaluation}>
+                  <RefreshCw size={15} />
+                  <span>重新评估</span>
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="export-action"
@@ -807,6 +884,11 @@ export default function App() {
                 <Download size={16} />
                 <span>导出</span>
               </button>
+              {isVad && status === "completed" && !vadConfigOpen ? (
+                <button type="button" className="export-action run-information-action" onClick={() => setRunInformationOpen(true)}>
+                  运行信息
+                </button>
+              ) : null}
             </div>
           </header>
         ) : null}
@@ -814,12 +896,16 @@ export default function App() {
         <section
           className={`work-grid ${
             activeModule === "evaluation" ? "" : "single-column"
-          } ${activeModule === "evaluation" && activeTab === "report" ? "report-full" : ""}`}
+          } ${activeModule === "evaluation" && activeTab === "report" ? "report-full" : ""} ${
+            activeModule === "evaluation" && isVad && (status === "idle" || vadConfigOpen) ? "single-column vad-config-mode" : ""
+          } ${activeModule === "evaluation" && isVad && status !== "idle" && !vadConfigOpen ? "report-full vad-run-full" : ""} ${
+            activeModule === "evaluation" && isVad && status === "completed" && !vadConfigOpen ? "vad-report-full" : ""
+          }`}
         >
-          {activeModule === "evaluation" && activeTab === "overview" ? (
+          {activeModule === "evaluation" && activeTab === "overview" && (!isVad || status === "idle" || vadConfigOpen) ? (
             <form
               ref={formRef}
-              className="panel evaluation-form"
+              className={`panel evaluation-form ${isVad ? "vad-evaluation-form" : ""}`}
               onSubmit={handleSubmit}
             >
               <div className="panel-heading">
@@ -828,6 +914,11 @@ export default function App() {
                   <span>设置引擎、数据集与运行范围</span>
                 </div>
               </div>
+              {isVad && vadConfigOpen && finalResult ? (
+                <p className="vad-reevaluation-note">
+                  数据源沿用本次任务，高级参数使用当前设置。
+                </p>
+              ) : null}
 
               <div className="field-grid">
                 <div className="engine-target-row">
@@ -905,8 +996,13 @@ export default function App() {
 
               <div className="form-action-bar">
                 <Button type="submit" className="primary-action" disabled={busy || datasetUploading} stretch>
-                  {busy ? "评估中..." : "启动评估"}
+                  {busy ? "评估中..." : isVad && vadConfigOpen ? "创建重新评估任务" : "启动评估"}
                 </Button>
+                {isVad && vadConfigOpen && finalResult ? (
+                  <GhostButton className="vad-config-cancel" onClick={() => setVadConfigOpen(false)}>
+                    返回当前报告
+                  </GhostButton>
+                ) : null}
               </div>
             </form>
           ) : null}
@@ -1212,7 +1308,7 @@ export default function App() {
             </section>
           ) : null}
 
-          {activeModule === "evaluation" ? (
+          {activeModule === "evaluation" && (!isVad || (status !== "idle" && !vadConfigOpen)) ? (
           <section
             id={`evaluation-${activeTab}-panel`}
             role="tabpanel"
@@ -1221,6 +1317,33 @@ export default function App() {
               activeTab === "report" ? "report-column" : "overview-column"
             } status-${status}`}
           >
+            {isVad ? (
+              status === "completed" && finalResult ? (
+                <VadEvaluationReport
+                  result={finalResult}
+                  request={runRequest}
+                  view={activeTab === "report" ? "diagnosis" : "overview"}
+                  filter={vadDiagnosisFilter}
+                  onViewChange={(view) => setActiveTab(view === "overview" ? "overview" : "report")}
+                  onFilterChange={setVadDiagnosisFilter}
+                />
+              ) : (
+                <VadRunWorkspace
+                  status={status === "idle" ? "queued" : status}
+                  jobId={jobId}
+                  progress={progress}
+                  request={runRequest}
+                  events={runEvents}
+                  errorMessage={errorMessage}
+                  connectionWarning={connectionWarning}
+                  onEditConfiguration={() => {
+                    if (runRequest) setFormState(requestToFormState(runRequest));
+                    setVadConfigOpen(true);
+                  }}
+                />
+              )
+            ) : (
+              <>
             {activeTab === "overview" ? (
               <>
                 <div className="panel progress-panel">
@@ -1350,11 +1473,7 @@ export default function App() {
             ) : null}
 
             {activeTab === "report" ? (
-              isVad ? (
-                <VadReportPanel
-                  result={finalResult}
-                />
-              ) : isLid ? (
+              isLid ? (
                 <LidReportPanel
                   result={finalResult}
                 />
@@ -1380,6 +1499,8 @@ export default function App() {
                 />
               )
             ) : null}
+              </>
+            )}
           </section>
           ) : null}
         </section>
@@ -1393,6 +1514,14 @@ export default function App() {
             setDirectoryBrowserPath(path);
             setDirectoryBrowserOpen(false);
           }}
+        />
+        <VadRunInformationDrawer
+          open={runInformationOpen && isVad}
+          jobId={jobId}
+          request={runRequest}
+          result={finalResult}
+          onClose={() => setRunInformationOpen(false)}
+          onReevaluate={openVadReevaluation}
         />
         <ConfirmDialog
           isOpen={resetDialogOpen}
@@ -3422,6 +3551,61 @@ function buildRequest(rawState: EvaluationFormState): EvaluationRequest {
     hit_threshold: toNumber(state.hit_threshold, 0.9),
     streaming: state.streaming ?? false,
   };
+}
+
+function requestToFormState(request: EvaluationRequest): EvaluationFormState {
+  return {
+    task: request.task,
+    target: request.target,
+    dataset_path: request.dataset_path,
+    split: request.split,
+    limit: request.limit === null ? "" : String(request.limit),
+    language_code: request.language_code,
+    sample_rate: String(request.sample_rate),
+    min_reference_words: String(request.min_reference_words),
+    hotwords: request.hotwords.join(", "),
+    hotword_bias: String(request.hotword_bias),
+    connect_timeout_seconds: request.connect_timeout_seconds === null ? "" : String(request.connect_timeout_seconds),
+    request_timeout_seconds: String(request.request_timeout_seconds),
+    interim_results: request.interim_results,
+    inference_concurrency: String(request.inference_concurrency),
+    asr_inference_concurrency: String(request.asr_inference_concurrency),
+    vad_inference_concurrency: String(request.vad_inference_concurrency),
+    lid_inference_concurrency: String(request.lid_inference_concurrency),
+    enable_mos: request.enable_mos,
+    mos_target: request.mos_target,
+    enable_snr: request.enable_snr,
+    snr_target: request.snr_target,
+    sqa_inference_concurrency: String(request.sqa_inference_concurrency),
+    lid_confidence_threshold: String(request.lid_confidence_threshold),
+    remove_punctuation: request.remove_punctuation,
+    mask_frame_seconds: String(request.mask_frame_seconds),
+    chunk_duration_seconds: String(request.chunk_duration_seconds),
+    speech_padding_seconds: String(request.speech_padding_seconds),
+    hit_threshold: String(request.hit_threshold),
+    streaming: request.streaming,
+  };
+}
+
+function mergeReevaluationFormState(
+  currentState: EvaluationFormState,
+  request: EvaluationRequest,
+): EvaluationFormState {
+  return {
+    ...normalizeFormState(currentState),
+    task: request.task,
+    target: request.target,
+    dataset_path: request.dataset_path,
+    split: request.split,
+    limit: request.limit === null ? "" : String(request.limit),
+  };
+}
+
+function appendRunEvent(events: string[], event: string): string[] {
+  if (!event || events[events.length - 1] === event) {
+    return events;
+  }
+  return [...events, event].slice(-12);
 }
 
 function normalizeFormState(state: EvaluationFormState): EvaluationFormState {

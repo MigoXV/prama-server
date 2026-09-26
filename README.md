@@ -105,3 +105,43 @@ poetry run python -m prama_server.utils.vad_select.app \
 ```
 
 两个工具都先写入同级临时目录，成功后再替换目标目录；覆盖已有目标必须显式传入 `--overwrite`。
+
+## 本地 prama wheel 与逐条指标
+
+当前服务代码使用 prama 0.2.0a1 的 `iter_wer` / `iter_cer`。本地联调通过 pip
+覆盖 Poetry 环境中的包，不修改本项目 `pyproject.toml` 或 `poetry.lock`：
+
+```bash
+(cd /workspace/libs/prama && poetry build)
+poetry run python -m pip install --no-deps --force-reinstall \
+  /workspace/libs/prama/dist/prama-0.2.0a1-cp310-cp310-linux_x86_64.whl
+poetry run python -c 'from importlib.metadata import version; print(version("prama"))'
+```
+
+该 wheel 适用于当前 Linux x86_64 / Python 3.10 环境。重新执行 `poetry install`
+或同步锁定依赖可能恢复旧版本，此时需要重新安装 wheel。已经启动的服务需重启才能加载新包。
+
+ASR 每条最终识别返回后立即计算 WER/CER，通过
+`GET /api/evaluations/{job_id}/events` 发送两个 `metric_result` SSE 事件：
+
+- `metric`：`wer` 或 `cer`。
+- `utterance`：当前样本的标识、逐 token 对齐和本条计数。
+- `summary`：到当前样本的累计计数；`wer` / `accuracy` 为百分数。
+
+前端在任务运行期间更新概览和对齐报告，不必等全部样本完成。重连时用
+`metric_snapshot` 恢复已有报告；`done` 保留完整最终结果格式。ASR 临时转写仍走
+`partial_inference_result`，不计入最终指标。并发任务使用线程；流式 native 对象通过
+上下文管理器释放。最后仍执行完整批量汇总，逐条计数和对齐以实际 sclite 结果为准。
+
+验证命令：
+
+```bash
+poetry run python -m unittest tests.test_asr_metric_stream tests.test_http_recalculate tests.test_http_frontend tests.test_session tests.test_prama_cli tests.test_vad_evaluator -q
+pnpm --dir src/web run lint
+pnpm --dir src/web run build
+pnpm --dir src/web exec playwright test --grep 'ASR 运行中'
+```
+
+流式测试使用真实 wheel 的 C 实现，覆盖 8 线程、空文本、中英文、插入/删除/替换和
+与批量结果的严格比较。SSE 测试仅替代外部 ASR 识别服务，验证第二条识别开始前即可
+读取第一条指标；浏览器测试验证运行中展示对齐结果及重复事件去重。

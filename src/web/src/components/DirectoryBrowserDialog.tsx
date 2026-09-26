@@ -1,5 +1,5 @@
 import { Folder, FolderOpen, RefreshCw, Volume2, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ServerDirectoryListing } from "../types";
 import { Button } from "./ui";
@@ -34,6 +34,7 @@ export function DirectoryBrowserDialog({
   const [error, setError] = useState("");
   const titleId = useId();
   const descriptionId = useId();
+  const pathInputId = useId();
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const requestIdRef = useRef(0);
@@ -117,11 +118,14 @@ export function DirectoryBrowserDialog({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, onClose]);
 
+  function handlePathSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void loadDirectory(requestedPath.trim() || undefined);
+  }
+
   if (!isOpen) {
     return null;
   }
-
-  const currentPath = listing?.currentPath ?? requestedPath;
 
   return createPortal(
     <div className="dialog-backdrop" onMouseDown={(event) => {
@@ -154,73 +158,94 @@ export function DirectoryBrowserDialog({
         </header>
 
         <div className="directory-toolbar">
+          <form className="directory-path-form" onSubmit={handlePathSubmit}>
+            <label htmlFor={pathInputId}>目录路径</label>
+            <div className="directory-path-controls">
+              <input
+                id={pathInputId}
+                value={requestedPath}
+                disabled={loading}
+                onChange={(event) => setRequestedPath(event.target.value)}
+                placeholder="例如 data-bin/audiofolder/asr-demo"
+              />
+              <Button type="submit" variant="ghost" disabled={loading}>
+                打开目录
+              </Button>
+            </div>
+          </form>
           <div className="directory-current-path">
             <span>当前位置</span>
-            <code>{currentPath || "正在读取"}</code>
+            <code>{listing?.currentPath || "尚未读取有效目录"}</code>
           </div>
           <Button
             variant="ghost"
-            disabled={loading || !currentPath}
-            onClick={() => void loadDirectory(currentPath || undefined)}
+            disabled={loading || !listing}
+            onClick={() => void loadDirectory(listing?.currentPath)}
           >
             <RefreshCw size={15} aria-hidden="true" />
             刷新
           </Button>
         </div>
 
-        {error ? (
-          <div className="dialog-error" role="alert">
-            <span>{error}</span>
-            <Button variant="ghost" onClick={() => void loadDirectory(currentPath || undefined)}>
-              重新读取
-            </Button>
-          </div>
-        ) : null}
+        <div className="directory-content">
+          {error ? (
+            <div className="dialog-error" role="alert">
+              <span>{error}</span>
+              <Button variant="ghost" onClick={() => void loadDirectory(requestedPath.trim() || undefined)}>
+                重新读取
+              </Button>
+            </div>
+          ) : null}
 
-        <div className="directory-list" aria-busy={loading}>
-          {listing?.parentPath ? (
-            <button
-              type="button"
-              className="directory-row"
-              disabled={loading}
-              onClick={() => void loadDirectory(listing.parentPath ?? undefined)}
-            >
-              <FolderOpen size={18} aria-hidden="true" />
-              <span>上级目录</span>
-            </button>
-          ) : null}
-          {loading && !listing ? (
-            <div className="directory-empty" role="status">正在读取目录…</div>
-          ) : null}
-          {!loading && listing && listing.entries.length === 0 ? (
-            <div className="directory-empty">当前目录为空</div>
-          ) : null}
-          {listing?.entries.map((entry) =>
-            entry.kind === "directory" ? (
+          <div className="directory-list" aria-busy={loading}>
+            {listing?.parentPath ? (
               <button
                 type="button"
                 className="directory-row"
-                key={entry.path}
                 disabled={loading}
-                onClick={() => void loadDirectory(entry.path)}
+                onClick={() => void loadDirectory(listing.parentPath ?? undefined)}
               >
-                <Folder size={18} aria-hidden="true" />
-                <span>{entry.name}</span>
+                <FolderOpen size={18} aria-hidden="true" />
+                <span>上级目录</span>
               </button>
-            ) : (
-              <div className="directory-row directory-file" key={entry.path}>
-                <Volume2 size={18} aria-hidden="true" />
-                <span>{entry.name}</span>
-              </div>
-            ),
-          )}
+            ) : null}
+            {loading && !listing ? (
+              <div className="directory-empty" role="status">正在读取目录…</div>
+            ) : null}
+            {!loading && listing && listing.entries.length === 0 ? (
+              <div className="directory-empty">当前目录为空</div>
+            ) : null}
+            {listing?.entries.map((entry) =>
+              entry.kind === "directory" ? (
+                <button
+                  type="button"
+                  className="directory-row"
+                  key={entry.path}
+                  disabled={loading}
+                  onClick={() => void loadDirectory(entry.path)}
+                >
+                  <Folder size={18} aria-hidden="true" />
+                  <span>{entry.name}</span>
+                </button>
+              ) : (
+                <div className="directory-row directory-file" key={entry.path}>
+                  <Volume2 size={18} aria-hidden="true" />
+                  <span>{entry.name}</span>
+                </div>
+              ),
+            )}
+          </div>
         </div>
 
         <footer className="dialog-footer">
           <p id={descriptionId}>选择后将扫描当前目录中的音频文件。</p>
           <Button
-            disabled={!currentPath || loading}
-            onClick={() => onSelect(currentPath)}
+            disabled={!listing || loading}
+            onClick={() => {
+              if (listing) {
+                onSelect(listing.currentPath);
+              }
+            }}
           >
             选择当前目录
           </Button>
