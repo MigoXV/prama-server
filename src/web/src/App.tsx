@@ -1,4106 +1,879 @@
 import {
   Activity,
-  BookOpen,
-  CircleDashed,
-  Clipboard,
+  ArrowRight,
+  Check,
   Download,
-  Upload,
-  Pause,
-  Play,
+  FolderOpen,
+  Plus,
   RefreshCw,
-  Server,
-  Settings,
-  TriangleAlert,
+  Upload,
 } from "lucide-react";
-import katex from "katex";
-import "katex/dist/katex.min.css";
-import type { ChangeEvent, FormEvent, MouseEvent, ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Button,
-  Field,
-  GhostButton,
-  MetricTile,
-  SidebarPane,
-  StatusChip,
-  WorkbenchShell,
-  WorkspacePane,
-} from "./components/ui";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { AppShell } from "./components/AppShell";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DirectoryBrowserDialog } from "./components/DirectoryBrowserDialog";
-import {
-  deriveVadEvent,
-  VadEvaluationReport,
-  VadRunInformationDrawer,
-  VadRunWorkspace,
-  type VadDiagnosisFilter,
-} from "./components/VadEvaluationReport";
+import { MarkdownDocument, StatusPill, TextField } from "./components/Reports";
+import { Button } from "./components/ui";
 import { usePersistentState } from "./hooks/usePersistentState";
-import packageJson from "../package.json";
+import { useRoute, type EvaluationView } from "./hooks/useRoute";
+import {
+  AdvancedSettings,
+  ConnectionTest,
+  FIELD_LABELS,
+  RequestSummary,
+} from "./features/evaluation/Configuration";
+import { ReportWorkspace } from "./features/evaluation/ReportWorkspace";
+import {
+  buildRequest,
+  DEFAULT_FORM_STATE,
+  initialDraft,
+  mergeReevaluationFormState,
+  migratedDrafts,
+  normalizeFormState,
+  readStored,
+  TASKS,
+  taskLabel,
+} from "./features/evaluation/model";
+import { useEvaluationJobs } from "./features/evaluation/useEvaluationJobs";
 import {
   createEvaluation,
   getHelpDocument,
-  getEvaluation,
   listServerDirectory,
-  subscribeEvaluationEvents,
-  testEngineConnectivity,
   uploadDatasetFiles,
 } from "./services/evaluations";
 import type {
   EvaluationFormState,
-  EvaluationProgress,
   EvaluationRequest,
-  EvaluationResult,
-  EvaluationSnapshot,
   EvaluationTask,
-  DenoiseReportSample,
   HelpDocument,
-  JobStatus,
-  KeywordAudioReportSample,
-  KeywordReportSample,
-  LidReportSample,
-  SqaScore,
-  SqaSummary,
-  VadReportRegion,
-  VadReportSample,
-  VadReportSegment,
-  WerReport,
-  WerSummary,
-  WerToken,
-  WerUtterance,
 } from "./types";
 
-const DEFAULT_FORM_STATE: EvaluationFormState = {
-  task: "asr",
-  target: "192.168.0.222:50011",
-  dataset_path: "data-bin/audiofolder/asr-demo",
-  split: "test",
-  limit: "",
-  language_code: "en-US",
-  sample_rate: "16000",
-  min_reference_words: "5",
-  hotwords: "",
-  hotword_bias: "0",
-  connect_timeout_seconds: "10",
-  request_timeout_seconds: "60",
-  interim_results: true,
-  inference_concurrency: "0",
-  asr_inference_concurrency: "0",
-  vad_inference_concurrency: "0",
-  lid_inference_concurrency: "0",
-  enable_mos: false,
-  mos_target: "",
-  enable_snr: false,
-  snr_target: "",
-  sqa_inference_concurrency: "0",
-  lid_confidence_threshold: "0",
-  remove_punctuation: false,
-  mask_frame_seconds: "0.01",
-  chunk_duration_seconds: "0.1",
-  speech_padding_seconds: "0",
-  hit_threshold: "0.9",
-  streaming: false,
-};
-const KEYWORD_REPORT_INITIAL_VISIBLE = 100;
-const KEYWORD_REPORT_LOAD_STEP = 100;
-
-const APP_VERSION = packageJson.version;
-
-const LAST_EVALUATION_JOB_KEY = "prama.lastEvaluationJobId";
-const VAD_TIMELINE_LABEL_WIDTH = 88;
-const VAD_TIMELINE_PIXELS_PER_SECOND = 24;
-const VAD_TIMELINE_MIN_WIDTH = 760;
-
-const TASK_DEFAULTS: Record<EvaluationTask, Partial<EvaluationFormState>> = {
-  asr: {
-    target: "192.168.0.222:50011",
-    dataset_path: "data-bin/audiofolder/asr-demo",
-    min_reference_words: "5",
-  },
-  vad: {
-    target: "192.168.0.222:50021",
-    dataset_path: "data-bin/audiofolder/vad-demo",
-    min_reference_words: "0",
-  },
-  lid: {
-    target: "192.168.0.222:50026",
-    dataset_path: "data-bin/audiofolder/lid-demo",
-    min_reference_words: "0",
-  },
-  keyword: {
-    target: "192.168.0.222:50011",
-    dataset_path: "data-bin/audiofolder/keyword-demo",
-    min_reference_words: "0",
-  },
-  denoise: {
-    target: "192.168.0.222:50027",
-    dataset_path: "data-bin/audiofolder/denoise-demo",
-    min_reference_words: "0",
-  },
-};
-
-type TaskRememberedFields = Pick<EvaluationFormState, "target" | "dataset_path">;
-
-const TASK_REMEMBERED_DEFAULTS: Record<EvaluationTask, TaskRememberedFields> = {
-  asr: {
-    target: "192.168.0.222:50011",
-    dataset_path: "data-bin/audiofolder/asr-demo",
-  },
-  vad: {
-    target: "192.168.0.222:50021",
-    dataset_path: "data-bin/audiofolder/vad-demo",
-  },
-  lid: {
-    target: "192.168.0.222:50026",
-    dataset_path: "data-bin/audiofolder/lid-demo",
-  },
-  keyword: {
-    target: "192.168.0.222:50011",
-    dataset_path: "data-bin/audiofolder/keyword-demo",
-  },
-  denoise: {
-    target: "192.168.0.222:50027",
-    dataset_path: "data-bin/audiofolder/denoise-demo",
-  },
-};
-
-const STATUS_LABELS: Record<JobStatus | "idle" | "started", string> = {
-  idle: "未启动",
-  queued: "排队中",
-  running: "运行中",
-  started: "已开始",
-  completed: "已完成",
-  failed: "失败",
-};
-
-type ConsoleModule = "evaluation" | "settings" | "help";
-
-const MODULES: Array<{
-  id: ConsoleModule;
-  label: string;
-  icon: typeof Activity;
-}> = [
-  { id: "evaluation", label: "在线评估", icon: Activity },
-  { id: "settings", label: "设置", icon: Settings },
-  { id: "help", label: "帮助", icon: BookOpen },
-];
-
-type AlignmentMetric = "wer" | "cer";
-type ReportSortMode =
-  | "index-asc"
-  | "index-desc"
-  | "wer-desc"
-  | "wer-asc"
-  | "cer-desc"
-  | "cer-asc";
-type ConnectivityState = "idle" | "testing" | "ok" | "failed";
-type ConnectivityStatus = {
-  state: ConnectivityState;
-  message: string;
-};
-type EvaluationRunState = {
-  status: JobStatus | "idle" | "started";
-  jobId: string;
-  progress: EvaluationProgress | null;
-  finalResult: EvaluationResult | null;
-  errorMessage: string;
-  connectionWarning: string;
-  busy: boolean;
-  request: EvaluationRequest | null;
-  events: string[];
-};
-type TaskEventClosers = Record<EvaluationTask, (() => void) | null>;
-type MarkdownBlock =
-  | { type: "heading"; level: 1 | 2 | 3; text: string; id: string }
-  | { type: "paragraph"; text: string }
-  | { type: "list"; items: string[] }
-  | { type: "code"; language: string; text: string }
-  | { type: "formula"; text: string }
-  | { type: "table"; headers: string[]; rows: string[][] };
-
-const EMPTY_RUN_STATE: EvaluationRunState = {
-  status: "idle",
-  jobId: "",
-  progress: null,
-  finalResult: null,
-  errorMessage: "",
-  connectionWarning: "",
-  busy: false,
-  request: null,
-  events: [],
-};
-
-function createRunState(): EvaluationRunState {
-  return { ...EMPTY_RUN_STATE };
-}
-
-function createTaskRunStates(): Record<EvaluationTask, EvaluationRunState> {
-  return {
-    asr: createRunState(),
-    vad: createRunState(),
-    lid: createRunState(),
-    keyword: createRunState(),
-    denoise: createRunState(),
-  };
-}
-
-function createTaskEventClosers(): TaskEventClosers {
-  return {
-    asr: null,
-    vad: null,
-    lid: null,
-    keyword: null,
-    denoise: null,
-  };
-}
-
 export default function App() {
-  const [storedFormState, setFormState] = usePersistentState<EvaluationFormState>(
-    "prama.evaluationForm",
-    DEFAULT_FORM_STATE,
+  const { route, navigate, query } = useRoute();
+  const [defaults, setDefaults] = usePersistentState(
+    "prama.defaults",
+    normalizeFormState(readStored("prama.evaluationForm", DEFAULT_FORM_STATE)),
   );
-  const formState = normalizeFormState(storedFormState);
-  const [taskRememberedFields, setTaskRememberedFields] = usePersistentState<
-    Record<EvaluationTask, TaskRememberedFields>
-  >("prama.taskRememberedFields", TASK_REMEMBERED_DEFAULTS);
-  const [runStates, setRunStates] = useState<Record<EvaluationTask, EvaluationRunState>>(
-    () => createTaskRunStates(),
+  const [seed] = useState(migratedDrafts);
+  const [drafts, setDrafts] = usePersistentState<
+    Partial<Record<EvaluationTask, EvaluationFormState>>
+  >("prama.drafts", seed);
+  const task = (
+    TASKS.some((t) => t.id === route.params.get("task"))
+      ? route.params.get("task")
+      : "asr"
+  ) as EvaluationTask;
+  const draft = normalizeFormState(
+    drafts[task] ?? initialDraft(task, defaults),
   );
-  const [rememberedJobId, setRememberedJobId] = usePersistentState<string>(
-    LAST_EVALUATION_JOB_KEY,
-    "",
+  const { jobs, latest, load, register } = useEvaluationJobs();
+  const record = route.jobId ? jobs[route.jobId] : undefined;
+  const snapshot = record?.snapshot;
+  const view = (
+    ["run", "report", "diagnosis", "configuration"].includes(
+      route.params.get("view") ?? "",
+    )
+      ? route.params.get("view")
+      : "run"
+  ) as EvaluationView;
+  const [directoryOpen, setDirectoryOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false),
+    [uploading, setUploading] = useState(false),
+    [formError, setFormError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [settings, setSettings] = useState(defaults),
+    [settingsDirty, setSettingsDirty] = useState(false),
+    [resetOpen, setResetOpen] = useState(false);
+  const [help, setHelp] = useState<HelpDocument | null>(null),
+    [helpError, setHelpError] = useState(""),
+    [helpAttempt, setHelpAttempt] = useState(0);
+  const upload = useRef<HTMLInputElement>(null);
+  const previousPage = useRef(route.page);
+  const sourceId = route.params.get("from");
+  const sourceRequest = sourceId
+    ? jobs[sourceId]?.snapshot?.request
+    : undefined;
+  const activeSameTask = latest[task]
+    ? jobs[latest[task]!]?.snapshot
+    : undefined;
+  const blocked =
+    activeSameTask?.status === "queued" || activeSameTask?.status === "running";
+  const differences = useMemo(
+    () =>
+      sourceRequest
+        ? Object.entries(buildRequest(draft)).filter(
+            ([key, value]) =>
+              JSON.stringify(value) !==
+              JSON.stringify(sourceRequest[key as keyof EvaluationRequest]),
+          )
+        : [],
+    [draft, sourceRequest],
   );
-  const [connectivityStatus, setConnectivityStatus] = useState<
-    Record<string, ConnectivityStatus>
-  >({});
-  const [datasetUploading, setDatasetUploading] = useState(false);
-  const [activeModule, setActiveModule] = useState<ConsoleModule>("evaluation");
-  const [activeTab, setActiveTab] = useState<"overview" | "report">("overview");
-  const [vadDiagnosisFilter, setVadDiagnosisFilter] =
-    useState<VadDiagnosisFilter>("all");
-  const [vadConfigOpen, setVadConfigOpen] = useState(false);
-  const [runInformationOpen, setRunInformationOpen] = useState(false);
-  const [activeAlignmentMetric, setActiveAlignmentMetric] =
-    useState<AlignmentMetric>("wer");
-  const [reportSort, setReportSort] = useState<ReportSortMode>("index-asc");
-  const [wrapWerAlignment, setWrapWerAlignment] = useState(false);
-  const [helpDocument, setHelpDocument] = useState<HelpDocument | null>(null);
-  const [helpError, setHelpError] = useState("");
-  const evaluationConnectivityKey = `evaluation:${formState.task}`;
-  const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
-  const [directoryBrowserPath, setDirectoryBrowserPath] = useState(
-    formState.dataset_path,
-  );
-  const [resetDialogOpen, setResetDialogOpen] = useState(false);
-  const [liveNotice, setLiveNotice] = useState("");
-  const eventClosersRef = useRef<TaskEventClosers>(createTaskEventClosers());
-  const datasetUploadInputRef = useRef<HTMLInputElement | null>(null);
-  const formRef = useRef<HTMLFormElement | null>(null);
-  const activeRunState = runStates[formState.task] ?? EMPTY_RUN_STATE;
-  const status = activeRunState.status;
-  const jobId = activeRunState.jobId;
-  const progress = activeRunState.progress;
-  const finalResult = activeRunState.finalResult;
-  const errorMessage = activeRunState.errorMessage;
-  const connectionWarning = activeRunState.connectionWarning;
-  const busy = activeRunState.busy;
-  const runRequest = activeRunState.request;
-  const runEvents = activeRunState.events;
-
-  function updateTaskRunState(
-    task: EvaluationTask,
-    update:
-      | Partial<EvaluationRunState>
-      | ((current: EvaluationRunState) => EvaluationRunState),
-  ) {
-    setRunStates((current) => {
-      const currentTaskState = current[task] ?? createRunState();
-      const nextTaskState =
-        typeof update === "function"
-          ? update(currentTaskState)
-          : { ...currentTaskState, ...update };
-      return {
-        ...current,
-        [task]: nextTaskState,
-      };
-    });
-  }
-
   useEffect(() => {
-    return () => {
-      Object.values(eventClosersRef.current).forEach((closeEvents) => {
-        closeEvents?.();
-      });
-    };
-  }, []);
-
+    if (route.page === "job" && route.jobId) void load(route.jobId);
+  }, [route.page, route.jobId, load]);
   useEffect(() => {
-    if (
-      activeModule !== "evaluation" ||
-      jobId ||
-      activeRunState.busy ||
-      !rememberedJobId
-    ) {
-      return;
+    if (sourceId && !jobs[sourceId]) void load(sourceId);
+  }, [sourceId, load, jobs]);
+  useEffect(() => {
+    if (route.page !== previousPage.current) {
+      setFormError("");
+      previousPage.current = route.page;
     }
-
-    let canceled = false;
-    getEvaluation(rememberedJobId)
-      .then((snapshot) => {
-        if (canceled) {
-          return;
-        }
-        applyEvaluationSnapshot(snapshot);
-        if (snapshot.status === "queued" || snapshot.status === "running") {
-          subscribeToEvaluation(snapshot.job_id, snapshot.request.task);
-        }
-      })
-      .catch((error) => {
-        if (canceled) {
-          return;
-        }
-        const message =
-          error instanceof Error ? error.message : "最近评估任务恢复失败";
-        if (message.includes("评估任务不存在")) {
-          setRememberedJobId("");
-          return;
-        }
-        updateTaskRunState(formState.task, {
-          connectionWarning: message,
-        });
-      });
-
-    return () => {
-      canceled = true;
-    };
-  }, [activeModule, rememberedJobId, jobId, activeRunState.busy, formState.task]);
-
+  }, [route.page]);
   useEffect(() => {
-    datasetUploadInputRef.current?.setAttribute("webkitdirectory", "");
-  }, [activeModule]);
-
-  useEffect(() => {
-    if (activeModule !== "help" || helpDocument || helpError) {
-      return;
-    }
+    if (route.page !== "help" || help) return;
     let canceled = false;
+    setHelpError("");
     getHelpDocument()
-      .then((document) => {
-        if (!canceled) {
-          setHelpDocument(document);
-        }
+      .then((x) => {
+        if (!canceled) setHelp(x);
       })
-      .catch((error) => {
-        if (!canceled) {
-          setHelpError(error instanceof Error ? error.message : "帮助文档加载失败");
-        }
+      .catch((e) => {
+        if (!canceled) setHelpError(e.message);
       });
     return () => {
       canceled = true;
     };
-  }, [activeModule, helpDocument, helpError]);
-
+  }, [route.page, helpAttempt, help]);
   useEffect(() => {
-    function handleGlobalKeyDown(event: KeyboardEvent) {
-      if (event.key !== "Enter" || event.repeat || busy) {
-        return;
-      }
-      if (isEditableTarget(event.target)) {
-        return;
-      }
-      event.preventDefault();
-      formRef.current?.requestSubmit();
-    }
-
-    window.addEventListener("keydown", handleGlobalKeyDown);
-    return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, [busy]);
-
-  useEffect(() => {
-    if (!liveNotice) {
-      return;
-    }
-    const timeout = window.setTimeout(() => setLiveNotice(""), 2400);
-    return () => window.clearTimeout(timeout);
-  }, [liveNotice]);
-
-  const progressPercent = useMemo(() => {
-    const total = progress?.total ?? 0;
-    const processed = progress?.processed ?? 0;
-    return total > 0 ? Math.min((processed / total) * 100, 100) : 0;
-  }, [progress]);
-
-  const werReport = finalResult?.wer_report;
-  const cerReport = finalResult?.cer_report;
-  const lidReport = finalResult?.lid_report;
-  const denoiseReport = finalResult?.denoise_report;
-  const keywordReport = finalResult?.keyword_report;
-  const canExport = finalResult !== null;
-  const displayTask = formState.task;
-  const isVad = displayTask === "vad";
-  const isLid = displayTask === "lid";
-  const isDenoise = displayTask === "denoise";
-  const isKeyword = displayTask === "keyword";
-
-  function handleTaskChange(task: EvaluationTask) {
-    if (task === formState.task) {
-      return;
-    }
-    const nextTaskRemembered =
-      taskRememberedFields[task] ?? TASK_REMEMBERED_DEFAULTS[task];
-    setTaskRememberedFields((current) => ({
-      ...current,
-      [formState.task]: pickTaskRememberedFields(formState),
-    }));
-    setFormState((current) => ({
-      ...current,
-      ...TASK_DEFAULTS[task],
-      ...nextTaskRemembered,
-      task,
-    }));
-    setDirectoryBrowserPath(nextTaskRemembered.dataset_path);
-    setVadConfigOpen(false);
-    setRunInformationOpen(false);
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 4000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+  function change(patch: Partial<EvaluationFormState>) {
+    setDrafts((d) => ({ ...d, [task]: { ...draft, ...patch } }));
+    setFormError("");
   }
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const requestTask = formState.task;
-    updateTaskRunState(requestTask, {
-      busy: true,
-      errorMessage: "",
-      connectionWarning: "",
-    });
-
+  function chooseTask(next: EvaluationTask) {
+    setDrafts((d) => ({ ...d, [task]: draft }));
+    query({ task: next, from: null });
+    setFormError("");
+  }
+  async function submit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (submitting || blocked) return;
+    setSubmitting(true);
+    setFormError("");
     try {
-      const request = buildRequest(formState);
+      const request = buildRequest(draft);
       const created = await createEvaluation(request);
-      closeTaskEvents(request.task);
-      setRememberedJobId(created.job_id);
-      updateTaskRunState(request.task, {
+      register({
+        job_id: created.job_id,
         status: created.status,
-        jobId: created.job_id,
-        progress: null,
-        finalResult: null,
-        errorMessage: "",
-        connectionWarning: "",
-        busy: true,
         request,
-        events: ["任务已创建，等待服务处理"],
+        result: null,
+        progress: null,
+        error: null,
       });
-      if (request.task === "vad") {
-        setVadConfigOpen(false);
-        setActiveTab("overview");
-      }
-      subscribeToEvaluation(created.job_id, request.task);
-    } catch (error) {
-      updateTaskRunState(requestTask, (current) => ({
-        ...current,
-        errorMessage: error instanceof Error ? error.message : "评估任务创建失败",
-        busy: false,
-      }));
-    }
-  }
-
-  async function handleTestConnectivity(key: string, target: string) {
-    const normalizedTarget = target.trim();
-    if (!normalizedTarget) {
-      setConnectivityStatus((current) => ({
-        ...current,
-        [key]: { state: "failed", message: "引擎地址不能为空" },
-      }));
-      return;
-    }
-    setConnectivityStatus((current) => ({
-      ...current,
-      [key]: { state: "testing", message: "测试中" },
-    }));
-    try {
-      const result = await testEngineConnectivity(
-        normalizedTarget,
-        toOptionalNumber(formState.connect_timeout_seconds),
-      );
-      setConnectivityStatus((current) => ({
-        ...current,
-        [key]: {
-          state: result.ok ? "ok" : "failed",
-          message: result.message,
-        },
-      }));
-    } catch (error) {
-      setConnectivityStatus((current) => ({
-        ...current,
-        [key]: {
-          state: "failed",
-          message: error instanceof Error ? error.message : "连接测试失败",
-        },
-      }));
-    }
-  }
-
-  function applyEvaluationSnapshot(snapshot: EvaluationSnapshot) {
-    setRememberedJobId(snapshot.job_id);
-    updateTaskRunState(snapshot.request.task, {
-      status: snapshot.status,
-      jobId: snapshot.job_id,
-      progress: snapshot.progress,
-      finalResult: snapshot.result,
-      errorMessage: snapshot.error ?? "",
-      busy: snapshot.status === "queued" || snapshot.status === "running",
-      request: snapshot.request,
-    });
-    if (snapshot.request.task === "vad" && snapshot.status === "completed") {
-      setVadConfigOpen(false);
-      setActiveTab("overview");
-    }
-  }
-
-  function subscribeToEvaluation(nextJobId: string, task: EvaluationTask) {
-    closeTaskEvents(task);
-    const closeEvents = subscribeEvaluationEvents(nextJobId, {
-      onProgress: (nextProgress) => {
-        updateTaskRunState(task, (current) => ({
-          ...current,
-          connectionWarning: "",
-          progress: nextProgress,
-          status: nextProgress.status ?? "running",
-          finalResult: nextProgress.result ?? current.finalResult,
-          events: appendRunEvent(current.events, deriveVadEvent(nextProgress)),
-        }));
-      },
-      onMetricSnapshot: (result) => {
-        updateTaskRunState(task, (current) => ({ ...current, finalResult: result }));
-      },
-      onMetric: ({ metric, utterance, summary }) => {
-        updateTaskRunState(task, (current) => {
-          const result = current.finalResult ?? {};
-          const key = metric === "wer" ? "wer_report" : "cer_report";
-          const previous = result[key];
-          if (previous && previous.summary.sentence_count >= summary.sentence_count) {
-            return current;
-          }
-          return {
-            ...current,
-            finalResult: {
-              ...result,
-              [metric]: summary.wer,
-              [metric === "wer" ? "word_accuracy" : "character_accuracy"]: summary.accuracy,
-              ...(metric === "wer" ? { accuracy: summary.accuracy } : {}),
-              [key]: { summary, utterances: [...(previous?.utterances ?? []), utterance] },
-            },
-          };
-        });
-      },
-      onPartialProgress: (nextProgress) => {
-        updateTaskRunState(task, (current) => ({
-          ...current,
-          connectionWarning: "",
-          progress: nextProgress,
-          status: nextProgress.status ?? "running",
-          events: appendRunEvent(current.events, deriveVadEvent(nextProgress)),
-        }));
-      },
-      onDone: (snapshot) => {
-        applyEvaluationSnapshot(snapshot);
-        if (eventClosersRef.current[task] === closeEvents) {
-          eventClosersRef.current[task] = null;
-        }
-      },
-      onError: (message) => {
-        updateTaskRunState(task, (current) => ({
-          ...current,
-          status: "failed",
-          errorMessage: message,
-          busy: false,
-        }));
-      },
-      onConnectionError: () => {
-        updateTaskRunState(task, (current) => ({
-          ...current,
-          connectionWarning: "事件流连接暂时不可用",
-        }));
-      },
-    });
-    eventClosersRef.current[task] = closeEvents;
-  }
-
-  function closeTaskEvents(task: EvaluationTask) {
-    eventClosersRef.current[task]?.();
-    eventClosersRef.current[task] = null;
-  }
-
-  function updateField(field: keyof EvaluationFormState, value: string) {
-    setFormState((current) => ({ ...current, [field]: value }));
-    if (field === "target" || field === "dataset_path") {
-      setTaskRememberedFields((current) => ({
-        ...current,
-        [formState.task]: {
-          ...(current[formState.task] ?? TASK_REMEMBERED_DEFAULTS[formState.task]),
-          [field]: value,
-        },
-      }));
-    }
-  }
-
-  function setBooleanField(field: keyof EvaluationFormState, value: boolean) {
-    setFormState((current) => ({ ...current, [field]: value }));
-  }
-
-  async function handleImportDataset(files: File[]) {
-    const result = await uploadDatasetFiles(files);
-    updateField("dataset_path", result.dataset_path);
-    setDirectoryBrowserPath(result.dataset_path);
-    return {
-      importedCount: result.imported_count,
-      skippedCount: result.skipped_count,
-      message: result.message,
-    };
-  }
-
-  async function handleDatasetUploadChange(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? []);
-    if (files.length === 0) {
-      return;
-    }
-    setDatasetUploading(true);
-    updateTaskRunState(formState.task, { errorMessage: "" });
-    try {
-      await handleImportDataset(files);
-    } catch (error) {
-      updateTaskRunState(formState.task, {
-        errorMessage: error instanceof Error ? error.message : "数据集上传失败",
-      });
+      navigate(`/evaluations/${encodeURIComponent(created.job_id)}?view=run`);
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : "创建任务失败");
     } finally {
-      setDatasetUploading(false);
-      event.target.value = "";
+      setSubmitting(false);
     }
   }
-
-  function resetForm() {
-    setFormState(DEFAULT_FORM_STATE);
-    setTaskRememberedFields(TASK_REMEMBERED_DEFAULTS);
-    setDirectoryBrowserPath(DEFAULT_FORM_STATE.dataset_path);
-    setResetDialogOpen(false);
-    setLiveNotice("已恢复默认值");
+  function reevaluate() {
+    if (!snapshot) return;
+    const t = snapshot.request.task;
+    const current = normalizeFormState(drafts[t] ?? initialDraft(t, defaults));
+    setDrafts((d) => ({
+      ...d,
+      [t]: mergeReevaluationFormState(current, snapshot.request),
+    }));
+    navigate(
+      `/evaluations/new?task=${t}&from=${encodeURIComponent(snapshot.job_id)}`,
+    );
   }
-
-  function openVadReevaluation() {
-    if (runRequest) {
-      setFormState((current) => mergeReevaluationFormState(current, runRequest));
-      setDirectoryBrowserPath(runRequest.dataset_path);
+  function exportResult() {
+    if (!snapshot?.result) return;
+    const url = URL.createObjectURL(
+      new Blob([JSON.stringify(snapshot.result, null, 2)], {
+        type: "application/json",
+      }),
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${snapshot.job_id}-result.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  async function importFiles(files: File[]) {
+    if (!files.length) return;
+    const uploadTask = task;
+    setUploading(true);
+    setFormError("");
+    try {
+      const result = await uploadDatasetFiles(files);
+      setDrafts((d) => ({
+        ...d,
+        [uploadTask]: {
+          ...normalizeFormState(d[uploadTask] ?? draft),
+          dataset_path: result.dataset_path,
+        },
+      }));
+      setNotice(result.message || `已导入 ${result.imported_count} 个文件`);
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : "上传失败");
+    } finally {
+      setUploading(false);
+      if (upload.current) upload.current.value = "";
     }
-    setRunInformationOpen(false);
-    setVadConfigOpen(true);
-    setActiveTab("overview");
   }
-
-  async function copyText(value: string) {
-    if (!value) {
-      return;
-    }
-    await navigator.clipboard.writeText(value);
-    setLiveNotice("任务 ID 已复制");
-  }
-
-  function downloadResult() {
-    if (!finalResult) {
-      return;
-    }
-    const blob = new Blob([JSON.stringify(finalResult, null, 2)], {
-      type: "application/json;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${jobId || "prama-evaluation"}-result.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-
+  const latestEntries = TASKS.filter((t) => latest[t.id]);
   return (
-    <div className="app-theme-root">
-      <a className="skip-link" href="#main-content">跳到主内容</a>
-      <WorkbenchShell className="console-frame">
-        <SidebarPane className="sidebar">
-        <div className="sidebar-brand">
-          <div className="brand-symbol">
-            <Server size={19} />
-          </div>
-          <div>
-            <div className="brand-title-row">
-              <strong>Prama</strong>
-              <small>v{APP_VERSION}</small>
+    <AppShell page={route.page} navigate={navigate}>
+      {route.page === "new" && (
+        <>
+          <header className="page-heading">
+            <div>
+              <h1>{sourceId ? "重新评估" : "新建评估"}</h1>
+              <p>选择评估任务，连接引擎并配置本次运行。</p>
             </div>
-            <span>评估控制台</span>
-          </div>
-        </div>
-
-        <nav className="module-nav" aria-label="主导航">
-          {MODULES.map((item) => {
-            const Icon = item.icon;
-            return (
-              <div className={`module-group module-group-${item.id}`} key={item.id}>
-                <button
-                  type="button"
-                  className={`module-item ${activeModule === item.id ? "active" : ""}`}
-                  onClick={() => setActiveModule(item.id)}
-                >
-                  <Icon size={17} />
-                  <span>{item.label}</span>
-                </button>
-                {item.id === "evaluation" ? (
-                  <div className="task-nav" aria-label="评估类型">
-                    <button
-                      type="button"
-                      className={formState.task === "asr" ? "active" : ""}
-                      onClick={() => {
-                        setActiveModule("evaluation");
-                        handleTaskChange("asr");
-                      }}
-                    >
-                      ASR
-                    </button>
-                    <button
-                      type="button"
-                      className={formState.task === "vad" ? "active" : ""}
-                      onClick={() => {
-                        setActiveModule("evaluation");
-                        handleTaskChange("vad");
-                      }}
-                    >
-                      VAD
-                    </button>
-                    <button
-                      type="button"
-                      className={formState.task === "lid" ? "active" : ""}
-                      onClick={() => {
-                        setActiveModule("evaluation");
-                        handleTaskChange("lid");
-                      }}
-                    >
-                      LID
-                    </button>
-                    <button
-                      type="button"
-                      className={formState.task === "keyword" ? "active" : ""}
-                      onClick={() => {
-                        setActiveModule("evaluation");
-                        handleTaskChange("keyword");
-                      }}
-                    >
-                      Keyword
-                    </button>
-                    <button
-                      type="button"
-                      className={formState.task === "denoise" ? "active" : ""}
-                      onClick={() => {
-                        setActiveModule("evaluation");
-                        handleTaskChange("denoise");
-                      }}
-                    >
-                      SE
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            );
-          })}
-        </nav>
-
-        </SidebarPane>
-
-        <WorkspacePane
-          className={`workspace ${
-            activeModule === "evaluation" ? "" : "workspace-compact"
-          }`}
-        >
-        {activeModule === "evaluation" ? (
-          <header className={`workspace-header ${isVad && status === "completed" && !vadConfigOpen ? "vad-report-header" : ""}`}>
-            <div className="workspace-title-row">
-              <div className="workspace-title-copy">
-                <h1>{isVad && status === "completed" && !vadConfigOpen ? "VAD 评估报告" : evaluationTaskTitle(formState.task)}</h1>
-                {isVad && status === "completed" && !vadConfigOpen ? (
-                  <p>{runRequest?.target || formState.target} · {runRequest?.dataset_path || formState.dataset_path} / {runRequest?.split || formState.split} · {formatNumber(finalResult?.included_sample_count ?? finalResult?.sample_count ?? finalResult?.vad_report?.samples.length)} 条</p>
-                ) : null}
-              </div>
-              {!isVad || (status === "completed" && !vadConfigOpen) ? <div
-                className="page-tabs"
-                role="tablist"
-                aria-label="评估视图"
-                onKeyDown={(event) => {
-                  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-                    return;
-                  }
-                  event.preventDefault();
-                  const nextTab =
-                    event.key === "ArrowLeft" || event.key === "Home" ? "overview" : "report";
-                  setActiveTab(nextTab);
-                  window.requestAnimationFrame(() => {
-                    document.getElementById(`evaluation-${nextTab}-tab`)?.focus();
-                  });
-                }}
-              >
-                <TabButton
-                  id="evaluation-overview-tab"
-                  controls="evaluation-overview-panel"
-                  active={activeTab === "overview"}
-                  label={isVad ? "评估总览" : "运行概览"}
-                  onClick={() => setActiveTab("overview")}
-                />
-                <TabButton
-                  id="evaluation-report-tab"
-                  controls="evaluation-report-panel"
-                  active={activeTab === "report"}
-                  label={
-                    isVad
-                      ? "样本诊断"
-                      : isLid
-                        ? "LID 报告"
-                        : isKeyword
-                          ? "关键词报告"
-                          : isDenoise
-                            ? "SE 报告"
-                            : "对齐报告"
-                  }
-                  onClick={() => setActiveTab("report")}
-                />
-              </div> : null}
-            </div>
-            <div className="header-actions">
-              <StatusPill status={status} />
-              {isVad && status === "completed" && !vadConfigOpen ? (
-                <button type="button" className="vad-reevaluate-action" onClick={openVadReevaluation}>
-                  <RefreshCw size={15} />
-                  <span>重新评估</span>
-                </button>
-              ) : null}
+            {sourceId && (
               <button
-                type="button"
-                className="export-action"
-                title="下载结果 JSON"
-                disabled={!canExport}
-                onClick={downloadResult}
+                className="text-action"
+                onClick={() =>
+                  navigate(
+                    `/evaluations/${encodeURIComponent(sourceId)}?view=report`,
+                  )
+                }
               >
-                <Download size={16} />
-                <span>导出</span>
+                返回原任务 →
               </button>
-              {isVad && status === "completed" && !vadConfigOpen ? (
-                <button type="button" className="export-action run-information-action" onClick={() => setRunInformationOpen(true)}>
-                  运行信息
-                </button>
-              ) : null}
-            </div>
+            )}
           </header>
-        ) : null}
-
-        <section
-          className={`work-grid ${
-            activeModule === "evaluation" ? "" : "single-column"
-          } ${activeModule === "evaluation" && activeTab === "report" ? "report-full" : ""} ${
-            activeModule === "evaluation" && isVad && (status === "idle" || vadConfigOpen) ? "single-column vad-config-mode" : ""
-          } ${activeModule === "evaluation" && isVad && status !== "idle" && !vadConfigOpen ? "report-full vad-run-full" : ""} ${
-            activeModule === "evaluation" && isVad && status === "completed" && !vadConfigOpen ? "vad-report-full" : ""
-          }`}
-        >
-          {activeModule === "evaluation" && activeTab === "overview" && (!isVad || status === "idle" || vadConfigOpen) ? (
-            <form
-              ref={formRef}
-              className={`panel evaluation-form ${isVad ? "vad-evaluation-form" : ""}`}
-              onSubmit={handleSubmit}
-            >
-              <div className="panel-heading">
-                <div>
-                  <h2>评估配置</h2>
-                  <span>设置引擎、数据集与运行范围</span>
-                </div>
-              </div>
-              {isVad && vadConfigOpen && finalResult ? (
-                <p className="vad-reevaluation-note">
-                  数据源沿用本次任务，高级参数使用当前设置。
-                </p>
-              ) : null}
-
-              <div className="field-grid">
-                <div className="engine-target-row">
-                  <TextField
-                    label={`${evaluationTaskShortLabel(formState.task)} 引擎地址`}
-                    value={formState.target}
-                    onChange={(value) => updateField("target", value)}
-                    required
-                  />
-                  <ConnectivityButton
-                    status={connectivityStatus[evaluationConnectivityKey]}
-                    onClick={() =>
-                      void handleTestConnectivity(
-                        evaluationConnectivityKey,
-                        formState.target,
-                      )
-                    }
-                  />
-                </div>
-                <div className="field dataset-path-field">
-                  <label htmlFor="evaluation-dataset-path">数据集路径</label>
-                  <div className="dataset-path-controls">
-                    <input
-                      id="evaluation-dataset-path"
-                      value={formState.dataset_path}
-                      required
-                      disabled={busy || datasetUploading}
-                      onChange={(event) => updateField("dataset_path", event.target.value)}
-                    />
-                    <input
-                      ref={datasetUploadInputRef}
-                      type="file"
-                      hidden
-                      multiple
-                      accept=".wav,.mp3,.flac,.ogg,.json,.jsonl,.csv,.parquet,.txt"
-                      onChange={handleDatasetUploadChange}
-                    />
-                    <GhostButton
-                      className="dataset-action-button dataset-upload-button"
-                      disabled={busy || datasetUploading}
-                      onClick={() => datasetUploadInputRef.current?.click()}
-                    >
-                      <Upload size={14} />
-                      <span>{datasetUploading ? "上传中" : "上传"}</span>
-                    </GhostButton>
-                    <GhostButton
-                      className="dataset-action-button dataset-browser-button"
-                      disabled={busy || datasetUploading}
-                      onClick={() => {
-                        setDirectoryBrowserPath(formState.dataset_path);
-                        setDirectoryBrowserOpen(true);
-                      }}
-                    >
-                      浏览
-                    </GhostButton>
-                  </div>
-                </div>
-                <div className="dataset-options-grid">
-                  <TextField
-                    label="Split"
-                    value={formState.split}
-                    onChange={(value) => updateField("split", value)}
-                    required
-                  />
-                  <TextField
-                    label="Limit"
-                    value={formState.limit}
-                    type="number"
-                    min="1"
-                    placeholder="不限制"
-                    onChange={(value) => updateField("limit", value)}
-                  />
-                </div>
-              </div>
-
-              <div className="form-action-bar">
-                <Button type="submit" className="primary-action" disabled={busy || datasetUploading} stretch>
-                  {busy ? "评估中..." : isVad && vadConfigOpen ? "创建重新评估任务" : "启动评估"}
-                </Button>
-                {isVad && vadConfigOpen && finalResult ? (
-                  <GhostButton className="vad-config-cancel" onClick={() => setVadConfigOpen(false)}>
-                    返回当前报告
-                  </GhostButton>
-                ) : null}
-              </div>
-            </form>
-          ) : null}
-
-          {activeModule === "settings" ? (
-            <section className="panel configuration-panel settings-panel">
-              <div className="panel-heading">
-                <div>
-                  <h2>设置</h2>
-                  <span>ASR、VAD、LID 与 SE 的高级评估参数</span>
-                </div>
-                <button type="button" className="ghost-button" onClick={() => setResetDialogOpen(true)}>
-                  重置
-                </button>
-              </div>
-              <p className="settings-save-note">更改会自动保存到当前浏览器</p>
-              <div className="settings-stack">
-                <section className="settings-section">
-                  <div className="settings-section-heading">
-                    <h3>通用设置</h3>
-                  </div>
-                  <div className="field-grid advanced-grid">
-                    <TextField
-                      label="采样率"
-                      value={formState.sample_rate}
-                      type="number"
-                      min="1"
-                      onChange={(value) => updateField("sample_rate", value)}
-                      required
-                    />
-                    <TextField
-                      label="连接超时秒"
-                      value={formState.connect_timeout_seconds}
-                      type="number"
-                      min="0.1"
-                      step="0.1"
-                      onChange={(value) => updateField("connect_timeout_seconds", value)}
-                    />
-                    <TextField
-                      label="请求超时秒"
-                      value={formState.request_timeout_seconds}
-                      type="number"
-                      min="0.1"
-                      step="0.1"
-                      onChange={(value) => updateField("request_timeout_seconds", value)}
-                      required
-                    />
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div className="settings-section-heading">
-                    <h3>SQA 语音质量评估</h3>
-                  </div>
-                  <div className="field-grid advanced-grid">
-                    <TextField
-                      label="MOS/SNR 推理并发数"
-                      value={formState.sqa_inference_concurrency}
-                      type="number"
-                      min="0"
-                      step="1"
-                      onChange={(value) => updateField("sqa_inference_concurrency", value)}
-                      required
-                    />
-                  </div>
-                  <div className="sqa-fixed-list">
-                    <div className="sqa-fixed-row">
-                      <label className="check-field">
-                        <input
-                          type="checkbox"
-                          checked={formState.enable_mos}
-                          onChange={(event) =>
-                            setBooleanField("enable_mos", event.target.checked)
-                          }
-                        />
-                        <span>MOS</span>
-                      </label>
-                      <TextField
-                        label="MOS 地址"
-                        value={formState.mos_target}
-                        onChange={(value) => updateField("mos_target", value)}
-                      />
-                      <ConnectivityButton
-                        status={connectivityStatus.mos}
-                        onClick={() =>
-                          void handleTestConnectivity("mos", formState.mos_target)
-                        }
-                      />
-                    </div>
-                    <div className="sqa-fixed-row">
-                      <label className="check-field">
-                        <input
-                          type="checkbox"
-                          checked={formState.enable_snr}
-                          onChange={(event) =>
-                            setBooleanField("enable_snr", event.target.checked)
-                          }
-                        />
-                        <span>SNR</span>
-                      </label>
-                      <TextField
-                        label="SNR 地址"
-                        value={formState.snr_target}
-                        onChange={(value) => updateField("snr_target", value)}
-                      />
-                      <ConnectivityButton
-                        status={connectivityStatus.snr}
-                        onClick={() =>
-                          void handleTestConnectivity("snr", formState.snr_target)
-                        }
-                      />
-                    </div>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div className="settings-section-heading">
-                    <h3>ASR 高级设置</h3>
-                  </div>
-                  <div className="field-grid advanced-grid">
-                    <TextField
-                      label="语言"
-                      value={formState.language_code}
-                      onChange={(value) => updateField("language_code", value)}
-                      required
-                    />
-                    <TextField
-                      label="最少参考词数"
-                      value={formState.min_reference_words}
-                      type="number"
-                      min="0"
-                      onChange={(value) => updateField("min_reference_words", value)}
-                      required
-                    />
-                    <TextField
-                      label="热词"
-                      value={formState.hotwords}
-                      onChange={(value) => updateField("hotwords", value)}
-                    />
-                    <TextField
-                      label="热词 Bias"
-                      value={formState.hotword_bias}
-                      type="number"
-                      step="0.1"
-                      onChange={(value) => updateField("hotword_bias", value)}
-                    />
-                    <TextField
-                      label="ASR 推理并发数"
-                      value={formState.asr_inference_concurrency}
-                      type="number"
-                      min="0"
-                      step="1"
-                      onChange={(value) =>
-                        updateField("asr_inference_concurrency", value)
-                      }
-                      required
-                    />
-                    <label className="check-field">
-                      <input
-                        type="checkbox"
-                        checked={formState.interim_results}
-                        onChange={(event) =>
-                          setFormState((current) => ({
-                            ...current,
-                            interim_results: event.target.checked,
-                          }))
-                        }
-                      />
-                      <span>启用临时识别结果</span>
-                    </label>
-                    <label className="check-field">
-                      <input
-                        type="checkbox"
-                        checked={formState.remove_punctuation}
-                        onChange={(event) =>
-                          setFormState((current) => ({
-                            ...current,
-                            remove_punctuation: event.target.checked,
-                          }))
-                        }
-                      />
-                      <span>评估时去掉标点</span>
-                    </label>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div className="settings-section-heading">
-                    <h3>VAD 高级设置</h3>
-                  </div>
-                  <div className="field-grid advanced-grid">
-                    <TextField
-                      label="VAD 帧长秒"
-                      value={formState.mask_frame_seconds}
-                      type="number"
-                      min="0.001"
-                      step="0.001"
-                      onChange={(value) => updateField("mask_frame_seconds", value)}
-                    />
-                    <TextField
-                      label="VAD 分块秒"
-                      value={formState.chunk_duration_seconds}
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      onChange={(value) => updateField("chunk_duration_seconds", value)}
-                    />
-                    <TextField
-                      label="语音扩展秒"
-                      value={formState.speech_padding_seconds ?? "0"}
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      onChange={(value) => updateField("speech_padding_seconds", value)}
-                    />
-                    <TextField
-                      label="段命中阈值"
-                      value={formState.hit_threshold}
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      onChange={(value) => updateField("hit_threshold", value)}
-                    />
-                    <TextField
-                      label="VAD 推理并发数"
-                      value={formState.vad_inference_concurrency}
-                      type="number"
-                      min="0"
-                      step="1"
-                      onChange={(value) =>
-                        updateField("vad_inference_concurrency", value)
-                      }
-                      required
-                    />
-                    <label className="check-field">
-                      <input
-                        type="checkbox"
-                        checked={formState.streaming}
-                        onChange={(event) =>
-                          setFormState((current) => ({
-                            ...current,
-                            streaming: event.target.checked,
-                          }))
-                        }
-                      />
-                      <span>使用 VAD 流式接口</span>
-                    </label>
-                  </div>
-                </section>
-                <section className="settings-section">
-                  <div className="settings-section-heading">
-                    <h3>LID 高级设置</h3>
-                  </div>
-                  <div className="field-grid advanced-grid">
-                    <TextField
-                      label="LID 推理并发数"
-                      value={formState.lid_inference_concurrency}
-                      type="number"
-                      min="0"
-                      step="1"
-                      onChange={(value) =>
-                        updateField("lid_inference_concurrency", value)
-                      }
-                      required
-                    />
-                    <TextField
-                      label="LID 置信度阈值"
-                      value={formState.lid_confidence_threshold}
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      onChange={(value) =>
-                        updateField("lid_confidence_threshold", value)
-                      }
-                      required
-                    />
-                  </div>
-                </section>
-              </div>
-            </section>
-          ) : null}
-
-          {activeModule === "help" ? (
-            <section className="panel help-panel">
-              <div className="panel-heading">
-                <div>
-                  <h2>{helpDocument?.title || "帮助"}</h2>
-                  <span>数据集格式、字段要求和示例</span>
-                </div>
-              </div>
-              {helpError ? (
-                <div className="inline-warning">
-                  <TriangleAlert size={15} />
-                  {helpError}
-                </div>
-              ) : helpDocument ? (
-                <MarkdownDocument markdown={helpDocument.markdown} />
-              ) : (
-                <div className="empty-state">正在加载帮助文档</div>
-              )}
-            </section>
-          ) : null}
-
-          {activeModule === "evaluation" && (!isVad || (status !== "idle" && !vadConfigOpen)) ? (
-          <section
-            id={`evaluation-${activeTab}-panel`}
-            role="tabpanel"
-            aria-labelledby={`evaluation-${activeTab}-tab`}
-            className={`run-column ${
-              activeTab === "report" ? "report-column" : "overview-column"
-            } status-${status}`}
+          <form
+            className="creation-form"
+            onSubmit={submit}
+            onInvalid={(e) => {
+              const details = (e.target as HTMLElement).closest("details");
+              if (details) details.open = true;
+            }}
           >
-            {isVad ? (
-              status === "completed" && finalResult ? (
-                <VadEvaluationReport
-                  result={finalResult}
-                  request={runRequest}
-                  view={activeTab === "report" ? "diagnosis" : "overview"}
-                  filter={vadDiagnosisFilter}
-                  onViewChange={(view) => setActiveTab(view === "overview" ? "overview" : "report")}
-                  onFilterChange={setVadDiagnosisFilter}
-                />
-              ) : (
-                <VadRunWorkspace
-                  status={status === "idle" ? "queued" : status}
-                  jobId={jobId}
-                  progress={progress}
-                  request={runRequest}
-                  events={runEvents}
-                  errorMessage={errorMessage}
-                  connectionWarning={connectionWarning}
-                  onEditConfiguration={() => {
-                    if (runRequest) setFormState(requestToFormState(runRequest));
-                    setVadConfigOpen(true);
-                  }}
-                />
-              )
-            ) : (
-              <>
-            {activeTab === "overview" ? (
-              <>
-                <div className="panel progress-panel">
-                  <div className="panel-heading run-status-heading">
-                    <div>
-                      <h2>运行状态</h2>
-                      <span>{jobId ? `任务 ${jobId}` : "等待启动"}</span>
+            <fieldset
+              className="task-selection"
+              disabled={submitting || uploading}
+            >
+              <legend>评估类型</legend>
+              <div className="task-options">
+                {TASKS.map((t) => (
+                  <label key={t.id} className={task === t.id ? "selected" : ""}>
+                    <input
+                      type="radio"
+                      name="task"
+                      checked={task === t.id}
+                      onChange={() => chooseTask(t.id)}
+                    />
+                    <strong>{t.label}</strong>
+                    <span>{t.description}</span>
+                    {task === t.id && <Check size={15} aria-hidden />}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+            <div className="creation-layout">
+              <div className="creation-fields">
+                <fieldset disabled={submitting || uploading}>
+                  <section className="form-section">
+                    <div className="section-label">
+                      <span>01</span>
+                      <div>
+                        <h2>引擎与数据集</h2>
+                        <p>指定评估服务与服务器上的数据目录</p>
+                      </div>
                     </div>
-                    <div className="run-status-actions">
-                      {jobId ? (
+                    <div className="engine-line">
+                      <TextField
+                        label={`${taskLabel(task)} 引擎地址`}
+                        value={draft.target}
+                        required
+                        onChange={(target) => change({ target })}
+                      />
+                      <ConnectionTest
+                        target={draft.target}
+                        timeout={draft.connect_timeout_seconds}
+                      />
+                    </div>
+                    <div className="path-field">
+                      <label htmlFor="evaluation-dataset-path">
+                        数据集路径
+                      </label>
+                      <input
+                        id="evaluation-dataset-path"
+                        value={draft.dataset_path}
+                        required
+                        onChange={(e) =>
+                          change({ dataset_path: e.target.value })
+                        }
+                      />
+                      <div className="path-actions">
                         <button
                           type="button"
-                          className="copy-job-action"
-                          title="复制任务 ID"
-                          aria-label="复制任务 ID"
-                          onClick={() => void copyText(jobId)}
+                          className="text-action"
+                          onClick={() => setDirectoryOpen(true)}
                         >
-                          <Clipboard size={15} />
-                          <span>复制 ID</span>
+                          <FolderOpen size={16} />
+                          浏览服务器目录
                         </button>
-                      ) : null}
-                      {status === "running" || status === "completed" ? (
-                        <strong className="progress-percent">
-                          {`${progressPercent.toFixed(0)}%`}
-                        </strong>
-                      ) : null}
+                        <button
+                          type="button"
+                          className="text-action"
+                          onClick={() => upload.current?.click()}
+                        >
+                          <Upload size={16} />
+                          {uploading ? "上传中…" : "上传本地目录"}
+                        </button>
+                        <input
+                          ref={upload}
+                          type="file"
+                          hidden
+                          multiple
+                          {...{ webkitdirectory: "" }}
+                          onChange={(e) =>
+                            void importFiles(Array.from(e.target.files ?? []))
+                          }
+                        />
+                      </div>
+                      <p className="field-hint">
+                        路径属于运行 Prama 的服务器。上传后将自动填入新目录。
+                      </p>
                     </div>
+                  </section>
+                  <section className="form-section">
+                    <div className="section-label">
+                      <span>02</span>
+                      <div>
+                        <h2>运行范围</h2>
+                        <p>控制本次使用的数据划分和样本数量</p>
+                      </div>
+                    </div>
+                    <div className="range-fields">
+                      <TextField
+                        label="数据划分（Split）"
+                        value={draft.split}
+                        required
+                        onChange={(split) => change({ split })}
+                      />
+                      <TextField
+                        label="样本上限（Limit）"
+                        value={draft.limit}
+                        type="number"
+                        min="1"
+                        step="1"
+                        placeholder="不限制"
+                        onChange={(limit) => change({ limit })}
+                      />
+                    </div>
+                  </section>
+                  <div className="draft-reset">
+                    <button
+                      type="button"
+                      className="text-action"
+                      onClick={() => {
+                        change(initialDraft(task, defaults));
+                        setNotice("草稿已使用当前默认值重置");
+                      }}
+                    >
+                      使用默认值重置草稿
+                    </button>
                   </div>
-                  {status === "idle" ? (
-                    <div className="idle-run-state">
-                      <div className="idle-run-state-content">
-                        <Activity size={22} aria-hidden="true" />
-                        <div>
-                          <strong>尚未开始评估</strong>
-                          <span>配置完成后启动评估</span>
-                        </div>
-                      </div>
+                  <details className="advanced-settings">
+                    <summary>
+                      <span>
+                        03 <strong>高级参数</strong>
+                      </span>
+                      <span>采样率、并发与 {taskLabel(task)} 评估设置</span>
+                    </summary>
+                    <AdvancedSettings value={draft} onChange={change} />
+                  </details>
+                </fieldset>
+              </div>
+              <aside className="submission-summary">
+                <p className="eyebrow">本次运行</p>
+                <h2>{taskLabel(task)} 评估</h2>
+                <dl>
+                  <div>
+                    <dt>数据划分</dt>
+                    <dd>{draft.split || "未填写"}</dd>
+                  </div>
+                  <div>
+                    <dt>样本上限</dt>
+                    <dd>{draft.limit || "不限制"}</dd>
+                  </div>
+                  <div>
+                    <dt>采样率</dt>
+                    <dd>{draft.sample_rate} Hz</dd>
+                  </div>
+                  <div>
+                    <dt>请求超时</dt>
+                    <dd>{draft.request_timeout_seconds} 秒</dd>
+                  </div>
+                </dl>
+                <details className="summary-details">
+                  <summary>查看全部生效参数</summary>
+                  <RequestSummary request={buildRequest(draft)} />
+                </details>
+                {sourceRequest && (
+                  <div className="reevaluation-diff">
+                    <strong>与原任务比较</strong>
+                    <p>数据源沿用原任务，高级参数使用当前草稿。</p>
+                    {differences.length ? (
+                      <ul>
+                        {differences.map(([key, value]) => (
+                          <li key={key}>
+                            {FIELD_LABELS[key as keyof EvaluationFormState] ??
+                              key}
+                            ：
+                            {String(
+                              sourceRequest[key as keyof EvaluationRequest],
+                            )}{" "}
+                            → {String(value)}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p>参数与原任务一致。</p>
+                    )}
+                  </div>
+                )}
+                <div className="submission-action">
+                  {formError && (
+                    <div role="alert" className="error-box submission-error">
+                      {formError}
                     </div>
-                  ) : status === "queued" || status === "started" ? (
-                    <div className="lifecycle-run-state queued-run-state">
-                      <CircleDashed size={22} aria-hidden="true" />
-                      <div>
-                        <strong>任务已进入队列</strong>
-                        <span>服务正在准备评估，开始处理后将在这里显示进度。</span>
-                      </div>
-                    </div>
-                  ) : status === "failed" ? (
-                    <div className="lifecycle-run-state failed-run-state">
-                      <TriangleAlert size={22} aria-hidden="true" />
-                      <div>
-                        <strong>评估未完成</strong>
-                        <span>{errorMessage || "检查左侧配置后重新启动评估。"}</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <div
-                        className="progress-track"
-                        role="progressbar"
-                        aria-label="评估进度"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={Math.round(progressPercent)}
-                      >
-                        <div className="progress-bar" style={{ width: `${progressPercent}%` }} />
-                      </div>
-                      <div className="metric-strip progress-metrics">
-                        <Metric label="已处理" value={`${progress?.processed ?? 0} / ${progress?.total ?? 0}`} />
-                        <Metric label="已评估" value={String(progress?.evaluated ?? 0)} />
-                      </div>
-                    </>
                   )}
-                  <PerformanceMetrics result={finalResult} />
-                  <SqaSummaryMetrics summary={finalResult?.sqa_summary} />
-                  {connectionWarning ? (
-                    <div className="inline-warning">
-                      <TriangleAlert size={15} />
-                      {connectionWarning}
-                    </div>
-                  ) : null}
-                  {errorMessage && status !== "failed" ? (
-                    <div className="error-box">
-                      <TriangleAlert size={16} />
-                      <span>{errorMessage}</span>
-                    </div>
-                  ) : null}
+                  <Button
+                    type="submit"
+                    disabled={submitting || uploading || blocked}
+                    stretch
+                  >
+                    <Plus size={16} />
+                    {submitting ? "正在创建…" : "启动评估"}
+                  </Button>
+                  <p>创建独立任务，使用上方配置执行评估</p>
                 </div>
-                {isVad ? <VadOverviewMetrics result={finalResult} /> : null}
-                {isLid ? <LidOverviewMetrics result={finalResult} /> : null}
-                {isKeyword ? <KeywordOverviewMetrics result={finalResult} /> : null}
-                {isDenoise ? <DenoiseOverviewMetrics result={finalResult} /> : null}
-                {!isVad && !isLid && !isKeyword && !isDenoise ? (
-                  <AsrOverviewMetrics result={finalResult} />
-                ) : null}
-
-                {!isVad &&
-                !isDenoise &&
-                (status === "running" || status === "started" || status === "completed") ? (
-                  <div className="panel sample-panel">
-                    <div className="panel-heading compact-heading">
-                      <div>
-                        <h2>当前样本</h2>
-                        <span>{progress?.current_id || progress?.id || "-"}</span>
-                      </div>
-                    </div>
-                    <div className="sample-grid">
-                      <TextBlock
-                        label={
-                          isLid
-                            ? "Reference Language"
-                            : isKeyword
-                              ? "Expected"
-                              : "Reference"
-                        }
-                        value={progress?.reference || "-"}
-                      />
-                      <TextBlock
-                        label={
-                          isLid || isKeyword ? "Prediction" : "Hypothesis"
-                        }
-                        value={progress?.hypothesis || "-"}
-                      />
-                    </div>
-                  </div>
-                ) : null}
-              </>
-            ) : null}
-
-            {activeTab === "report" ? (
-              isLid ? (
-                <LidReportPanel
-                  result={finalResult}
-                />
-              ) : isDenoise ? (
-                <DenoiseReportPanel
-                  result={finalResult}
-                />
-              ) : isKeyword ? (
-                <KeywordReportPanel
-                  result={finalResult}
-                />
-              ) : (
-                <AsrAlignmentReportPanel
-                  werReport={werReport}
-                  cerReport={cerReport}
-                  activeMetric={activeAlignmentMetric}
-                  onActiveMetricChange={setActiveAlignmentMetric}
-                  result={finalResult}
-                  sortMode={reportSort}
-                  onSortModeChange={setReportSort}
-                  wrapAlignment={wrapWerAlignment}
-                  onWrapAlignmentChange={setWrapWerAlignment}
-                />
-              )
-            ) : null}
-              </>
-            )}
-          </section>
-          ) : null}
-        </section>
-        <DirectoryBrowserDialog
-          isOpen={directoryBrowserOpen}
-          initialPath={directoryBrowserPath}
-          listDirectory={listServerDirectory}
-          onClose={() => setDirectoryBrowserOpen(false)}
-          onSelect={(path) => {
-            updateField("dataset_path", path);
-            setDirectoryBrowserPath(path);
-            setDirectoryBrowserOpen(false);
-          }}
-        />
-        <VadRunInformationDrawer
-          open={runInformationOpen && isVad}
-          jobId={jobId}
-          request={runRequest}
-          result={finalResult}
-          onClose={() => setRunInformationOpen(false)}
-          onReevaluate={openVadReevaluation}
-        />
-        <ConfirmDialog
-          isOpen={resetDialogOpen}
-          title="恢复全部默认设置？"
-          description="这会恢复所有任务的引擎地址、数据集路径和高级评估参数。该操作不会删除已有评估结果。"
-          confirmLabel="恢复默认值"
-          onClose={() => setResetDialogOpen(false)}
-          onConfirm={resetForm}
-        />
-        <div className="live-notice" role="status" aria-live="polite">
-          {liveNotice}
-        </div>
-        </WorkspacePane>
-      </WorkbenchShell>
-    </div>
-  );
-}
-
-function TabButton({
-  id,
-  controls,
-  active,
-  label,
-  onClick,
-}: {
-  id: string;
-  controls: string;
-  active: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      id={id}
-      type="button"
-      className={`page-tab ${active ? "active" : ""}`}
-      role="tab"
-      aria-selected={active}
-      aria-controls={controls}
-      tabIndex={active ? 0 : -1}
-      onClick={onClick}
-    >
-      <span>{label}</span>
-    </button>
-  );
-}
-
-function StatusPill({ status }: { status: JobStatus | "idle" | "started" }) {
-  return (
-    <StatusChip
-      className={`status-pill status-${status}`}
-      role="status"
-      aria-live="polite"
-    >
-      <span className="status-dot" aria-hidden="true" />
-      <span>{STATUS_LABELS[status]}</span>
-    </StatusChip>
-  );
-}
-
-function ConnectivityButton({
-  status,
-  onClick,
-}: {
-  status?: ConnectivityStatus;
-  onClick: () => void;
-}) {
-  const state = status?.state ?? "idle";
-  const label =
-    state === "testing"
-      ? "测试中"
-      : state === "ok"
-        ? "已连接"
-        : state === "failed"
-          ? "连接失败"
-          : "测试连接";
-  return (
-    <button
-      type="button"
-      className={`connectivity-button ${state}`}
-      title={status?.message || "测试 gRPC 连通性"}
-      disabled={state === "testing"}
-      onClick={onClick}
-    >
-      {label}
-    </button>
-  );
-}
-
-function TextField({
-  label,
-  value,
-  onChange,
-  type = "text",
-  required = false,
-  placeholder,
-  min,
-  step,
-  max,
-  disabled = false,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  type?: string;
-  required?: boolean;
-  placeholder?: string;
-  min?: string;
-  step?: string;
-  max?: string;
-  disabled?: boolean;
-}) {
-  return (
-    <Field label={label} className="field">
-      <input
-        value={value}
-        type={type}
-        min={min}
-        max={max}
-        step={step}
-        disabled={disabled}
-        required={required}
-        placeholder={placeholder}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </Field>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return <MetricTile className="metric" label={label} value={value} />;
-}
-
-function TextBlock({ label, value }: { label: string; value: ReactNode }) {
-  return (
-    <div className="text-block">
-      <span>{label}</span>
-      <p>{value}</p>
-    </div>
-  );
-}
-
-type KeywordHighlightTone = "hit" | "false_alarm";
-
-interface KeywordHighlight {
-  keyword: string;
-  tone: KeywordHighlightTone;
-}
-
-function KeywordMatchTextBlock({
-  matchText,
-  highlights,
-}: {
-  matchText: string;
-  highlights: KeywordHighlight[];
-}) {
-  return (
-    <TextBlock
-      label="正则化后的推理结果"
-      value={
-        matchText ? (
-          <HighlightedKeywordText text={matchText} highlights={highlights} />
-        ) : (
-          "-"
-        )
-      }
-    />
-  );
-}
-
-function keywordHighlightsFromSample(sample: KeywordReportSample): KeywordHighlight[] {
-  if (!sample.predicted_hit) {
-    return [];
-  }
-  return [
-    {
-      keyword: sample.keyword,
-      tone: sample.expected_hit ? "hit" : "false_alarm",
-    },
-  ];
-}
-
-function keywordHighlightsFromAudioSample(
-  sample: KeywordAudioReportSample,
-): KeywordHighlight[] {
-  return sample.keywords
-    .filter((keyword) => keyword.predicted_hit)
-    .map((keyword) => ({
-      keyword: keyword.keyword,
-      tone: keyword.expected_hit ? "hit" : "false_alarm",
-    }));
-}
-
-function HighlightedKeywordText({
-  text,
-  highlights,
-}: {
-  text: string;
-  highlights: KeywordHighlight[];
-}) {
-  const ranges = keywordHighlightRanges(text, highlights);
-  if (!ranges.length) {
-    return <>{text}</>;
-  }
-
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  ranges.forEach((range, index) => {
-    if (range.start > cursor) {
-      parts.push(text.slice(cursor, range.start));
-    }
-    parts.push(
-      <mark
-        className={`keyword-match-highlight ${range.tone}`}
-        key={`${range.start}-${range.end}-${index}`}
-      >
-        {text.slice(range.start, range.end)}
-      </mark>,
-    );
-    cursor = range.end;
-  });
-  if (cursor < text.length) {
-    parts.push(text.slice(cursor));
-  }
-  return <>{parts}</>;
-}
-
-function keywordHighlightRanges(text: string, highlights: KeywordHighlight[]) {
-  const ranges = highlights
-    .flatMap((highlight) =>
-      keywordRangesForHighlight(text, highlight).map((range) => ({
-        ...range,
-        tone: highlight.tone,
-      })),
-    )
-    .sort((left, right) => left.start - right.start || right.end - left.end);
-
-  const merged: Array<{ start: number; end: number; tone: KeywordHighlightTone }> = [];
-  ranges.forEach((range) => {
-    const previous = merged[merged.length - 1];
-    if (!previous || range.start >= previous.end) {
-      merged.push(range);
-      return;
-    }
-    if (range.end > previous.end && range.tone === previous.tone) {
-      previous.end = range.end;
-    }
-  });
-  return merged;
-}
-
-function keywordRangesForHighlight(text: string, highlight: KeywordHighlight) {
-  const normalizedKeyword = normalizeKeywordText(highlight.keyword);
-  if (!normalizedKeyword) {
-    return [];
-  }
-  if (/^[a-z0-9]+(?: [a-z0-9]+)*$/.test(normalizedKeyword)) {
-    const tokens = Array.from(text.matchAll(/\S+/g));
-    const keywordTokens = normalizedKeyword.split(" ");
-    const ranges: Array<{ start: number; end: number }> = [];
-    for (let index = 0; index <= tokens.length - keywordTokens.length; index += 1) {
-      const tokenSlice = tokens.slice(index, index + keywordTokens.length);
-      if (
-        tokenSlice.every(
-          (token, tokenIndex) => token[0] === keywordTokens[tokenIndex],
-        )
-      ) {
-        const firstToken = tokenSlice[0];
-        const lastToken = tokenSlice[tokenSlice.length - 1];
-        ranges.push({
-          start: firstToken.index ?? 0,
-          end: (lastToken.index ?? 0) + lastToken[0].length,
-        });
-      }
-    }
-    return ranges;
-  }
-
-  const ranges: Array<{ start: number; end: number }> = [];
-  let start = text.indexOf(normalizedKeyword);
-  while (start >= 0) {
-    ranges.push({ start, end: start + normalizedKeyword.length });
-    start = text.indexOf(normalizedKeyword, start + normalizedKeyword.length);
-  }
-  return ranges;
-}
-
-function normalizeKeywordText(text: string) {
-  return text
-    .toLowerCase()
-    .replace(/\p{P}/gu, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function AudioPlayer({
-  src,
-  durationSeconds,
-}: {
-  src?: string;
-  durationSeconds?: number;
-}) {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [actualDuration, setActualDuration] = useState(durationSeconds ?? 0);
-  const duration = actualDuration || durationSeconds || 0;
-  const progress = duration > 0 ? Math.min((currentTime / duration) * 100, 100) : 0;
-
-  if (!src) {
-    return <span className="audio-empty">无音频</span>;
-  }
-
-  function togglePlay(event: MouseEvent<HTMLButtonElement>) {
-    event.preventDefault();
-    event.stopPropagation();
-    const audio = audioRef.current;
-    if (!audio) {
-      return;
-    }
-    if (audio.paused) {
-      void audio.play();
-    } else {
-      audio.pause();
-    }
-  }
-
-  function handleSeek(event: ChangeEvent<HTMLInputElement>) {
-    event.stopPropagation();
-    const audio = audioRef.current;
-    if (!audio || duration <= 0) {
-      return;
-    }
-    const nextTime = (Number(event.target.value) / 100) * duration;
-    audio.currentTime = nextTime;
-    setCurrentTime(nextTime);
-  }
-
-  return (
-    <div className="audio-player" onClick={(event) => event.stopPropagation()}>
-      <audio
-        ref={audioRef}
-        preload="metadata"
-        src={src}
-        onLoadedMetadata={(event) => {
-          const nextDuration = event.currentTarget.duration;
-          if (Number.isFinite(nextDuration)) {
-            setActualDuration(nextDuration);
-          }
-        }}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onEnded={() => setPlaying(false)}
-        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-      />
-      <button
-        type="button"
-        className="audio-play-button"
-        title={playing ? "暂停音频" : "播放音频"}
-        aria-label={playing ? "暂停音频" : "播放音频"}
-        onClick={togglePlay}
-      >
-        {playing ? <Pause size={14} /> : <Play size={14} />}
-      </button>
-      <input
-        className="audio-progress"
-        type="range"
-        min="0"
-        max="100"
-        step="0.1"
-        value={progress}
-        aria-label="音频播放进度"
-        onClick={(event) => event.stopPropagation()}
-        onChange={handleSeek}
-      />
-      <small>
-        {formatSeconds(currentTime)} / {formatSeconds(duration)}
-      </small>
-    </div>
-  );
-}
-
-function SampleCountStrip({
-  result,
-  fallbackCount,
-}: {
-  result: EvaluationResult | null;
-  fallbackCount: number;
-}) {
-  const included = result?.included_sample_count ?? fallbackCount;
-  const total = result?.total_sample_count;
-  return (
-    <div className="metric-strip sample-count-strip">
-      <Metric label="参与样本" value={formatNumber(included)} />
-      {typeof total === "number" && total !== included ? (
-        <Metric label="总样本" value={formatNumber(total)} />
-      ) : null}
-    </div>
-  );
-}
-
-function PerformanceMetrics({ result }: { result: EvaluationResult | null }) {
-  if (!result) {
-    return null;
-  }
-
-  return (
-    <div className="metric-strip performance-metrics">
-      <Metric label="音频时长" value={formatSeconds(result.audio_duration_seconds)} />
-      <Metric label="处理耗时" value={formatSeconds(result.processing_elapsed_seconds)} />
-      <Metric label="倍时" value={formatRealtimeFactor(result.realtime_factor)} />
-    </div>
-  );
-}
-
-function CompactReportMeta({
-  result,
-  fallbackCount,
-  className = "",
-}: {
-  result: EvaluationResult | null;
-  fallbackCount: number;
-  className?: string;
-}) {
-  const included = result?.included_sample_count ?? fallbackCount;
-  const total = result?.total_sample_count;
-  const sampleText =
-    typeof total === "number" && total !== included
-      ? `${formatNumber(included)} / ${formatNumber(total)}`
-      : formatNumber(included);
-  const items = [
-    { label: "参与样本", value: sampleText },
-    { label: "音频时长", value: formatSeconds(result?.audio_duration_seconds) },
-    { label: "处理耗时", value: formatSeconds(result?.processing_elapsed_seconds) },
-    { label: "倍时", value: formatRealtimeFactor(result?.realtime_factor) },
-  ];
-
-  return (
-    <div
-      className={`compact-report-meta ${className}`.trim()}
-      aria-label="评估运行元信息"
-    >
-      {items.map((item) => (
-        <span key={item.label}>
-          <em>{item.label}</em>
-          <strong>{item.value}</strong>
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function SqaSummaryMetrics({ summary }: { summary?: SqaSummary[] }) {
-  if (!summary?.length) {
-    return null;
-  }
-
-  return (
-    <div className="metric-strip sqa-summary-metrics">
-      {summary.map((item) => (
-        <Metric
-          key={`${item.engine_name}-${item.target}`}
-          label={item.engine_name}
-          value={formatSqaScore(item.mean_score)}
-        />
-      ))}
-    </div>
-  );
-}
-
-function SqaScoreChips({ scores }: { scores?: SqaScore[] }) {
-  if (!scores?.length) {
-    return null;
-  }
-
-  return (
-    <span className="sqa-score-chips">
-      {scores.map((item) => {
-        const failed = item.score === null || item.score === undefined || item.error;
-        const title = failed
-          ? `${item.engine_name}: ${item.error || "无有效分数"}`
-          : `${item.engine_name}: ${item.target}`;
-        return (
-          <span
-            className={`sqa-score-chip ${failed ? "failed" : ""}`}
-            key={`${item.engine_name}-${item.target}`}
-            title={title}
-          >
-            <em>{item.engine_name}</em>
-            <strong>{formatSqaScore(item.score)}</strong>
-          </span>
-        );
-      })}
-    </span>
-  );
-}
-
-function MarkdownDocument({ markdown }: { markdown: string }) {
-  const blocks = useMemo(() => parseMarkdown(markdown), [markdown]);
-  const headings = blocks.filter(
-    (block): block is Extract<MarkdownBlock, { type: "heading" }> =>
-      block.type === "heading" && block.level === 2 && block.text !== "目录",
-  );
-  const contentBlocks = blocks.filter((block, index) => {
-    if (block.type === "heading" && block.level === 1) {
-      return false;
-    }
-    if (block.type === "heading" && block.text === "目录") {
-      return false;
-    }
-    const previous = blocks[index - 1];
-    return !(
-      block.type === "list" &&
-      previous?.type === "heading" &&
-      previous.text === "目录"
-    );
-  });
-  return (
-    <div className="help-document-layout">
-      {headings.length ? (
-        <details className="markdown-toc" open>
-          <summary>本文目录</summary>
-          <nav aria-label="帮助文档目录">
-            {headings.map((heading) => (
-              <a href={`#${heading.id}`} key={heading.id}>{heading.text}</a>
-            ))}
-          </nav>
-        </details>
-      ) : null}
-      <article className="markdown-document">
-      {contentBlocks.map((block, index) => {
-        if (block.type === "heading") {
-          const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
-          return (
-            <HeadingTag id={block.id} key={index}>
-              {renderInlineMarkdown(block.text)}
-            </HeadingTag>
-          );
-        }
-        if (block.type === "formula") {
-          return <LatexFormula key={index} text={block.text} displayMode />;
-        }
-        if (block.type === "code") {
-          return (
-            <pre key={index} className="markdown-code-block">
-              {block.language ? <span>{block.language}</span> : null}
-              <code>{block.text}</code>
-            </pre>
-          );
-        }
-        if (block.type === "list") {
-          return (
-            <ul key={index}>
-              {block.items.map((item, itemIndex) => (
-                <li key={itemIndex}>{renderInlineMarkdown(item)}</li>
-              ))}
-            </ul>
-          );
-        }
-        if (block.type === "table") {
-          return (
-            <div className="table-wrap markdown-table-wrap" key={index}>
-              <table>
-                <thead>
-                  <tr>
-                    {block.headers.map((header, headerIndex) => (
-                      <th key={headerIndex}>{renderInlineMarkdown(header)}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {block.rows.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      {block.headers.map((_, cellIndex) => (
-                        <td key={cellIndex}>
-                          {renderInlineMarkdown(row[cellIndex] ?? "")}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              </aside>
             </div>
-          );
-        }
-        return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
-      })}
-      </article>
-    </div>
-  );
-}
-
-function LatexFormula({
-  text,
-  displayMode = false,
-}: {
-  text: string;
-  displayMode?: boolean;
-}) {
-  const html = useMemo(
-    () =>
-      katex.renderToString(text, {
-        displayMode,
-        throwOnError: false,
-        strict: false,
-        trust: false,
-      }),
-    [displayMode, text],
-  );
-
-  if (displayMode) {
-    return (
-      <div
-        className="markdown-formula"
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
-    );
-  }
-  return (
-    <span
-      className="markdown-inline-formula"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  );
-}
-
-function AsrOverviewMetrics({ result }: { result: EvaluationResult | null }) {
-  if (!result) {
-    return null;
-  }
-  const wordAccuracy =
-    result.word_accuracy ??
-    result.accuracy ??
-    result.wer_report?.summary?.accuracy;
-  const characterAccuracy =
-    result.character_accuracy ??
-    result.cer_report?.summary?.accuracy;
-
-  return (
-    <div className="panel asr-overview-panel">
-      <div className="metric-strip asr-overview-metrics">
-        <Metric label="词正确率" value={formatPercentScale(wordAccuracy)} />
-        <Metric label="字正确率" value={formatPercentScale(characterAccuracy)} />
-        <Metric label="WER" value={formatPercentScale(result.wer)} />
-        <Metric label="CER" value={formatPercentScale(result.cer)} />
-      </div>
-      <SampleCountStrip
-        result={result}
-        fallbackCount={
-          result.wer_report?.utterances.length ??
-          result.cer_report?.utterances.length ??
-          0
-        }
-      />
-    </div>
-  );
-}
-
-function VadOverviewMetrics({ result }: { result: EvaluationResult | null }) {
-  if (!result) {
-    return null;
-  }
-
-  return <VadMetricGroups metrics={result} />;
-}
-
-function LidOverviewMetrics({ result }: { result: EvaluationResult | null }) {
-  if (!result) {
-    return null;
-  }
-
-  return (
-    <div className="metric-strip lid-overview-metrics">
-      <Metric label="已知语种准确率" value={formatRate(result.known_accuracy ?? result.accuracy)} />
-      <Metric label="宏平均精确率" value={formatRate(result.macro_precision ?? result.precision)} />
-      <Metric label="宏平均召回率" value={formatRate(result.macro_recall ?? result.recall)} />
-      <Metric label="未知误接收" value={formatNumber(result.unknown_false_accept_count)} />
-      <Metric label="已知被拒识" value={formatNumber(result.known_reject_count)} />
-    </div>
-  );
-}
-
-function KeywordOverviewMetrics({ result }: { result: EvaluationResult | null }) {
-  if (!result) {
-    return null;
-  }
-
-  return (
-    <div className="panel keyword-overview-panel">
-      <div className="metric-strip keyword-overview-metrics">
-        <Metric label="Accuracy" value={formatRate(result.accuracy)} />
-        <Metric label="Precision" value={formatRate(result.precision)} />
-        <Metric label="Recall" value={formatRate(result.recall)} />
-        <Metric label="F1" value={formatRate(result.f1)} />
-        <Metric label="Miss" value={formatNumber(result.miss_count)} />
-        <Metric label="False Alarm" value={formatNumber(result.false_alarm_count)} />
-      </div>
-      <SampleCountStrip
-        result={result}
-        fallbackCount={result.keyword_report?.samples.length ?? 0}
-      />
-    </div>
-  );
-}
-
-function DenoiseOverviewMetrics({ result }: { result: EvaluationResult | null }) {
-  if (!result) {
-    return null;
-  }
-
-  return (
-    <div className="panel denoise-overview-panel">
-      <div className="metric-strip denoise-overview-metrics">
-        <Metric label="SNR Δ" value={formatSignedScore(result.mean_snr_delta)} />
-        <Metric label="MOS Δ" value={formatSignedScore(result.mean_mos_delta)} />
-        <Metric label="SNR Samples" value={formatNumber(result.scored_snr_sample_count)} />
-        <Metric label="MOS Samples" value={formatNumber(result.scored_mos_sample_count)} />
-        <Metric label="Failed" value={formatNumber(result.failed_sample_count)} />
-      </div>
-      <SampleCountStrip
-        result={result}
-        fallbackCount={result.denoise_report?.samples.length ?? 0}
-      />
-    </div>
-  );
-}
-
-function VadMetricGroups({ metrics }: { metrics: EvaluationResult }) {
-  const frame = metrics.frame;
-  const segment = metrics.segment;
-  const frameMacro = metrics.frame_macro;
-  const segmentMacro = metrics.segment_macro;
-
-  return (
-    <div className="vad-metric-groups">
-      <section className="vad-metric-section">
-        <div className="vad-metric-title">
-          <span>帧级指标（Micro）</span>
-          <strong>{formatRate(frame?.frame_f1 ?? metrics.frame_f1)}</strong>
-        </div>
-        <div className="report-summary vad-summary vad-frame-summary">
-          <Metric
-            label="Accuracy"
-            value={formatRate(frame?.frame_accuracy ?? metrics.frame_accuracy)}
-          />
-          <Metric
-            label="Recall"
-            value={formatRate(frame?.frame_recall ?? metrics.frame_recall)}
-          />
-          <Metric
-            label="Precision"
-            value={formatRate(frame?.frame_precision ?? metrics.frame_precision)}
-          />
-          <Metric label="F1" value={formatRate(frame?.frame_f1 ?? metrics.frame_f1)} />
-        </div>
-        <div className="report-summary vad-summary vad-macro-summary">
-          <Metric label="Macro Accuracy" value={formatRate(frameMacro?.frame_accuracy)} />
-          <Metric label="Macro Recall" value={formatRate(frameMacro?.frame_recall)} />
-          <Metric label="Macro Precision" value={formatRate(frameMacro?.frame_precision)} />
-          <Metric label="Macro F1" value={formatRate(frameMacro?.frame_f1)} />
-        </div>
-      </section>
-
-      <section className="vad-metric-section">
-        <div className="vad-metric-title">
-          <span>段级指标（Micro）</span>
-          <strong>{formatRate(segment?.segment_f1)}</strong>
-        </div>
-        <div className="report-summary vad-summary">
-          <Metric
-            label="Recall"
-            value={formatRate(segment?.segment_recall ?? metrics.segment_recall)}
-          />
-          <Metric
-            label="Precision"
-            value={formatRate(segment?.segment_precision ?? metrics.segment_precision)}
-          />
-          <Metric label="F1" value={formatRate(segment?.segment_f1)} />
-        </div>
-        <div className="report-summary vad-summary vad-macro-summary">
-          <Metric label="Macro Recall" value={formatRate(segmentMacro?.segment_recall)} />
-          <Metric label="Macro Precision" value={formatRate(segmentMacro?.segment_precision)} />
-          <Metric label="Macro F1" value={formatRate(segmentMacro?.segment_f1)} />
-        </div>
-        <div className="metric-strip vad-segment-counts">
-          <Metric
-            label="Reference Segments"
-            value={formatNumber(
-              segment?.reference_segment_count ?? metrics.reference_segment_count,
+            {blocked && (
+              <div className="inline-message">
+                此类型已有任务正在运行。
+                <button
+                  type="button"
+                  className="text-action"
+                  onClick={() =>
+                    navigate(`/evaluations/${latest[task]}?view=run`)
+                  }
+                >
+                  查看运行进度 →
+                </button>
+              </div>
             )}
-          />
-          <Metric
-            label="Prediction Segments"
-            value={formatNumber(
-              segment?.prediction_segment_count ?? metrics.prediction_segment_count,
-            )}
-          />
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function AsrAlignmentReportPanel({
-  werReport,
-  cerReport,
-  activeMetric,
-  onActiveMetricChange,
-  result,
-  sortMode,
-  onSortModeChange,
-  wrapAlignment,
-  onWrapAlignmentChange,
-}: {
-  werReport: WerReport | undefined;
-  cerReport: WerReport | undefined;
-  activeMetric: AlignmentMetric;
-  onActiveMetricChange: (metric: AlignmentMetric) => void;
-  result: EvaluationResult | null;
-  sortMode: ReportSortMode;
-  onSortModeChange: (sortMode: ReportSortMode) => void;
-  wrapAlignment: boolean;
-  onWrapAlignmentChange: (wrapAlignment: boolean) => void;
-}) {
-  const activeReport = activeMetric === "wer" ? werReport : cerReport;
-  const activeLabel: "WER" | "CER" = activeMetric === "wer" ? "WER" : "CER";
-  const sampleCount = werReport?.utterances.length ?? cerReport?.utterances.length ?? 0;
-  const utterances = useMemo(
-    () =>
-      sortAlignmentUtterances(activeReport?.utterances ?? [], sortMode, {
-        wer: werReport,
-        cer: cerReport,
-      }),
-    [activeReport?.utterances, cerReport, sortMode, werReport],
-  );
-  return (
-    <div className="panel report-panel asr-report-panel compact-report-panel">
-      <div className="panel-heading compact-heading">
-        <div>
-          <h2>对齐报告</h2>
-          <span>{sampleCount} 个样本</span>
-        </div>
-        <div className="report-controls">
-          <label className="wrap-control">
-            <input
-              type="checkbox"
-              checked={wrapAlignment}
-              onChange={(event) => onWrapAlignmentChange(event.target.checked)}
-            />
-            <span>自动换行</span>
-          </label>
-          <label className="sort-control">
-            <span>排序</span>
-            <select
-              value={sortMode}
-              onChange={(event) =>
-                onSortModeChange(event.target.value as ReportSortMode)
-              }
-            >
-              <option value="index-asc">索引升序</option>
-              <option value="index-desc">索引降序</option>
-              <option value="wer-desc">WER 降序</option>
-              <option value="wer-asc">WER 升序</option>
-              <option value="cer-desc">CER 降序</option>
-              <option value="cer-asc">CER 升序</option>
-            </select>
-          </label>
-        </div>
-      </div>
-
-      {werReport?.summary || cerReport?.summary ? (
-        <>
-          <div className="asr-summary-grid">
-            <AsrMetricSummaryCard
-              label="WER"
-              summary={werReport?.summary}
-              fallbackRate={result?.wer}
-              accuracy={result?.word_accuracy}
-              accuracyLabel="词正确率"
-            />
-            <AsrMetricSummaryCard
-              label="CER"
-              summary={cerReport?.summary}
-              fallbackRate={result?.cer}
-              accuracy={result?.character_accuracy}
-              accuracyLabel="字正确率"
-            />
-          </div>
-          <CompactReportMeta result={result} fallbackCount={sampleCount} />
-          <SqaSummaryMetrics summary={result?.sqa_summary} />
-          <div className="alignment-metric-tabs" role="tablist" aria-label="对齐指标">
-            <button
-              type="button"
-              className={activeMetric === "wer" ? "active" : ""}
-              aria-selected={activeMetric === "wer"}
-              role="tab"
-              onClick={() => onActiveMetricChange("wer")}
-            >
-              WER
-            </button>
-            <button
-              type="button"
-              className={activeMetric === "cer" ? "active" : ""}
-              aria-selected={activeMetric === "cer"}
-              role="tab"
-              onClick={() => onActiveMetricChange("cer")}
-            >
-              CER
-            </button>
-          </div>
-          <div className="utterance-list">
-            {utterances.map((utterance, index) => (
-              <details
-                className="utterance"
-                key={utterance.id}
-                open={index < 3}
-              >
-                <summary>
-                  <span className="utterance-title">
-                    <strong>#{utterance.index ?? "-"}</strong>
-                    <span>{utterance.id || "-"}</span>
-                  </span>
-                  <TokenCounts
-                    metricLabel={activeLabel}
-                    summary={utterance.summary}
-                    tokens={utterance.tokens}
-                  />
-                  <SqaScoreChips scores={utterance.sqa_scores} />
-                </summary>
-                <div className="utterance-body">
-                  <div className="utterance-audio-row">
-                    <AudioPlayer
-                      src={utterance.audio_url}
-                      durationSeconds={utterance.duration_seconds}
-                    />
-                  </div>
-                  <WerAlignmentRows tokens={utterance.tokens} wrap={wrapAlignment} />
-                </div>
-              </details>
-            ))}
-          </div>
+          </form>
         </>
-      ) : (
-        <div className="empty-state">评估完成后生成对齐报告</div>
       )}
-    </div>
-  );
-}
-
-function VadReportPanel({
-  result,
-}: {
-  result: EvaluationResult | null;
-}) {
-  const samples = result?.vad_report?.samples ?? [];
-  return (
-    <div className="panel report-panel vad-report-panel compact-report-panel">
-      <div className="panel-heading compact-heading">
-        <div>
-          <h2>VAD 报告</h2>
-          <span>{formatNumber(result?.sample_count)} 个样本</span>
-        </div>
-        <div className="report-controls vad-report-controls">
-          <div className="vad-legend report-legend">
-            <LegendItem className="hit" label="命中" />
-            <LegendItem className="miss" label="漏检" />
-            <LegendItem className="false_alarm" label="虚警" />
-            <LegendItem className="correct_reject" label="静音正确" />
-          </div>
-        </div>
-      </div>
-      {result ? (
+      {route.page === "tasks" && (
         <>
-          <CompactReportMeta result={result} fallbackCount={samples.length} />
-          <SqaSummaryMetrics summary={result.sqa_summary} />
-          <VadMaskReport samples={samples} />
-        </>
-      ) : (
-        <div className="empty-state">评估完成后生成 VAD 指标</div>
-      )}
-    </div>
-  );
-}
-
-function LidReportPanel({
-  result,
-}: {
-  result: EvaluationResult | null;
-}) {
-  const samples = result?.lid_report?.samples ?? [];
-  return (
-    <div className="panel report-panel lid-report-panel compact-report-panel">
-      <div className="panel-heading compact-heading">
-        <div>
-          <h2>LID 报告</h2>
-          <span>{formatNumber(result?.sample_count)} 个样本</span>
-        </div>
-      </div>
-      {result ? (
-        <>
-          <div className="report-summary lid-summary">
-            <Metric
-              label="已知语种准确率"
-              value={formatRate(result.known_accuracy ?? result.accuracy)}
-            />
-            <Metric
-              label="宏平均精确率"
-              value={formatRate(result.macro_precision ?? result.precision)}
-            />
-            <Metric
-              label="宏平均召回率"
-              value={formatRate(result.macro_recall ?? result.recall)}
-            />
-            <Metric
-              label="未知误接收"
-              value={formatNumber(result.unknown_false_accept_count)}
-            />
-            <Metric
-              label="已知被拒识"
-              value={formatNumber(result.known_reject_count)}
-            />
-          </div>
-          <CompactReportMeta result={result} fallbackCount={samples.length} />
-          <SqaSummaryMetrics summary={result.sqa_summary} />
-          <LidMetricsDetails result={result} />
-          <LidSampleList samples={samples} />
-        </>
-      ) : (
-        <div className="empty-state">评估完成后生成 LID 报告</div>
-      )}
-    </div>
-  );
-}
-
-function KeywordReportPanel({
-  result,
-}: {
-  result: EvaluationResult | null;
-}) {
-  const samples = result?.keyword_report?.samples ?? [];
-  const audioSamples = result?.keyword_audio_report?.samples ?? [];
-  const [viewMode, setViewMode] = useState<"keyword" | "audio">("keyword");
-  return (
-    <div className="panel report-panel keyword-report-panel compact-report-panel">
-      <div className="panel-heading compact-heading">
-        <div>
-          <h2>关键词报告</h2>
-          <span>
-            {formatNumber(result?.sample_count)} 个关键词 /{" "}
-            {formatNumber(result?.audio_sample_count ?? audioSamples.length)} 条语音
-          </span>
-        </div>
-      </div>
-      {result ? (
-        <>
-          <div className="report-summary keyword-summary">
-            <Metric label="Accuracy" value={formatRate(result.accuracy)} />
-            <Metric label="Precision" value={formatRate(result.precision)} />
-            <Metric label="Recall" value={formatRate(result.recall)} />
-            <Metric label="F1" value={formatRate(result.f1)} />
-            <Metric label="Hit" value={formatNumber(result.hit_count)} />
-            <Metric label="Miss" value={formatNumber(result.miss_count)} />
-            <Metric
-              label="False Alarm"
-              value={formatNumber(result.false_alarm_count)}
-            />
-            <Metric
-              label="Correct Reject"
-              value={formatNumber(result.correct_reject_count)}
-            />
-          </div>
-          <CompactReportMeta result={result} fallbackCount={samples.length} />
-          <SqaSummaryMetrics summary={result.sqa_summary} />
-          {audioSamples.length ? (
-            <div className="keyword-view-tabs" role="tablist" aria-label="关键词报告视图">
-              <button
-                type="button"
-                className={viewMode === "keyword" ? "active" : ""}
-                onClick={() => setViewMode("keyword")}
-              >
-                按关键词
-              </button>
-              <button
-                type="button"
-                className={viewMode === "audio" ? "active" : ""}
-                onClick={() => setViewMode("audio")}
-              >
-                按语音
-              </button>
+          <header className="page-heading">
+            <div>
+              <h1>当前任务</h1>
+              <p>
+                此浏览器记录的各类型最近任务，最多五项。任务由当前服务进程提供。
+              </p>
             </div>
-          ) : null}
-          {viewMode === "audio" && audioSamples.length ? (
-            <KeywordAudioSampleList samples={audioSamples} />
+            <Button onClick={() => navigate("/evaluations/new")}>
+              <Plus size={16} />
+              新建评估
+            </Button>
+          </header>
+          {latestEntries.length ? (
+            <div className="task-table">
+              <div className="task-table-head">
+                <span>评估任务</span>
+                <span>数据集</span>
+                <span>状态</span>
+                <span>进度</span>
+                <span />
+              </div>
+              {latestEntries.map((t) => {
+                const id = latest[t.id]!,
+                  r = jobs[id],
+                  s = r?.snapshot;
+                return (
+                  <a
+                    className="task-table-row"
+                    key={id}
+                    href={`/evaluations/${id}?view=run`}
+                    onClick={(e) => {
+                      if (e.ctrlKey || e.metaKey) return;
+                      e.preventDefault();
+                      navigate(`/evaluations/${id}?view=run`);
+                    }}
+                  >
+                    <span>
+                      <strong>{t.label} 评估</strong>
+                      <small>{id}</small>
+                    </span>
+                    <span title={s?.request.dataset_path}>
+                      {s?.request.dataset_path ?? "—"}
+                    </span>
+                    <span>
+                      {s ? (
+                        <StatusPill status={s.status} />
+                      ) : r?.error ? (
+                        "不可用"
+                      ) : (
+                        "读取中"
+                      )}
+                    </span>
+                    <span>
+                      {s?.progress?.total
+                        ? `${s.progress.processed ?? 0} / ${s.progress.total}`
+                        : "—"}
+                    </span>
+                    <ArrowRight size={16} />
+                  </a>
+                );
+              })}
+            </div>
           ) : (
-            <KeywordSampleList samples={samples} />
+            <div className="paper-empty">
+              <Activity size={28} />
+              <h2>还没有评估任务</h2>
+              <p>从一次评估开始，运行状态和结果会显示在这里。</p>
+              <Button onClick={() => navigate("/evaluations/new")}>
+                新建评估
+              </Button>
+            </div>
           )}
         </>
-      ) : (
-        <div className="empty-state">评估完成后生成关键词报告</div>
       )}
-    </div>
-  );
-}
-
-function KeywordAudioSampleList({ samples }: { samples: KeywordAudioReportSample[] }) {
-  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
-  useEffect(() => {
-    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
-  }, [samples]);
-
-  if (!samples.length) {
-    return <div className="empty-state">评估完成后生成语音聚合结果</div>;
-  }
-  const visibleSamples = samples.slice(0, visibleCount);
-
-  return (
-    <>
-      <KeywordListToolbar
-        total={samples.length}
-        visible={visibleSamples.length}
-        onCollapse={
-          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
-            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
-            : undefined
-        }
-      />
-      <div className="keyword-sample-list">
-        {visibleSamples.map((sample) => (
-          <section className="keyword-sample keyword-audio-sample" key={sample.id}>
-            <div className="keyword-sample-title">
-              <span className="keyword-sample-name">
-                <strong>#{sample.index ?? "-"}</strong>
-                <span title={sample.id}>{sample.id}</span>
-              </span>
-              <span className="keyword-status">
-                {formatNumber(sample.keywords.length)} 个关键词
-              </span>
-            </div>
-            <AudioPlayer
-              src={sample.audio_url}
-              durationSeconds={sample.duration_seconds}
-            />
-            <SqaScoreChips scores={sample.sqa_scores} />
-            <div className="keyword-token-list">
-              {sample.keywords.map((keyword) => (
-                <div
-                  className={`keyword-token ${keyword.correct ? "correct" : "incorrect"}`}
-                  key={keyword.id}
-                >
-                  <span title={keyword.id}>{keyword.keyword}</span>
-                  <small>
-                    {keyword.expected_hit ? "Expected Hit" : "Expected No Hit"} /{" "}
-                    {keyword.predicted_hit ? "Predicted Hit" : "Predicted No Hit"}
-                  </small>
-                </div>
-              ))}
-            </div>
-            <KeywordMatchTextBlock
-              matchText={sample.match_text}
-              highlights={keywordHighlightsFromAudioSample(sample)}
-            />
-          </section>
-        ))}
-        {visibleCount < samples.length ? (
-          <KeywordLoadMoreButton
-            onClick={() =>
-              setVisibleCount((current) =>
-                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
-              )
-            }
-          />
-        ) : null}
-      </div>
-    </>
-  );
-}
-
-function KeywordSampleList({ samples }: { samples: KeywordReportSample[] }) {
-  const [visibleCount, setVisibleCount] = useState(KEYWORD_REPORT_INITIAL_VISIBLE);
-  useEffect(() => {
-    setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE);
-  }, [samples]);
-
-  if (!samples.length) {
-    return <div className="empty-state">评估完成后生成关键词结果</div>;
-  }
-  const visibleSamples = samples.slice(0, visibleCount);
-
-  return (
-    <>
-      <KeywordListToolbar
-        total={samples.length}
-        visible={visibleSamples.length}
-        onCollapse={
-          visibleSamples.length > KEYWORD_REPORT_INITIAL_VISIBLE
-            ? () => setVisibleCount(KEYWORD_REPORT_INITIAL_VISIBLE)
-            : undefined
-        }
-      />
-      <div className="keyword-sample-list">
-        {visibleSamples.map((sample) => (
-          <section
-            className={`keyword-sample ${sample.correct ? "correct" : "incorrect"}`}
-            key={sample.id}
-          >
-            <div className="keyword-sample-title">
-              <span className="keyword-sample-name">
-                <strong>#{sample.index ?? "-"}</strong>
-                <span title={sample.id}>{sample.id}</span>
-              </span>
-              <span className={`keyword-status ${sample.correct ? "correct" : "incorrect"}`}>
-                {sample.correct ? "正确" : "错误"}
-              </span>
-            </div>
-            <AudioPlayer
-              src={sample.audio_url}
-              durationSeconds={sample.duration_seconds}
-            />
-            <div className="keyword-sample-metrics">
-              <Metric label="Keyword" value={sample.keyword || "-"} />
-              <Metric label="Expected" value={sample.expected_hit ? "Hit" : "No Hit"} />
-              <Metric label="Prediction" value={sample.predicted_hit ? "Hit" : "No Hit"} />
-            </div>
-            <SqaScoreChips scores={sample.sqa_scores} />
-            <div className="keyword-transcript-grid">
-              <TextBlock label="Transcript" value={sample.transcript || "-"} />
-              <KeywordMatchTextBlock
-                matchText={sample.match_text}
-                highlights={keywordHighlightsFromSample(sample)}
-              />
-            </div>
-          </section>
-        ))}
-        {visibleCount < samples.length ? (
-          <KeywordLoadMoreButton
-            onClick={() =>
-              setVisibleCount((current) =>
-                Math.min(current + KEYWORD_REPORT_LOAD_STEP, samples.length),
-              )
-            }
-          />
-        ) : null}
-      </div>
-    </>
-  );
-}
-
-function KeywordListToolbar({
-  total,
-  visible,
-  onCollapse,
-}: {
-  total: number;
-  visible: number;
-  onCollapse?: () => void;
-}) {
-  return (
-    <div className="keyword-list-toolbar">
-      <span>
-        已显示 {formatNumber(visible)} / {formatNumber(total)}
-      </span>
-      {onCollapse ? (
-        <button type="button" onClick={onCollapse}>
-          收起
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-function KeywordLoadMoreButton({ onClick }: { onClick: () => void }) {
-  return (
-    <button type="button" className="keyword-load-more" onClick={onClick}>
-      加载更多
-    </button>
-  );
-}
-
-function DenoiseReportPanel({
-  result,
-}: {
-  result: EvaluationResult | null;
-}) {
-  const samples = result?.denoise_report?.samples ?? [];
-  return (
-    <div className="panel report-panel denoise-report-panel compact-report-panel">
-      <div className="panel-heading compact-heading">
-        <div>
-          <h2>SE 报告</h2>
-          <span>{formatNumber(result?.sample_count)} 个样本</span>
-        </div>
-      </div>
-      {result ? (
+      {route.page === "job" && (
         <>
-          <div className="report-summary denoise-summary">
-            <Metric label="SNR Δ" value={formatSignedScore(result.mean_snr_delta)} />
-            <Metric label="MOS Δ" value={formatSignedScore(result.mean_mos_delta)} />
-            <Metric label="SNR Before" value={formatSqaScore(result.mean_original_snr)} />
-            <Metric label="SNR After" value={formatSqaScore(result.mean_denoised_snr)} />
-            <Metric label="MOS Before" value={formatSqaScore(result.mean_original_mos)} />
-            <Metric label="MOS After" value={formatSqaScore(result.mean_denoised_mos)} />
-          </div>
-          <CompactReportMeta result={result} fallbackCount={samples.length} />
-          <DenoiseSampleList samples={samples} />
-        </>
-      ) : (
-        <div className="empty-state">评估完成后生成 SE 报告</div>
-      )}
-    </div>
-  );
-}
-
-function DenoiseSampleList({ samples }: {
-  samples: DenoiseReportSample[];
-}) {
-  if (!samples.length) {
-    return <div className="empty-state">评估完成后生成 SE 结果</div>;
-  }
-
-  return (
-    <div className="denoise-sample-list">
-      {samples.map((sample) => (
-        <section
-          className={`denoise-sample ${sample.error ? "failed" : ""}`}
-          key={sample.id}
-        >
-          <div className="denoise-sample-title">
-            <span className="denoise-sample-name">
-              <strong>#{sample.index ?? "-"}</strong>
-              <span title={sample.id}>{sample.id}</span>
-            </span>
-            {sample.error ? (
-              <span className="denoise-error" title={sample.error}>
-                {sample.error}
-              </span>
-            ) : null}
-          </div>
-          <div className="denoise-audio-grid">
-            <div>
-              <span>原始</span>
-              <AudioPlayer
-                src={sample.audio_url}
-                durationSeconds={sample.duration_seconds}
-              />
-            </div>
-            <div>
-              <span>SE</span>
-              <AudioPlayer
-                src={sample.denoised_audio_url || undefined}
-                durationSeconds={sample.duration_seconds}
-              />
-            </div>
-          </div>
-          <DenoiseSampleMetrics sample={sample} />
-        </section>
-      ))}
-    </div>
-  );
-}
-
-function DenoiseSampleMetrics({ sample }: { sample: DenoiseReportSample }) {
-  const rows = [
-    {
-      label: "SNR",
-      before: sample.original_snr,
-      after: sample.denoised_snr,
-      delta: sample.snr_delta,
-    },
-    {
-      label: "MOS",
-      before: sample.original_mos,
-      after: sample.denoised_mos,
-      delta: sample.mos_delta,
-    },
-  ].filter(
-    (row) =>
-      hasFiniteNumber(row.before) ||
-      hasFiniteNumber(row.after) ||
-      hasFiniteNumber(row.delta),
-  );
-
-  if (!rows.length) {
-    return <div className="denoise-metric-empty">暂无质量指标</div>;
-  }
-
-  return (
-    <div className="denoise-metric-table" role="table" aria-label="SE 质量指标">
-      <div className="denoise-metric-row denoise-metric-header" role="row">
-        <span role="columnheader">指标</span>
-        <span role="columnheader">Before</span>
-        <span role="columnheader">After</span>
-        <span role="columnheader">Δ</span>
-      </div>
-      {rows.map((row) => (
-        <div className="denoise-metric-row" role="row" key={row.label}>
-          <strong role="rowheader">{row.label}</strong>
-          <span role="cell">{formatSqaScore(row.before)}</span>
-          <span role="cell">{formatSqaScore(row.after)}</span>
-          <span className="delta" role="cell">
-            {formatSignedScore(row.delta)}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function LidMetricsDetails({ result }: { result: EvaluationResult }) {
-  const recalls = getKnownLidLanguageRecalls(result);
-  const hasRecalls = recalls.length > 0;
-  const matrix = result.lid_confusion_matrix;
-  const hasMatrix =
-    (matrix?.rows ?? []).length > 0 && (matrix?.predicted_languages ?? []).length > 0;
-  const overallCorrect = result.overall_correct_count ?? result.correct_count;
-  const errorCount = getLidErrorCount(result);
-
-  if (!hasRecalls && !hasMatrix) {
-    return null;
-  }
-
-  return (
-    <details className="lid-metrics-details">
-      <summary>
-        <span>类别指标与混淆矩阵</span>
-        <small>
-          {recalls.length} 类 / 正确 {formatNumber(overallCorrect)} / 错误{" "}
-          {formatNumber(errorCount)} / 未知误接收{" "}
-          {formatNumber(result.unknown_false_accept_count)}
-          {" / "}
-          已知拒识 {formatNumber(result.known_reject_count)}
-        </small>
-      </summary>
-      <div className="lid-metrics-scroll">
-        <LidMetricsTables result={result} />
-      </div>
-    </details>
-  );
-}
-
-function LidMetricsTables({ result }: { result: EvaluationResult }) {
-  const recalls = getKnownLidLanguageRecalls(result);
-  const matrix = result.lid_confusion_matrix;
-  const matrixRows = matrix?.rows ?? [];
-  const predictedLanguages = matrix?.predicted_languages ?? [];
-  const hasMatrix = matrixRows.length > 0 && predictedLanguages.length > 0;
-
-  if (!recalls.length && !hasMatrix) {
-    return null;
-  }
-
-  return (
-    <div className="lid-metrics-grid">
-      {recalls.length ? (
-        <section className="metric-table-section">
-          <div className="metric-table-heading">
-            <h3>类别指标</h3>
-          </div>
-          <div className="table-wrap lid-recall-table">
-            <table>
-              <thead>
-                <tr>
-                  <th>真实标签</th>
-                  <th>正确数</th>
-                  <th>真实总数</th>
-                  <th>预测总数</th>
-                  <th>精确率</th>
-                  <th>召回率</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recalls.map((item) => (
-                  <tr
-                    className={item.recall < 0.9 ? "low-recall" : ""}
-                    key={item.language}
-                  >
-                    <td title={item.language}>{item.language || "-"}</td>
-                    <td>{formatNumber(item.correct_count)}</td>
-                    <td>{formatNumber(item.sample_count)}</td>
-                    <td>{formatNumber(item.predicted_count)}</td>
-                    <td>{formatRate(item.precision)}</td>
-                    <td>{formatRate(item.recall)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      ) : null}
-      {hasMatrix ? (
-        <section className="metric-table-section">
-          <div className="metric-table-heading">
-            <h3>混淆矩阵</h3>
-          </div>
-          <div className="table-wrap lid-confusion-table">
-            <table>
-              <thead>
-                <tr>
-                  <th title="真实标签 / 预测标签">真实/预测</th>
-                  {predictedLanguages.map((language) => (
-                    <th key={language} title={language}>
-                      {language || "-"}
-                    </th>
-                  ))}
-                  <th>总数</th>
-                  <th>召回率</th>
-                </tr>
-              </thead>
-              <tbody>
-                {matrixRows.map((row) => (
-                  <tr key={row.reference_language}>
-                    <th title={row.reference_language}>{row.reference_language || "-"}</th>
-                    {predictedLanguages.map((language) => (
-                      <td
-                        className={lidConfusionCellClass(
-                          row.reference_language,
-                          language,
-                          row.counts[language] ?? 0,
-                          row.total,
-                        )}
-                        key={`${row.reference_language}:${language}`}
-                        title={`${row.reference_language || "-"} -> ${language || "-"}: ${formatNumber(row.counts[language] ?? 0)}`}
-                      >
-                        {formatNumber(row.counts[language] ?? 0)}
-                      </td>
-                    ))}
-                    <td>{formatNumber(row.total)}</td>
-                    <td>{formatRate(getLidMatrixRowRecall(result, row.reference_language))}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      ) : null}
-    </div>
-  );
-}
-
-function lidConfusionCellClass(
-  referenceLanguage: string,
-  predictedLanguage: string,
-  count: number,
-  total: number,
-): string {
-  const ratio = total > 0 ? count / total : 0;
-  const level = count > 0 ? Math.max(1, Math.min(5, Math.ceil(ratio * 5))) : 0;
-  const status = referenceLanguage === predictedLanguage ? "diagonal" : "error";
-  return `confusion-cell ${status} heat-${level}`;
-}
-
-function getLidErrorCount(result: EvaluationResult): number | undefined {
-  const sampleCount = toDisplayNumber(result.sample_count);
-  const correctCount = toDisplayNumber(result.overall_correct_count ?? result.correct_count);
-  if (sampleCount === undefined || correctCount === undefined) {
-    return undefined;
-  }
-  return Math.max(0, sampleCount - correctCount);
-}
-
-function getKnownLidLanguageRecalls(result: EvaluationResult) {
-  return (result.lid_language_recalls ?? []).filter(
-    (item) => item.language !== "<others>",
-  );
-}
-
-function getLidMatrixRowRecall(
-  result: EvaluationResult,
-  referenceLanguage: string,
-): number | undefined {
-  if (referenceLanguage === "<others>") {
-    return undefined;
-  }
-  const recall = result.lid_language_recalls?.find(
-    (item) => item.language === referenceLanguage,
-  )?.recall;
-  if (typeof recall === "number") {
-    return recall;
-  }
-  const row = result.lid_confusion_matrix?.rows.find(
-    (item) => item.reference_language === referenceLanguage,
-  );
-  if (!row || row.total <= 0) {
-    return undefined;
-  }
-  return (row.counts[referenceLanguage] ?? 0) / row.total;
-}
-
-function toDisplayNumber(value: unknown): number | undefined {
-  const numeric = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(numeric) ? numeric : undefined;
-}
-
-function LidSampleList({ samples }: {
-  samples: LidReportSample[];
-}) {
-  if (!samples.length) {
-    return <div className="empty-state">评估完成后生成 LID 结果</div>;
-  }
-
-  return (
-    <div className="lid-sample-list">
-      {samples.map((sample) => (
-        <section
-          className={`lid-sample ${sample.correct ? "correct" : "incorrect"}`}
-          key={sample.id}
-        >
-          <div className="lid-sample-title">
-            <span className="lid-sample-name">
-              <strong>#{sample.index ?? "-"}</strong>
-              <span title={sample.id}>{sample.id}</span>
-            </span>
-            <div className="lid-result-line">
-              <span>
-                <em>真实</em>
-                <strong>{sample.reference_language || "-"}</strong>
-              </span>
-              <span>
-                <em>预测</em>
-                <strong>{sample.predicted_language || "-"}</strong>
-              </span>
-              <span>
-                <em>置信度</em>
-                <strong>{formatConfidence(sample.confidence)}</strong>
-              </span>
-            </div>
-            <SqaScoreChips scores={sample.sqa_scores} />
-            <div className="lid-sample-actions">
-              <b>{sample.correct ? "正确" : "错误"}</b>
-              <AudioPlayer
-                src={sample.audio_url}
-                durationSeconds={sample.duration_seconds}
-              />
-            </div>
-          </div>
-        </section>
-      ))}
-    </div>
-  );
-}
-
-function AsrMetricSummaryCard({
-  label,
-  summary,
-  fallbackRate,
-  accuracy,
-  accuracyLabel,
-}: {
-  label: "WER" | "CER";
-  summary?: WerSummary;
-  fallbackRate?: number;
-  accuracy?: number;
-  accuracyLabel: string;
-}) {
-  return (
-    <section className="asr-summary-card">
-      <div className="asr-summary-title">
-        <span>{label}</span>
-        <strong>{formatPercentScale(summary?.wer ?? fallbackRate)}</strong>
-      </div>
-      <div className="report-summary">
-        <Metric
-          label={accuracyLabel}
-          value={formatPercentScale(accuracy ?? summary?.accuracy)}
-        />
-        <Metric label="Correct" value={formatNumber(summary?.correct)} />
-        <Metric label="Sub" value={formatNumber(summary?.substitutions)} />
-        <Metric label="Del" value={formatNumber(summary?.deletions)} />
-        <Metric label="Ins" value={formatNumber(summary?.insertions)} />
-      </div>
-    </section>
-  );
-}
-
-function VadMaskReport({ samples }: {
-  samples: VadReportSample[];
-}) {
-  if (!samples.length) {
-    return <div className="empty-state">评估完成后生成 mask 对齐报告</div>;
-  }
-
-  return (
-    <div className="vad-report-list">
-      {samples.map((sample, index) => {
-        const timelineWidth = getVadTimelineWidth(sample.duration_seconds);
-        return (
-          <details className="vad-sample" key={sample.id} open={index < 3}>
-            <summary>
-              <span>
-                #{sample.index ?? "-"} {sample.id}
-              </span>
-              <AudioPlayer
-                src={sample.audio_url}
-                durationSeconds={sample.duration_seconds}
-              />
-              <SqaScoreChips scores={sample.sqa_scores} />
-              <small>{formatSeconds(sample.duration_seconds)}</small>
-            </summary>
-            <div className="vad-sample-body">
-              {sample.metrics ? (
-                <div className="sample-vad-metrics">
-                  <VadMetricGroups metrics={sample.metrics} />
-                </div>
-              ) : null}
-              <div className="vad-timeline-scroll" aria-label="VAD 时间轴">
-                <div
-                  className="vad-timeline-canvas"
-                  style={{ width: timelineWidth }}
-                >
-                  <VadTimeRuler duration={sample.duration_seconds} />
-                  <div className="mask-stack">
-                    <MaskTrack
-                      label="Reference"
-                      duration={sample.duration_seconds}
-                      segments={sample.reference_segments}
-                      regions={sample.regions}
-                      track="reference"
-                    />
-                    <MaskTrack
-                      label="Prediction"
-                      duration={sample.duration_seconds}
-                      segments={sample.prediction_segments}
-                      regions={sample.regions}
-                      track="prediction"
-                    />
-                    <div className="mask-row region-row">
-                      <span>Errors</span>
-                      <div className="region-track" aria-label="VAD 对齐区域">
-                        {sample.regions.map((region) => (
-                          <span
-                            className={`region region-${normalizeVadLabel(region.label)}`}
-                            key={`${sample.id}:${region.start_frame}:${region.end_frame}:${region.label}`}
-                            style={{
-                              left: `${toPercent(
-                                region.start,
-                                sample.duration_seconds,
-                              )}%`,
-                              width: `${toPercent(
-                                region.duration,
-                                sample.duration_seconds,
-                              )}%`,
-                            }}
-                            title={`${regionLabel(region.label)} ${formatSeconds(region.start)} - ${formatSeconds(region.end)}`}
-                          />
-                        ))}
-                      </div>
-                    </div>
+          {!snapshot ? (
+            <div className="paper-empty">
+              <h1>{record?.error ? "任务不可用" : "正在读取任务"}</h1>
+              <p>{record?.error || "正在从服务器获取运行状态…"}</p>
+              {record?.error && (
+                <>
+                  <p>服务重启后，内存中的任务可能已失效。</p>
+                  <div className="button-row">
+                    <Button
+                      variant="secondary"
+                      onClick={() => void load(route.jobId!)}
+                    >
+                      重新读取
+                    </Button>
+                    <Button onClick={() => navigate("/evaluations/new")}>
+                      新建评估
+                    </Button>
                   </div>
+                </>
+              )}
+            </div>
+          ) : (
+            <>
+              <header className="page-heading job-heading">
+                <div>
+                  <button
+                    className="back-link"
+                    onClick={() => navigate("/evaluations")}
+                  >
+                    ← 当前任务
+                  </button>
+                  <h1>{taskLabel(snapshot.request.task)} 评估</h1>
+                  <p
+                    className="job-subtitle"
+                    title={snapshot.request.dataset_path}
+                  >
+                    {snapshot.request.dataset_path}
+                    <span> / {snapshot.request.split}</span>
+                  </p>
+                  <code className="job-id">{snapshot.job_id}</code>
                 </div>
+                <div className="job-actions">
+                  <StatusPill status={snapshot.status} />
+                  <button
+                    className="ui-button ui-button-secondary"
+                    disabled={
+                      snapshot.status === "queued" ||
+                      snapshot.status === "running"
+                    }
+                    onClick={reevaluate}
+                  >
+                    <RefreshCw size={15} />
+                    重新评估
+                  </button>
+                  <button
+                    className="text-action"
+                    disabled={!snapshot.result}
+                    onClick={exportResult}
+                  >
+                    <Download size={15} />
+                    导出 JSON
+                  </button>
+                </div>
+              </header>
+              <nav className="detail-tabs" aria-label="任务详情">
+                {(
+                  [
+                    ["run", "运行"],
+                    ["report", "报告"],
+                    ["diagnosis", "样本诊断"],
+                    ["configuration", "运行配置"],
+                  ] as const
+                ).map(([id, label]) => (
+                  <a
+                    key={id}
+                    href={`?view=${id}`}
+                    aria-current={view === id ? "page" : undefined}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      query({ view: id, sample: null });
+                    }}
+                  >
+                    {label}
+                  </a>
+                ))}
+              </nav>
+              {(record?.warning || record?.error) && (
+                <div role="status" className="inline-message">
+                  {record.warning || record.error}
+                  <button
+                    className="text-action"
+                    onClick={() => void load(snapshot.job_id)}
+                  >
+                    刷新状态
+                  </button>
+                </div>
+              )}
+              <div className="job-content" key={snapshot.job_id}>
+                {view === "run" && (
+                  <div className="run-workspace">
+                    <section className="run-primary">
+                      <p className="eyebrow">运行状态</p>
+                      <h2>
+                        {snapshot.status === "queued"
+                          ? "任务已进入队列"
+                          : snapshot.status === "running"
+                            ? "正在评估数据集"
+                            : snapshot.status === "completed"
+                              ? "评估已完成"
+                              : "评估未完成"}
+                      </h2>
+                      <p>
+                        {snapshot.status === "queued"
+                          ? "服务正在准备评估，开始处理后将显示进度。"
+                          : snapshot.status === "completed"
+                            ? "结果已生成，可以查看报告或进入样本诊断。"
+                            : snapshot.status === "failed"
+                              ? "请检查失败原因，调整配置后创建新的评估任务。"
+                              : "你可以离开此页面，服务器会继续处理。"}
+                      </p>
+                      {(snapshot.status === "running" ||
+                        snapshot.status === "completed") && (
+                        <>
+                          <div className="run-count">
+                            <strong>
+                              {snapshot.progress?.processed ?? "—"}
+                            </strong>
+                            <span>
+                              / {snapshot.progress?.total ?? "—"} 个样本
+                            </span>
+                          </div>
+                          <progress
+                            aria-label="评估进度"
+                            max={snapshot.progress?.total || 1}
+                            {...(snapshot.progress?.total
+                              ? { value: snapshot.progress.processed ?? 0 }
+                              : {})}
+                          />
+                          <p>
+                            已评估 {snapshot.progress?.evaluated ?? "—"} 个样本
+                          </p>
+                        </>
+                      )}
+                      {snapshot.status === "failed" && (
+                        <div className="error-box" role="alert">
+                          {snapshot.error || "服务器未返回详细原因"}
+                        </div>
+                      )}
+                      {snapshot.status === "completed" && (
+                        <Button onClick={() => query({ view: "report" })}>
+                          查看评估报告 <ArrowRight size={16} />
+                        </Button>
+                      )}
+                    </section>
+                    <section className="run-context">
+                      <h3>当前样本</h3>
+                      <code>
+                        {snapshot.progress?.current_id ||
+                          snapshot.progress?.id ||
+                          "尚无样本"}
+                      </code>
+                      {snapshot.progress?.reference && (
+                        <>
+                          <p>参考内容</p>
+                          <div>{snapshot.progress.reference}</div>
+                        </>
+                      )}
+                      {snapshot.progress?.hypothesis && (
+                        <>
+                          <p>预测内容</p>
+                          <div>{snapshot.progress.hypothesis}</div>
+                        </>
+                      )}
+                      <div className="context-source">
+                        <h3>本次配置</h3>
+                        <p>{snapshot.request.target}</p>
+                        <p>{snapshot.request.dataset_path}</p>
+                        <button
+                          className="text-action"
+                          onClick={() => query({ view: "configuration" })}
+                        >
+                          查看运行配置 →
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+                )}
+                {(view === "report" || view === "diagnosis") && (
+                  <ReportWorkspace
+                    snapshot={snapshot}
+                    diagnosis={view === "diagnosis"}
+                    params={route.params}
+                    query={query}
+                  />
+                )}
+                {view === "configuration" && (
+                  <section className="configuration-snapshot">
+                    <div className="section-heading">
+                      <div>
+                        <h2>运行配置</h2>
+                        <p>
+                          创建任务时的只读快照。修改默认设置不会改变本次评估。
+                        </p>
+                      </div>
+                      <button
+                        className="text-action"
+                        onClick={() => {
+                          void navigator.clipboard
+                            .writeText(
+                              JSON.stringify(snapshot.request, null, 2),
+                            )
+                            .then(() => setNotice("运行配置已复制"))
+                            .catch(() => setNotice("复制失败，请使用结果导出"));
+                        }}
+                      >
+                        复制配置
+                      </button>
+                    </div>
+                    <RequestSummary request={snapshot.request} />
+                  </section>
+                )}
               </div>
+            </>
+          )}
+        </>
+      )}
+      {route.page === "settings" && (
+        <>
+          <header className="page-heading">
+            <div>
+              <h1>默认设置</h1>
+              <p>
+                保存到当前浏览器，仅用于新建或重置草稿；已有草稿和运行结果保持独立。
+              </p>
             </div>
-          </details>
-        );
-      })}
-    </div>
-  );
-}
-
-function VadTimeRuler({ duration }: { duration: number }) {
-  const ticks = buildVadRulerTicks(duration);
-  return (
-    <div className="vad-time-ruler">
-      <span>Time</span>
-      <div className="vad-ruler-track">
-        {ticks.map((tick) => (
-          <i
-            key={tick}
-            style={{ left: `${toPercent(tick, duration)}%` }}
-            title={formatSeconds(tick)}
-          >
-            {formatSeconds(tick)}
-          </i>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MaskTrack({
-  label,
-  duration,
-  segments,
-  regions,
-  track,
-}: {
-  label: string;
-  duration: number;
-  segments: VadReportSegment[];
-  regions: VadReportRegion[];
-  track: "reference" | "prediction";
-}) {
-  const visibleSegments =
-    regions.length > 0 ? vadRegionsToTrackSegments(regions, track) : segments;
-
-  return (
-    <div className="mask-row">
-      <span>{label}</span>
-      <div className="mask-track">
-        {visibleSegments.map((segment) => (
-          <span
-            className={`mask-segment mask-${segment.status}`}
-            key={`${label}:${segment.start_frame}:${segment.end_frame}:${segment.status}`}
-            style={{
-              left: `${toPercent(segment.start, duration)}%`,
-              width: `${toPercent(segment.duration, duration)}%`,
+            <button className="text-action" onClick={() => setResetOpen(true)}>
+              恢复初始默认值
+            </button>
+          </header>
+          <form
+            className="settings-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setDefaults(settings);
+              setSettingsDirty(false);
+              setNotice("默认设置已保存");
             }}
-            title={`${segmentStatusLabel(segment.status)} ${formatSeconds(segment.start)} - ${formatSeconds(segment.end)}`}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function vadRegionsToTrackSegments(
-  regions: VadReportRegion[],
-  track: "reference" | "prediction",
-): VadReportSegment[] {
-  return regions
-    .filter((region) => {
-      const label = normalizeVadLabel(region.label);
-      return track === "reference"
-        ? label === "hit" || label === "miss"
-        : label === "hit" || label === "false_alarm";
-    })
-    .map((region) => ({
-      start: region.start,
-      end: region.end,
-      duration: region.duration,
-      start_frame: region.start_frame,
-      end_frame: region.end_frame,
-      status: normalizeVadLabel(region.label),
-    }));
-}
-
-function LegendItem({ className, label }: { className: string; label: string }) {
-  return (
-    <span>
-      <i className={`legend-dot ${className}`} />
-      {label}
-    </span>
-  );
-}
-
-function TokenCounts({
-  metricLabel,
-  summary,
-  tokens,
-}: {
-  metricLabel: "WER" | "CER";
-  summary?: WerSummary;
-  tokens: WerToken[];
-}) {
-  const counts = tokens.reduce(
-    (current, token) => {
-      const label = normalizeWerTokenLabel(token.label);
-      current[label] = (current[label] ?? 0) + 1;
-      return current;
-    },
-    { correct: 0, substitution: 0, deletion: 0, insertion: 0 } as Record<string, number>,
-  );
-
-  return (
-    <span className="token-counts">
-      {summary ? `${metricLabel} ${formatPercentScale(summary.wer)} · ` : ""}
-      C {summary?.correct ?? counts.correct ?? 0} · S{" "}
-      {summary?.substitutions ?? counts.substitution ?? 0} · D{" "}
-      {summary?.deletions ?? counts.deletion ?? 0} · I{" "}
-      {summary?.insertions ?? counts.insertion ?? 0}
-    </span>
-  );
-}
-
-function WerAlignmentRows({ tokens, wrap }: { tokens: WerToken[]; wrap: boolean }) {
-  const gridStyle = {
-    gridTemplateColumns: `42px repeat(${Math.max(tokens.length, 1)}, max-content)`,
-  };
-
-  if (wrap) {
-    return (
-      <div className="wer-alignment wrap">
-        <div className="wer-wrap-stack">
-          {chunkWerTokens(tokens).map((chunk, chunkIndex) => (
-            <div
-              className="wer-alignment-grid"
-              style={{
-                gridTemplateColumns: `42px repeat(${Math.max(
-                  chunk.length,
-                  1,
-                )}, max-content)`,
+          >
+            <AdvancedSettings
+              value={settings}
+              all
+              onChange={(patch) => {
+                setSettings((s) => ({ ...s, ...patch }));
+                setSettingsDirty(true);
               }}
-              key={`chunk:${chunkIndex}`}
-            >
-              <span className="wer-row-label">REF</span>
-              {chunk.map((token, index) => (
-                <span
-                  className={`wer-word ${getWerWordClass(token.label, "ref")}`}
-                  title={`ref: ${token.ref || "*"}\nhyp: ${token.hyp || "*"}`}
-                  key={`ref:${chunkIndex}:${index}:${token.ref ?? ""}:${token.hyp ?? ""}`}
-                >
-                  {token.ref || "*"}
-                </span>
-              ))}
-              <span className="wer-row-label">HYP</span>
-              {chunk.map((token, index) => (
-                <span
-                  className={`wer-word ${getWerWordClass(token.label, "hyp")}`}
-                  title={`ref: ${token.ref || "*"}\nhyp: ${token.hyp || "*"}`}
-                  key={`hyp:${chunkIndex}:${index}:${token.ref ?? ""}:${token.hyp ?? ""}`}
-                >
-                  {token.hyp || "*"}
-                </span>
-              ))}
+            />
+            <div className="settings-actions">
+              <Button type="submit">保存默认值</Button>
+              <span>
+                {settingsDirty
+                  ? "有未保存的更改"
+                  : "默认设置已保存到当前浏览器"}
+              </span>
             </div>
-          ))}
+          </form>
+        </>
+      )}
+      {route.page === "help" && (
+        <>
+          <header className="page-heading">
+            <div>
+              <h1>帮助</h1>
+              <p>数据集格式、评估指标与输入要求</p>
+            </div>
+          </header>
+          {help ? (
+            <section className="help-panel">
+              <MarkdownDocument markdown={help.markdown} />
+            </section>
+          ) : helpError ? (
+            <div role="alert" className="paper-empty">
+              <h2>帮助文档加载失败</h2>
+              <p>{helpError}</p>
+              <Button
+                variant="secondary"
+                onClick={() => setHelpAttempt((x) => x + 1)}
+              >
+                重新加载
+              </Button>
+            </div>
+          ) : (
+            <p role="status">正在加载帮助文档…</p>
+          )}
+        </>
+      )}
+      <DirectoryBrowserDialog
+        isOpen={directoryOpen}
+        initialPath={draft.dataset_path}
+        listDirectory={listServerDirectory}
+        onClose={() => setDirectoryOpen(false)}
+        onSelect={(path) => {
+          change({ dataset_path: path });
+          setDirectoryOpen(false);
+        }}
+      />
+      <ConfirmDialog
+        isOpen={resetOpen}
+        title="恢复初始默认值？"
+        description="恢复各类评估的默认高级参数。已有草稿和评估结果不会被修改。"
+        confirmLabel="恢复默认值"
+        onClose={() => setResetOpen(false)}
+        onConfirm={() => {
+          setDefaults(DEFAULT_FORM_STATE);
+          setSettings(DEFAULT_FORM_STATE);
+          setSettingsDirty(false);
+          setResetOpen(false);
+          setNotice("已恢复初始默认值");
+        }}
+      />
+      {notice && (
+        <div className="notice-toast" role="status">
+          {notice}
         </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="wer-alignment">
-      <div className="wer-alignment-grid" style={gridStyle}>
-        <span className="wer-row-label">REF</span>
-        {tokens.map((token, index) => (
-          <span
-            className={`wer-word ${getWerWordClass(token.label, "ref")}`}
-            title={`ref: ${token.ref || "*"}\nhyp: ${token.hyp || "*"}`}
-            key={`ref:${index}:${token.ref ?? ""}:${token.hyp ?? ""}`}
-          >
-            {token.ref || "*"}
-          </span>
-        ))}
-        <span className="wer-row-label">HYP</span>
-        {tokens.map((token, index) => (
-          <span
-            className={`wer-word ${getWerWordClass(token.label, "hyp")}`}
-            title={`ref: ${token.ref || "*"}\nhyp: ${token.hyp || "*"}`}
-            key={`hyp:${index}:${token.ref ?? ""}:${token.hyp ?? ""}`}
-          >
-            {token.hyp || "*"}
-          </span>
-        ))}
-      </div>
-    </div>
+      )}
+    </AppShell>
   );
-}
-
-function chunkWerTokens(tokens: WerToken[]): WerToken[][] {
-  const chunkSize = 12;
-  const chunks: WerToken[][] = [];
-  for (let index = 0; index < tokens.length; index += chunkSize) {
-    chunks.push(tokens.slice(index, index + chunkSize));
-  }
-  return chunks;
-}
-
-function getWerWordClass(label: string, row: "ref" | "hyp"): string {
-  const normalizedLabel = normalizeWerTokenLabel(label);
-  if (normalizedLabel === "substitution") {
-    return "wer-word-substitution";
-  }
-  if (normalizedLabel === "deletion" && row === "ref") {
-    return "wer-word-deletion";
-  }
-  if (normalizedLabel === "insertion" && row === "hyp") {
-    return "wer-word-insertion";
-  }
-  if (
-    (normalizedLabel === "deletion" && row === "hyp") ||
-    (normalizedLabel === "insertion" && row === "ref")
-  ) {
-    return "wer-word-placeholder";
-  }
-  return "wer-word-correct";
-}
-
-function normalizeWerTokenLabel(label: string): string {
-  const normalized = label.trim().toLowerCase();
-  if (["sub", "subst", "substitution", "s"].includes(normalized)) {
-    return "substitution";
-  }
-  if (["del", "delete", "deletion", "d"].includes(normalized)) {
-    return "deletion";
-  }
-  if (["ins", "insert", "insertion", "i"].includes(normalized)) {
-    return "insertion";
-  }
-  if (["cor", "correct", "ok", "c"].includes(normalized)) {
-    return "correct";
-  }
-  return normalized;
-}
-
-function buildRequest(rawState: EvaluationFormState): EvaluationRequest {
-  const state = normalizeFormState(rawState);
-  return {
-    task: state.task,
-    target: state.target,
-    dataset_path: state.dataset_path,
-    split: state.split,
-    limit: toOptionalNumber(state.limit),
-    language_code: state.language_code,
-    sample_rate: toNumber(state.sample_rate, 16000),
-    min_reference_words: toNumber(state.min_reference_words, 5),
-    hotwords: state.hotwords
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean),
-    hotword_bias: toNumber(state.hotword_bias, 0),
-    connect_timeout_seconds: toOptionalNumber(state.connect_timeout_seconds),
-    request_timeout_seconds: toNumber(state.request_timeout_seconds, 60),
-    interim_results: state.interim_results ?? true,
-    inference_concurrency: 0,
-    asr_inference_concurrency: toNumber(state.asr_inference_concurrency, 0),
-    vad_inference_concurrency: toNumber(state.vad_inference_concurrency, 0),
-    lid_inference_concurrency: toNumber(state.lid_inference_concurrency, 0),
-    enable_mos: state.enable_mos ?? false,
-    mos_target: state.mos_target.trim(),
-    enable_snr: state.enable_snr ?? false,
-    snr_target: state.snr_target.trim(),
-    sqa_inference_concurrency: toNumber(state.sqa_inference_concurrency, 0),
-    lid_confidence_threshold: toNumber(state.lid_confidence_threshold, 0),
-    remove_punctuation: state.remove_punctuation ?? false,
-    mask_frame_seconds: toNumber(state.mask_frame_seconds, 0.01),
-    chunk_duration_seconds: toNumber(state.chunk_duration_seconds, 0.1),
-    speech_padding_seconds: toNumber(state.speech_padding_seconds ?? "0", 0),
-    hit_threshold: toNumber(state.hit_threshold, 0.9),
-    streaming: state.streaming ?? false,
-  };
-}
-
-function requestToFormState(request: EvaluationRequest): EvaluationFormState {
-  return {
-    task: request.task,
-    target: request.target,
-    dataset_path: request.dataset_path,
-    split: request.split,
-    limit: request.limit === null ? "" : String(request.limit),
-    language_code: request.language_code,
-    sample_rate: String(request.sample_rate),
-    min_reference_words: String(request.min_reference_words),
-    hotwords: request.hotwords.join(", "),
-    hotword_bias: String(request.hotword_bias),
-    connect_timeout_seconds: request.connect_timeout_seconds === null ? "" : String(request.connect_timeout_seconds),
-    request_timeout_seconds: String(request.request_timeout_seconds),
-    interim_results: request.interim_results,
-    inference_concurrency: String(request.inference_concurrency),
-    asr_inference_concurrency: String(request.asr_inference_concurrency),
-    vad_inference_concurrency: String(request.vad_inference_concurrency),
-    lid_inference_concurrency: String(request.lid_inference_concurrency),
-    enable_mos: request.enable_mos,
-    mos_target: request.mos_target,
-    enable_snr: request.enable_snr,
-    snr_target: request.snr_target,
-    sqa_inference_concurrency: String(request.sqa_inference_concurrency),
-    lid_confidence_threshold: String(request.lid_confidence_threshold),
-    remove_punctuation: request.remove_punctuation,
-    mask_frame_seconds: String(request.mask_frame_seconds),
-    chunk_duration_seconds: String(request.chunk_duration_seconds),
-    speech_padding_seconds: String(request.speech_padding_seconds),
-    hit_threshold: String(request.hit_threshold),
-    streaming: request.streaming,
-  };
-}
-
-function mergeReevaluationFormState(
-  currentState: EvaluationFormState,
-  request: EvaluationRequest,
-): EvaluationFormState {
-  return {
-    ...normalizeFormState(currentState),
-    task: request.task,
-    target: request.target,
-    dataset_path: request.dataset_path,
-    split: request.split,
-    limit: request.limit === null ? "" : String(request.limit),
-  };
-}
-
-function appendRunEvent(events: string[], event: string): string[] {
-  if (!event || events[events.length - 1] === event) {
-    return events;
-  }
-  return [...events, event].slice(-12);
-}
-
-function normalizeFormState(state: EvaluationFormState): EvaluationFormState {
-  const { enable_sqa: _enableSqa, sqa_engines: _sqaEngines, ...knownState } =
-    state as EvaluationFormState & {
-      enable_sqa?: unknown;
-      sqa_engines?: unknown;
-    };
-  return {
-    ...DEFAULT_FORM_STATE,
-    ...knownState,
-    enable_mos:
-      typeof state.enable_mos === "boolean"
-        ? state.enable_mos
-        : DEFAULT_FORM_STATE.enable_mos,
-    mos_target:
-      typeof state.mos_target === "string"
-        ? state.mos_target
-        : DEFAULT_FORM_STATE.mos_target,
-    enable_snr:
-      typeof state.enable_snr === "boolean"
-        ? state.enable_snr
-        : DEFAULT_FORM_STATE.enable_snr,
-    snr_target:
-      typeof state.snr_target === "string"
-        ? state.snr_target
-        : DEFAULT_FORM_STATE.snr_target,
-    sqa_inference_concurrency:
-      typeof state.sqa_inference_concurrency === "string"
-        ? state.sqa_inference_concurrency
-        : DEFAULT_FORM_STATE.sqa_inference_concurrency,
-  };
-}
-
-function sortAlignmentUtterances(
-  utterances: WerUtterance[],
-  sortMode: ReportSortMode,
-  reports: Record<AlignmentMetric, WerReport | undefined>,
-): WerUtterance[] {
-  return [...utterances].sort((left, right) => {
-    if (sortMode === "index-desc") {
-      return getUtteranceIndex(right) - getUtteranceIndex(left);
-    }
-    if (
-      sortMode === "wer-desc" ||
-      sortMode === "wer-asc" ||
-      sortMode === "cer-desc" ||
-      sortMode === "cer-asc"
-    ) {
-      const metric: AlignmentMetric = sortMode.startsWith("cer") ? "cer" : "wer";
-      const leftRate = getUtteranceRate(left, reports[metric]);
-      const rightRate = getUtteranceRate(right, reports[metric]);
-      if (leftRate !== rightRate) {
-        return sortMode.endsWith("desc") ? rightRate - leftRate : leftRate - rightRate;
-      }
-    }
-    return getUtteranceIndex(left) - getUtteranceIndex(right);
-  });
-}
-
-function getUtteranceRate(
-  utterance: WerUtterance,
-  report: WerReport | undefined,
-): number {
-  const metricUtterance = report?.utterances.find(
-    (item) => item.id === utterance.id,
-  );
-  const summary = metricUtterance?.summary ?? utterance.summary;
-  if (typeof summary?.wer === "number") {
-    return summary.wer;
-  }
-  const tokens = metricUtterance?.tokens ?? utterance.tokens;
-  const referenceWords = tokens.filter(
-    (token) => normalizeWerTokenLabel(token.label) !== "insertion",
-  ).length;
-  if (referenceWords === 0) {
-    return 0;
-  }
-  const errors = tokens.filter(
-    (token) => normalizeWerTokenLabel(token.label) !== "correct",
-  ).length;
-  return (errors / referenceWords) * 100;
-}
-
-function getUtteranceIndex(utterance: WerUtterance): number {
-  return utterance.index ?? Number.MAX_SAFE_INTEGER;
-}
-
-function evaluationTaskShortLabel(task: EvaluationTask): string {
-  if (task === "vad") {
-    return "VAD";
-  }
-  if (task === "lid") {
-    return "LID";
-  }
-  if (task === "keyword") {
-    return "Keyword";
-  }
-  if (task === "denoise") {
-    return "SE";
-  }
-  return "ASR";
-}
-
-function evaluationTaskTitle(task: EvaluationTask): string {
-  if (task === "vad") {
-    return "VAD 评估";
-  }
-  if (task === "lid") {
-    return "LID 评估";
-  }
-  if (task === "keyword") {
-    return "关键词评估";
-  }
-  if (task === "denoise") {
-    return "SE 评估";
-  }
-  return "ASR 评估";
-}
-
-function pickTaskRememberedFields(
-  state: EvaluationFormState,
-): TaskRememberedFields {
-  return {
-    target: state.target,
-    dataset_path: state.dataset_path,
-  };
-}
-
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) {
-    return false;
-  }
-  const tagName = target.tagName.toLowerCase();
-  return (
-    target.isContentEditable ||
-    tagName === "input" ||
-    tagName === "textarea" ||
-    tagName === "select" ||
-    tagName === "button"
-  );
-}
-
-function toOptionalNumber(value: string): number | null {
-  return value.trim() ? Number(value) : null;
-}
-
-function toNumber(value: string, fallback: number): number {
-  return value.trim() ? Number(value) : fallback;
-}
-
-function formatRate(value: unknown): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return "-";
-  }
-  const percentage = Math.abs(value) <= 1 ? value * 100 : value;
-  return `${percentage.toFixed(2)}%`;
-}
-
-function formatPercentScale(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${value.toFixed(2)}%`
-    : "-";
-}
-
-function formatNumber(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value) ? String(value) : "0";
-}
-
-function formatSeconds(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${value.toFixed(2)}s`
-    : "-";
-}
-
-function formatRealtimeFactor(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${value.toFixed(2)}x`
-    : "-";
-}
-
-function formatConfidence(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value.toFixed(4)
-    : "-";
-}
-
-function formatSqaScore(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value.toFixed(2)
-    : "-";
-}
-
-function hasFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function formatSignedScore(value: unknown): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return "-";
-  }
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
-}
-
-function parseMarkdown(markdown: string): MarkdownBlock[] {
-  const blocks: MarkdownBlock[] = [];
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  let paragraph: string[] = [];
-  let listItems: string[] = [];
-  let codeLines: string[] = [];
-  let formulaLines: string[] = [];
-  let codeLanguage = "";
-  let inCode = false;
-  let inFormula = false;
-
-  function flushParagraph() {
-    if (paragraph.length) {
-      blocks.push({ type: "paragraph", text: paragraph.join(" ") });
-      paragraph = [];
-    }
-  }
-
-  function flushList() {
-    if (listItems.length) {
-      blocks.push({ type: "list", items: listItems });
-      listItems = [];
-    }
-  }
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const trimmed = line.trim();
-
-    if (trimmed === "$$") {
-      if (inFormula) {
-        blocks.push({ type: "formula", text: formulaLines.join("\n") });
-        formulaLines = [];
-        inFormula = false;
-      } else {
-        flushParagraph();
-        flushList();
-        inFormula = true;
-      }
-      continue;
-    }
-
-    if (inFormula) {
-      formulaLines.push(line);
-      continue;
-    }
-
-    if (line.startsWith("```")) {
-      if (inCode) {
-        const text = codeLines.join("\n");
-        blocks.push(
-          codeLanguage === "math" || codeLanguage === "formula"
-            ? { type: "formula", text }
-            : { type: "code", language: codeLanguage, text },
-        );
-        codeLines = [];
-        codeLanguage = "";
-        inCode = false;
-      } else {
-        flushParagraph();
-        flushList();
-        codeLanguage = line.slice(3).trim();
-        inCode = true;
-      }
-      continue;
-    }
-
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (!trimmed) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-
-    const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
-    if (heading) {
-      flushParagraph();
-      flushList();
-      const text = heading[2];
-      blocks.push({
-        type: "heading",
-        level: heading[1].length as 1 | 2 | 3,
-        text,
-        id: slugifyHeading(text),
-      });
-      continue;
-    }
-
-    if (isMarkdownTableStart(lines, index)) {
-      flushParagraph();
-      flushList();
-      const parsedTable = parseMarkdownTable(lines, index);
-      blocks.push(parsedTable.block);
-      index = parsedTable.nextIndex - 1;
-      continue;
-    }
-
-    if (trimmed.startsWith("- ")) {
-      flushParagraph();
-      listItems.push(trimmed.slice(2));
-      continue;
-    }
-
-    flushList();
-    paragraph.push(trimmed);
-  }
-
-  if (inCode) {
-    const text = codeLines.join("\n");
-    blocks.push(
-      codeLanguage === "math" || codeLanguage === "formula"
-        ? { type: "formula", text }
-        : { type: "code", language: codeLanguage, text },
-    );
-  }
-  if (inFormula) {
-    blocks.push({ type: "formula", text: formulaLines.join("\n") });
-  }
-  flushParagraph();
-  flushList();
-  return blocks;
-}
-
-function isMarkdownTableStart(lines: string[], index: number): boolean {
-  const current = lines[index]?.trim() ?? "";
-  const next = lines[index + 1]?.trim() ?? "";
-  return (
-    current.startsWith("|") &&
-    current.endsWith("|") &&
-    /^\|[\s:\-|]+\|$/.test(next)
-  );
-}
-
-function parseMarkdownTable(
-  lines: string[],
-  startIndex: number,
-): { block: MarkdownBlock; nextIndex: number } {
-  const headers = splitMarkdownTableRow(lines[startIndex]);
-  const rows: string[][] = [];
-  let index = startIndex + 2;
-  while (index < lines.length) {
-    const line = lines[index].trim();
-    if (!line.startsWith("|") || !line.endsWith("|")) {
-      break;
-    }
-    rows.push(splitMarkdownTableRow(line));
-    index += 1;
-  }
-  return { block: { type: "table", headers, rows }, nextIndex: index };
-}
-
-function splitMarkdownTableRow(line: string): string[] {
-  return line
-    .trim()
-    .slice(1, -1)
-    .split("|")
-    .map((cell) => cell.trim());
-}
-
-function renderInlineMarkdown(text: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const pattern = /(`([^`]+)`|\[([^\]]+)\]\((#[^)]+)\)|\$([^$]+)\$)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push(text.slice(lastIndex, match.index));
-    }
-    if (match[2]) {
-      nodes.push(<code key={`code-${match.index}`}>{match[2]}</code>);
-    } else if (match[3] && match[4]) {
-      nodes.push(
-        <a href={match[4]} key={`link-${match.index}`}>
-          {match[3]}
-        </a>,
-      );
-    } else if (match[5]) {
-      nodes.push(
-        <LatexFormula key={`math-${match.index}`} text={match[5]} />,
-      );
-    }
-    lastIndex = pattern.lastIndex;
-  }
-  if (lastIndex < text.length) {
-    nodes.push(text.slice(lastIndex));
-  }
-  return nodes;
-}
-
-function slugifyHeading(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/`/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/[^\p{L}\p{N}\-_]/gu, "");
-}
-
-function getVadTimelineWidth(duration: number): number {
-  if (!Number.isFinite(duration) || duration <= 0) {
-    return VAD_TIMELINE_MIN_WIDTH;
-  }
-  return Math.max(
-    VAD_TIMELINE_MIN_WIDTH,
-    Math.ceil(
-      VAD_TIMELINE_LABEL_WIDTH + duration * VAD_TIMELINE_PIXELS_PER_SECOND,
-    ),
-  );
-}
-
-function buildVadRulerTicks(duration: number): number[] {
-  if (!Number.isFinite(duration) || duration <= 0) {
-    return [0];
-  }
-  const targetTickCount = Math.max(4, Math.ceil(duration / 12));
-  const roughStep = duration / targetTickCount;
-  const step = pickRulerStep(roughStep);
-  const ticks: number[] = [];
-  for (let tick = 0; tick < duration; tick += step) {
-    ticks.push(Number(tick.toFixed(3)));
-  }
-  if (ticks[ticks.length - 1] !== duration) {
-    ticks.push(duration);
-  }
-  return ticks;
-}
-
-function pickRulerStep(roughStep: number): number {
-  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
-  return steps.find((step) => step >= roughStep) ?? steps[steps.length - 1];
-}
-
-function toPercent(value: number, total: number): number {
-  if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) {
-    return 0;
-  }
-  return Math.min(Math.max((value / total) * 100, 0), 100);
-}
-
-function segmentStatusLabel(status: string): string {
-  const normalizedStatus = normalizeVadLabel(status);
-  if (normalizedStatus === "hit") {
-    return "命中";
-  }
-  if (normalizedStatus === "miss") {
-    return "漏检";
-  }
-  if (normalizedStatus === "false_alarm") {
-    return "虚警";
-  }
-  return status;
-}
-
-function regionLabel(label: string): string {
-  const normalizedLabel = normalizeVadLabel(label);
-  if (normalizedLabel === "hit") {
-    return "命中";
-  }
-  if (normalizedLabel === "miss") {
-    return "漏检";
-  }
-  if (normalizedLabel === "false_alarm") {
-    return "虚警";
-  }
-  if (normalizedLabel === "correct_reject") {
-    return "静音正确";
-  }
-  return label;
-}
-
-function normalizeVadLabel(label: string): string {
-  const normalized = label.trim().toLowerCase().replace(/[-\s]+/g, "_");
-  if (["falsealarm", "false_alarm", "fa", "fp"].includes(normalized)) {
-    return "false_alarm";
-  }
-  if (["miss", "missed", "fn"].includes(normalized)) {
-    return "miss";
-  }
-  if (["hit", "tp", "speech_correct"].includes(normalized)) {
-    return "hit";
-  }
-  if (
-    ["correctreject", "correct_reject", "tn", "silence_correct"].includes(
-      normalized,
-    )
-  ) {
-    return "correct_reject";
-  }
-  return normalized;
 }

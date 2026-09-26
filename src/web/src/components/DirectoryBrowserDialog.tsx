@@ -1,5 +1,12 @@
 import { Folder, FolderOpen, RefreshCw, Volume2, X } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import type { ServerDirectoryListing } from "../types";
 import { Button } from "./ui";
@@ -128,11 +135,14 @@ export function DirectoryBrowserDialog({
   }
 
   return createPortal(
-    <div className="dialog-backdrop" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) {
-        onClose();
-      }
-    }}>
+    <div
+      className="dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
       <div
         ref={dialogRef}
         className="dialog directory-dialog"
@@ -191,8 +201,16 @@ export function DirectoryBrowserDialog({
           {error ? (
             <div className="dialog-error" role="alert">
               <span>{error}</span>
-              <Button variant="ghost" onClick={() => void loadDirectory(requestedPath.trim() || undefined)}>
+              <Button
+                variant="ghost"
+                onClick={() =>
+                  void loadDirectory(requestedPath.trim() || undefined)
+                }
+              >
                 重新读取
+              </Button>
+              <Button variant="ghost" onClick={() => void loadDirectory()}>
+                返回允许的根目录
               </Button>
             </div>
           ) : null}
@@ -203,14 +221,18 @@ export function DirectoryBrowserDialog({
                 type="button"
                 className="directory-row"
                 disabled={loading}
-                onClick={() => void loadDirectory(listing.parentPath ?? undefined)}
+                onClick={() =>
+                  void loadDirectory(listing.parentPath ?? undefined)
+                }
               >
                 <FolderOpen size={18} aria-hidden="true" />
                 <span>上级目录</span>
               </button>
             ) : null}
             {loading && !listing ? (
-              <div className="directory-empty" role="status">正在读取目录…</div>
+              <div className="directory-empty" role="status">
+                正在读取目录…
+              </div>
             ) : null}
             {!loading && listing && listing.entries.length === 0 ? (
               <div className="directory-empty">当前目录为空</div>

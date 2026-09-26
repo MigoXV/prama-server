@@ -22,7 +22,7 @@ export default defineConfig({
   },
   webServer: {
     command:
-      "pnpm --dir src/web run build && PRAMA_WORKDIR=$PWD/data-bin poetry run prama-server serve-http --host 127.0.0.1 --port 8010",
+      "corepack pnpm@10.33.0 --dir src/web run build && PRAMA_WORKDIR=$PWD/data-bin poetry run prama-server serve-http --host 127.0.0.1 --port 8010",
     cwd: repositoryRoot,
     url: "http://127.0.0.1:8010/api/health",
     reuseExistingServer: true,

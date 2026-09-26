@@ -5,12 +5,9 @@ export function usePersistentState<T>(
   initialValue: T,
 ): [T, (value: T | ((current: T) => T)) => void] {
   const [state, setState] = useState<T>(() => {
-    const stored = localStorage.getItem(key);
-    if (!stored) {
-      return initialValue;
-    }
-
     try {
+      const stored = localStorage.getItem(key);
+      if (!stored) return initialValue;
       return JSON.parse(stored) as T;
     } catch {
       return initialValue;
@@ -18,12 +15,18 @@ export function usePersistentState<T>(
   });
 
   useEffect(() => {
-    localStorage.setItem(key, JSON.stringify(state));
+    try {
+      localStorage.setItem(key, JSON.stringify(state));
+    } catch {
+      // 禁用或写满浏览器存储时，本次会话仍然可以工作。
+    }
   }, [key, state]);
 
   const updateState = useCallback((value: T | ((current: T) => T)) => {
     setState((current) =>
-      typeof value === "function" ? (value as (current: T) => T)(current) : value,
+      typeof value === "function"
+        ? (value as (current: T) => T)(current)
+        : value,
     );
   }, []);
 
